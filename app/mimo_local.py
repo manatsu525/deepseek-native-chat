@@ -34,6 +34,7 @@ from .mimo import (
     _user_urls,
     _normalize_usage,
     _url,
+    is_mimo_model,
 )
 
 
@@ -43,7 +44,7 @@ class UnapprovedSourceError(ValueError):
 
 FINAL_ANSWER_ATTEMPTS = 2
 FINAL_ANSWER_PROMPT = (
-    "The local web-tool budget is exhausted. You cannot call any more tools. "
+    "The local web-tool phase has ended. You cannot call any more tools in this response. "
     "Do not emit tool_calls, XML such as <tool_call>, function-call JSON, or a request to read another URL. "
     "Use only the evidence already present in the conversation and answer the user's original question now "
     "in natural language. Clearly state uncertainty when the available evidence is insufficient."
@@ -55,7 +56,10 @@ def _looks_like_text_tool_call(value: str) -> bool:
     stripped = str(value or "").strip().casefold()
     if stripped.startswith("```"):
         stripped = stripped.split("\n", 1)[-1].lstrip()
-    return stripped.startswith("<tool_call") or stripped.startswith("<function=")
+    if not (stripped.startswith("<tool_call") or stripped.startswith("<function=")):
+        return False
+    head = stripped[:2000]
+    return "fetch_webpage" in head or "web_search" in head
 
 
 async def stream_response(
@@ -94,6 +98,7 @@ async def stream_response(
     attempted_urls: set[str] = set()
     reader_enabled = bool(allowed_urls)
     final_answer_attempts = 0
+    force_final_answer = False
     api_limits = httpx.Timeout(timeout, connect=30)
     async with (
         httpx.AsyncClient(timeout=api_limits) as api_client,
@@ -116,12 +121,13 @@ async def stream_response(
             if stopped():
                 raise asyncio.CancelledError
             round_tools: list[dict[str, Any]] = []
-            if tool_rounds_used < MIMO_MAX_TOOL_ROUNDS and search_count < MIMO_MAX_SEARCHES:
-                round_tools.append(SEARCH_WEB_TOOL)
-            if tool_rounds_used < MIMO_MAX_TOOL_ROUNDS and reader_enabled and allowed_urls:
-                round_tools.append(FETCH_WEBPAGE_TOOL)
-            final_answer_only = not round_tools
-            is_mimo_model = model.casefold().startswith("mimo-")
+            if not force_final_answer:
+                if tool_rounds_used < MIMO_MAX_TOOL_ROUNDS and search_count < MIMO_MAX_SEARCHES:
+                    round_tools.append(SEARCH_WEB_TOOL)
+                if tool_rounds_used < MIMO_MAX_TOOL_ROUNDS and reader_enabled and allowed_urls:
+                    round_tools.append(FETCH_WEBPAGE_TOOL)
+            final_answer_only = force_final_answer or not round_tools
+            mimo_model = is_mimo_model(model)
             request_messages = conversation
             if final_answer_only:
                 retry_note = (
@@ -138,15 +144,15 @@ async def stream_response(
                 "messages": request_messages,
                 # Older MiMo gateways use max_completion_tokens; the generic
                 # OpenAI-compatible spelling remains max_tokens.
-                "max_completion_tokens" if is_mimo_model else "max_tokens": int(config["max_completion_tokens"]),
+                "max_completion_tokens" if mimo_model else "max_tokens": int(config["max_completion_tokens"]),
                 "stream": True,
             }
-            if is_mimo_model:
+            if mimo_model:
                 payload["thinking"] = {"type": config["thinking"]}
             if round_tools:
                 payload["tools"] = round_tools
                 payload["tool_choice"] = "auto"
-            if not is_mimo_model or config["thinking"] == "disabled":
+            if not mimo_model or config["thinking"] == "disabled":
                 payload["temperature"] = float(config["temperature"])
                 payload["top_p"] = float(config["top_p"])
 
@@ -203,8 +209,10 @@ async def stream_response(
 
             usage = _merge_usage(usage, round_usage)
             calls = _tool_calls(round_tools_by_index, round_number)
-            if final_answer_only and (calls or _looks_like_text_tool_call(round_answer)):
+            invalid_answer = not round_answer.strip() or _looks_like_text_tool_call(round_answer)
+            if (final_answer_only and (calls or invalid_answer)) or (not calls and invalid_answer):
                 final_answer_attempts += 1
+                force_final_answer = True
                 await update(
                     {
                         "answer": answer,
@@ -242,7 +250,7 @@ async def stream_response(
             # thinking setting is enabled.  Preserve reasoning only when the
             # provider actually returned it (or when this is MiMo, whose
             # protocol expects the field on tool-call turns).
-            if round_reasoning or (is_mimo_model and config["thinking"] == "enabled"):
+            if round_reasoning or (mimo_model and config["thinking"] == "enabled"):
                 assistant_message["reasoning_content"] = round_reasoning
             conversation.append(assistant_message)
             tool_rounds_used += 1

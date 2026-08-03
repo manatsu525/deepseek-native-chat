@@ -21,7 +21,7 @@ from .db import Database
 from .deepseek import list_models as deepseek_list_models
 from .deepseek import stream_response as deepseek_stream_response
 from .mimo import DEFAULT_SETTINGS as CUSTOM_DEFAULT_SETTINGS
-from .mimo import MIMO_MAX_COMPLETION_TOKENS, custom_auth_headers, list_models as custom_list_models
+from .mimo import MIMO_MAX_COMPLETION_TOKENS, custom_auth_headers, is_mimo_model, list_models as custom_list_models
 from .mimo_local import stream_response as custom_stream_response
 from .security import load_secret, make_token, password_hash, password_ok, read_token
 
@@ -215,7 +215,7 @@ async def run_job(job_id: str) -> None:
         # tool messages are intentionally not replayed here: the final assistant
         # message is persisted, while replaying an assistant tool_call without
         # its matching tool result can make compatible gateways reject history.
-        if kind == "custom" and str(job.get("model") or "").casefold().startswith("mimo-") and row["role"] == "assistant":
+        if kind == "custom" and is_mimo_model(job.get("model")) and row["role"] == "assistant":
             meta = db.decode(row.get("meta_json", "{}"), {})
             if meta.get("reasoning"):
                 message["reasoning_content"] = meta.get("reasoning", "")
@@ -413,14 +413,18 @@ def providers(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, An
 
 async def test_custom_model(base_url: str, api_key: str, model: str) -> None:
     """Validate a manually entered model with a one-token chat request."""
-    is_mimo_model = model.casefold().startswith("mimo-")
-    token_field = "max_completion_tokens" if is_mimo_model else "max_tokens"
+    mimo_model = is_mimo_model(model)
+    token_field = "max_completion_tokens" if mimo_model else "max_tokens"
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": "Reply OK"}],
         token_field: 1,
         "stream": False,
     }
+    if mimo_model:
+        # Keep a connection test cheap and deterministic. MiMo accepts the
+        # thinking switch, while ordinary Custom providers never receive it.
+        payload["thinking"] = {"type": "disabled"}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(30, connect=5), follow_redirects=True) as client:
             response = await client.post(

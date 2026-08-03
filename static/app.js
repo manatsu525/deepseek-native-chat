@@ -369,6 +369,7 @@ function stopPolling(){if(state.poll)clearTimeout(state.poll);state.poll=null}
 function startPolling(id){stopPolling();setRunning(true);const tick=async()=>{try{const job=await api(`/api/jobs/${id}`);if(job.provider_id)selectProvider(job.provider_id,false,job.model);state.job=job;if(job.status==='completed'){stopPolling();setRunning(false);finalizeLiveMessage(job);await loadHistory(1);return}if(['failed','stopped'].includes(job.status)){stopPolling();setRunning(false);renderMessages();return}updateLiveMessage()}catch(err){toast(err.message);setRunning(false);return}state.poll=setTimeout(tick,700)};tick()}
 
 function normalizeProviderType(value){return value==='mimo'?'custom':(value||'deepseek')}
+function isMimoModel(value){return String(value||'').toLowerCase().startsWith('mimo-')}
 function providerLabel(provider){return normalizeProviderType(provider.provider_type)==='custom'?'Custom':'DeepSeek'}
 function providerModels(provider){const models=Array.isArray(provider&&provider.models)&&provider.models.length?provider.models:[provider&&provider.model];return [...new Set(models.filter(Boolean).map(String))]}
 function selectedOption(){return $('#providerSelect').selectedOptions[0]||null}
@@ -475,7 +476,7 @@ function fillCustomSettings(){
   $('#customThinking').value=config.thinking;$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;
   syncCustomThinkingFields();
 }
-function syncCustomThinkingFields(){const disabled=$('#customThinking').value==='enabled';$('#customTemperature').disabled=disabled;$('#customTopP').disabled=disabled;$('#customSamplingNote').textContent=disabled?'开启时仅对兼容模型发送 thinking 参数；其他 Custom 模型仍使用标准参数。':'所有 Custom 模型使用可自定义的 temperature/top_p。'}
+function syncCustomThinkingFields(){const mimo=isMimoModel(selectedModel());const thinking=$('#customThinking').value==='enabled';const disabled=mimo&&thinking;$('#customThinking').disabled=!mimo;$('#customTemperature').disabled=disabled;$('#customTopP').disabled=disabled;$('#customSamplingNote').textContent=mimo?(thinking?'当前是 MiMo：开启思考时按小米协议固定采样参数。':'当前是 MiMo：关闭思考后可自定义 temperature/top_p。'):'当前是普通 Custom 模型：不发送 MiMo 专用 thinking 参数，temperature/top_p 始终可配置。'}
 function openCustomSettings(){if(!selectedProvider()||normalizeProviderType(selectedProvider().provider_type)!=='custom'){toast('请先选择 Custom API');return}fillCustomSettings();$('#customModal').showModal()}
 async function saveCustomSettings(event){
   event.preventDefault(); const provider=selectedProvider(); if(!provider)return;
