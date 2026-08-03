@@ -114,7 +114,7 @@ async def stream_response(
             headers=JINA_BROWSER_HEADERS,
         ) as jina_client,
     ):
-        # Tool calls stay capped at eight. Up to two answer-only attempts are
+        # Tool calls stay capped at six. Up to two answer-only attempts are
         # reserved for providers that try to print a tool request as plain
         # text after the tools have been removed.
         for round_number in range(MIMO_MAX_TOOL_ROUNDS + FINAL_ANSWER_ATTEMPTS):
