@@ -22,46 +22,143 @@ function toast(message) {
 
 function escapeHtml(value='') { return String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
 function safeUrl(value='') { return /^https?:\/\//i.test(value) ? escapeHtml(value) : '#'; }
-function inline(text) {
-  return text
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+const CODE_EXTENSIONS = {
+  python:'py', py:'py', javascript:'js', js:'js', typescript:'ts', ts:'ts',
+  jsx:'jsx', tsx:'tsx', bash:'sh', shell:'sh', sh:'sh', zsh:'sh',
+  html:'html', css:'css', json:'json', yaml:'yml', yml:'yml', xml:'xml',
+  sql:'sql', java:'java', kotlin:'kt', c:'c', cpp:'cpp', 'c++':'cpp',
+  csharp:'cs', 'c#':'cs', go:'go', rust:'rs', ruby:'rb', php:'php',
+  swift:'swift', markdown:'md', md:'md', dockerfile:'Dockerfile'
+};
+
+function inline(value='') {
+  const codeTokens = [], linkTokens = [];
+  let text = escapeHtml(value).replace(/`([^`\n]+)`/g, (_, code) => {
+    const token = `\u0000CODE${codeTokens.length}\u0000`;
+    codeTokens.push(`<code>${code}</code>`);
+    return token;
+  });
+  text = text.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, label, url) => {
+    const decoded = url.replace(/&amp;/g, '&');
+    if (!/^https?:\/\//i.test(decoded)) return `${label} (${url})`;
+    const token = `\u0000LINK${linkTokens.length}\u0000`;
+    linkTokens.push(`<a href="${escapeHtml(decoded)}" target="_blank" rel="noopener noreferrer">${label}</a>`);
+    return token;
+  });
+  text = text.replace(/https?:\/\/[^\s<]+/gi, rawUrl => {
+    const match = rawUrl.match(/^(.*?)([.,!?;:，。！？；：)\]}]+)$/);
+    const url = match ? match[1] : rawUrl;
+    const suffix = match ? match[2] : '';
+    const token = `\u0000LINK${linkTokens.length}\u0000`;
+    const decodedUrl = url.replace(/&amp;/g, '&');
+    linkTokens.push(`<a href="${escapeHtml(decodedUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(decodedUrl)}</a>`);
+    return token + suffix;
+  });
+  text = text
+    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/__([^_\n]+)__/g, '<strong>$1</strong>')
+    .replace(/~~([^~\n]+)~~/g, '<del>$1</del>')
+    .replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  text = text.replace(/\u0000LINK(\d+)\u0000/g, (_, index) => linkTokens[Number(index)] || '');
+  return text.replace(/\u0000CODE(\d+)\u0000/g, (_, index) => codeTokens[Number(index)] || '');
+}
+
+function splitTableRow(line) {
+  let value = String(line).trim();
+  if (value.startsWith('|')) value = value.slice(1);
+  if (value.endsWith('|')) value = value.slice(0, -1);
+  return value.split('|').map(cell => cell.trim());
+}
+
+function isTableDivider(line) {
+  const cells = splitTableRow(line);
+  return cells.length > 0 && cells.every(cell => /^:?-{3,}:?$/.test(cell));
+}
+
+function calloutInfo(lines) {
+  if (!lines.length) return null;
+  const marker = lines[0].match(/^\s*\[!(NOTE|INFO|TIP|SUCCESS|IMPORTANT|WARNING|CAUTION|DANGER|ERROR)\]\s*(.*)$/i);
+  const shorthand = lines[0].match(/^\s*(⚠️?|❗|‼️|风险提示|风险|警告|注意|重要提示)\s*[:：]?\s*(.*)$/i);
+  const bold = lines[0].match(/^\s*\*\*(风险提示|风险|警告|注意|重要提示|warning|caution|danger|error)\s*[:：]?\*\*\s*(.*)$/i);
+  const found = marker || shorthand || bold;
+  if (!found) return null;
+  const rawType = String(found[1]).toLowerCase();
+  const type = /warning|caution|⚠|风险|警告|注意/.test(rawType) ? 'warning' :
+    /danger|error|❗|‼/.test(rawType) ? 'danger' :
+    /important/.test(rawType) ? 'important' : /tip|success/.test(rawType) ? 'tip' :
+    'note';
+  const labels = {note:['说明','ℹ'], tip:['提示','✓'], important:['重要','◆'], warning:['注意','⚠'], danger:['风险','!']};
+  return {type, label:labels[type][0], icon:labels[type][1], body:[found[2], ...lines.slice(1)].filter(line => line.trim())};
+}
+
+function renderCodeBlock(language, code) {
+  const rawLanguage = String(language || '').trim().split(/\s+/)[0];
+  const safeLanguage = rawLanguage.toLowerCase().replace(/[^a-z0-9_+#.-]/g, '');
+  const extension = CODE_EXTENSIONS[safeLanguage] || safeLanguage || 'txt';
+  const label = escapeHtml(rawLanguage || 'code');
+  const languageClass = safeLanguage ? ` class="language-${escapeHtml(safeLanguage)}"` : '';
+  return `<div class="code-wrap code-block" data-language="${escapeHtml(safeLanguage)}" data-extension="${escapeHtml(extension)}"><div class="code-label"><span>${label}</span><button class="code-download" type="button" title="下载代码" aria-label="下载代码"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0 5-5m-5 5-5-5M5 21h14"></path></svg></button></div><pre><code${languageClass}>${escapeHtml(String(code).replace(/\n$/, ''))}</code></pre></div>`;
+}
+
+function renderCallout(lines) {
+  const info = calloutInfo(lines);
+  if (!info) return `<blockquote>${lines.map(line => inline(line)).join('<br>')}</blockquote>`;
+  const body = info.body.map(line => inline(line)).join('<br>');
+  return `<aside class="md-callout md-callout-${info.type}"><div class="md-callout-title"><span aria-hidden="true">${info.icon}</span>${info.label}</div><div class="md-callout-body">${body || '<span class="muted"> </span>'}</div></aside>`;
 }
 
 function markdown(raw='') {
-  const codes = [];
-  raw = raw.replace(/```([^\n`]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
-    const index = codes.length;
-    const label = escapeHtml(lang.trim() || 'code');
-    codes.push(`<div class="code-wrap"><div class="code-label"><span>${label}</span><button class="code-download" data-code="${index}">⇩ 下载</button></div><pre><code>${escapeHtml(code.replace(/\n$/, ''))}</code></pre></div>`);
-    return `\n@@CODE${index}@@\n`;
-  });
-  const lines = escapeHtml(raw).split('\n');
-  const out = []; let i = 0; let list = null;
-  const closeList = () => { if (list) { out.push(`</${list}>`); list = null; } };
-  while (i < lines.length) {
-    const line = lines[i];
-    if (/^@@CODE\d+@@$/.test(line.trim())) { closeList(); out.push(line.trim()); i++; continue; }
-    if (line.includes('|') && i + 1 < lines.length && /^\s*\|?\s*:?-{3,}/.test(lines[i+1])) {
-      closeList(); const headers = line.replace(/^\||\|$/g,'').split('|'); i += 2; const rows=[];
-      while (i < lines.length && lines[i].includes('|') && lines[i].trim()) { rows.push(lines[i].replace(/^\||\|$/g,'').split('|')); i++; }
-      out.push(`<div class="table-wrap"><table><thead><tr>${headers.map(x=>`<th>${inline(x.trim())}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${r.map(x=>`<td>${inline(x.trim())}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`); continue;
+  const lines = String(raw || '').replace(/\r\n?/g, '\n').split('\n');
+  const out = [], paragraph = [];
+  let listType = '';
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    out.push(`<p>${paragraph.map(line => inline(line)).join('<br>')}</p>`);
+    paragraph.length = 0;
+  };
+  const closeList = () => { if (listType) out.push(`</${listType}>`); listType = ''; };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i], trimmed = line.trim();
+    if (/^```/.test(trimmed)) {
+      flushParagraph(); closeList();
+      const language = trimmed.slice(3).trim().split(/\s+/)[0] || '';
+      const code = []; i++;
+      while (i < lines.length && !/^```/.test(lines[i].trim())) { code.push(lines[i]); i++; }
+      out.push(renderCodeBlock(language, code.join('\n'))); continue;
     }
-    let m;
-    if ((m=line.match(/^(#{1,3})\s+(.+)/))) { closeList(); out.push(`<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`); }
-    else if ((m=line.match(/^\s*[-*]\s+(.+)/))) { if(list!=='ul'){closeList();list='ul';out.push('<ul>')} out.push(`<li>${inline(m[1])}</li>`); }
-    else if ((m=line.match(/^\s*\d+\.\s+(.+)/))) { if(list!=='ol'){closeList();list='ol';out.push('<ol>')} out.push(`<li>${inline(m[1])}</li>`); }
-    else if ((m=line.match(/^&gt;\s*(.*)/))) { closeList(); out.push(`<blockquote>${inline(m[1])}</blockquote>`); }
-    else if (!line.trim()) { closeList(); }
-    else { closeList(); out.push(`<p>${inline(line)}</p>`); }
-    i++;
+    if (line.includes('|') && i + 1 < lines.length && isTableDivider(lines[i + 1])) {
+      flushParagraph(); closeList();
+      const headers = splitTableRow(line), divider = splitTableRow(lines[i + 1]);
+      const align = divider.map(cell => cell.startsWith(':') && cell.endsWith(':') ? 'center' : cell.endsWith(':') ? 'right' : cell.startsWith(':') ? 'left' : '');
+      i += 2; const rows = [];
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim()) { rows.push(splitTableRow(lines[i])); i++; }
+      i--;
+      let table = '<div class="table-wrap"><table><thead><tr>';
+      table += headers.map((cell, index) => `<th${align[index] ? ` style="text-align:${align[index]}"` : ''}>${inline(cell)}</th>`).join('');
+      table += '</tr></thead><tbody>';
+      rows.forEach(row => { table += `<tr>${headers.map((_, index) => `<td${align[index] ? ` style="text-align:${align[index]}"` : ''}>${inline(row[index] || '')}</td>`).join('')}</tr>`; });
+      out.push(`${table}</tbody></table></div>`); continue;
+    }
+    if (!trimmed) { flushParagraph(); closeList(); continue; }
+    let match = trimmed.match(/^(#{1,6})\s+(.+)$/);
+    if (match) { flushParagraph(); closeList(); const level=match[1].length; out.push(`<h${level}>${inline(match[2])}</h${level}>`); continue; }
+    if (/^([-*_])(?:\s*\1){2,}$/.test(trimmed)) { flushParagraph(); closeList(); out.push('<hr>'); continue; }
+    if (calloutInfo([trimmed])) { flushParagraph(); closeList(); out.push(renderCallout([trimmed])); continue; }
+    if (/^\s*>/.test(line)) {
+      flushParagraph(); closeList(); const quote=[];
+      while (i < lines.length && /^\s*>/.test(lines[i])) { quote.push(lines[i].replace(/^\s*>\s?/, '')); i++; }
+      i--; out.push(renderCallout(quote)); continue;
+    }
+    const unordered = trimmed.match(/^[-*+]\s+(.+)$/), ordered = trimmed.match(/^\d+[.)]\s+(.+)$/);
+    if (unordered || ordered) {
+      flushParagraph(); const nextType = unordered ? 'ul' : 'ol';
+      if (listType !== nextType) { closeList(); listType=nextType; out.push(`<${listType}>`); }
+      out.push(`<li>${inline((unordered || ordered)[1])}</li>`); continue;
+    }
+    closeList(); paragraph.push(line);
   }
-  closeList();
-  let html = out.join('');
-  codes.forEach((code, index) => { html = html.replace(`@@CODE${index}@@`, code); });
-  return html;
+  flushParagraph(); closeList();
+  return out.join('');
 }
 
 function usageHtml(usage={}) {
@@ -75,7 +172,13 @@ function usageHtml(usage={}) {
 function traceHtml(meta={}, active=false, detailKey='trace') {
   const reasoning = meta.reasoning || '';
   const searches = meta.searches || [];
-  const sources = meta.sources || [];
+  const sources = [];
+  const seenSources = new Set();
+  [...(meta.sources || []), ...searches.filter(item => item.action === 'open_page' && item.url).map(item => ({url:item.url,title:item.url}))].forEach(source => {
+    const url = String(source.url || '');
+    if (!/^https?:\/\//i.test(url) || seenSources.has(url)) return;
+    seenSources.add(url); sources.push({url, title:source.title || url});
+  });
   if (!reasoning && !searches.length && !active && !Object.keys(meta.usage || {}).length) return '';
   const status = active ? '进行中' : (meta.stopped ? '已停止' : '已完成');
   const searchHtml = searches.map((s,i) => {
@@ -85,7 +188,7 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
     const detail=s.url?`<a href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(s.url)}</a>`:escapeHtml(Array.isArray(s.query)?s.query.filter(x=>!String(x).startsWith('ws_call_id=')).join('；'):(s.query||'DeepSeek 未返回查询词'));
     return `<details class="search-step" data-detail-key="${escapeHtml(searchKey)}"${searchOpen}><summary>${label} ${i+1} · ${escapeHtml(s.status || 'completed')}</summary><div class="search-detail">${detail}</div></details>`;
   }).join('');
-  const sourceHtml = sources.length ? `<div class="sources">${sources.map(s => `<a class="source-chip" href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(s.title || s.url)}</a>`).join('')}</div>` : '';
+  const sourceHtml = sources.length ? `<div class="sources"><span class="sources-label">来源</span>${sources.map(s => `<a class="source-chip" href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(s.url)}">${escapeHtml(s.title || s.url)}</a>`).join('')}</div>` : '';
   const traceOpen=detailState.get(detailKey) ? ' open' : '';
   return `<details class="trace" data-detail-key="${escapeHtml(detailKey)}"${traceOpen}><summary>思考与联网 · ${status}${searches.length ? ` · ${searches.length} 次搜索` : ''}</summary><div class="trace-body">${reasoning ? `<div class="reasoning-text">${escapeHtml(reasoning)}</div>` : active ? '<div class="typing"><i></i><i></i><i></i></div>' : ''}${searchHtml}${sourceHtml}${usageHtml(meta.usage || {})}</div></details>`;
 }
@@ -174,12 +277,13 @@ function wireMessageActions(items) {
       if (prompt) submitPrompt(prompt);
     };
     $$('.code-download', node).forEach(button => button.onclick = () => {
-      const codeNode = $('pre code', button.closest('.code-wrap'));
+      const wrap = button.closest('.code-wrap');
+      const codeNode = $('pre code', wrap);
       const langNode = $('span', button.parentElement);
       const code = codeNode ? codeNode.textContent : '';
-      const lang = langNode ? langNode.textContent : 'txt';
+      const lang = wrap && wrap.dataset.extension ? wrap.dataset.extension : (langNode ? langNode.textContent : 'txt');
       const blob = new Blob([code], {type:'text/plain;charset=utf-8'}), a=document.createElement('a');
-      a.href=URL.createObjectURL(blob); a.download=`code.${lang === 'code' ? 'txt' : lang}`; a.click(); URL.revokeObjectURL(a.href);
+      a.href=URL.createObjectURL(blob); a.download=`code.${lang === 'code' ? 'txt' : lang}`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 0);
     });
   });
 }
