@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#0b1220">
+  <title>DeepSeek Native Chat</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <section id="loginView" class="login-view">
+    <div class="login-card">
+      <div class="brand-mark">DS</div>
+      <p class="eyebrow">PRIVATE WORKSPACE</p>
+      <h1>DeepSeek Chat</h1>
+      <p class="muted">原生联网搜索，不经过本地搜索代理。</p>
+      <form id="loginForm" class="stack">
+        <label>账号<input id="loginUser" autocomplete="username" required></label>
+        <label>密码<input id="loginPass" type="password" autocomplete="current-password" required></label>
+        <button class="primary" type="submit">登录</button>
+        <p id="loginError" class="error"></p>
+      </form>
+    </div>
+  </section>
+
+  <div id="appView" class="app hidden">
+    <aside id="sidebar" class="sidebar">
+      <div class="side-head">
+        <div><p class="eyebrow">DEEPSEEK</p><strong>Native Chat</strong></div>
+        <button id="closeSidebar" class="icon-btn mobile-only" aria-label="关闭">×</button>
+      </div>
+      <button id="newChat" class="new-chat"><span>＋</span> 新对话</button>
+      <div class="history-title"><span>对话历史</span><span id="historyCount">0</span></div>
+      <nav id="history" class="history"></nav>
+      <div id="pagination" class="pagination"></div>
+      <div class="account-card">
+        <span id="avatar" class="avatar">A</span>
+        <span class="account-name"><strong id="accountName"></strong><small id="accountRole"></small></span>
+        <button id="logout" class="icon-btn" title="退出">↗</button>
+      </div>
+    </aside>
+    <div id="scrim" class="scrim"></div>
+
+    <main class="main">
+      <header class="topbar">
+        <button id="openSidebar" class="icon-btn mobile-only" aria-label="菜单">☰</button>
+        <div class="title-block"><h2 id="conversationTitle">新对话</h2><span class="status-dot">原生搜索已就绪</span></div>
+        <div class="top-actions">
+          <label class="compact-select"><span>思考</span><select id="effort"><option value="high">深度</option><option value="max">最大</option></select></label>
+          <button id="providerButton" class="soft-btn">API</button>
+          <button id="usersButton" class="soft-btn hidden">账号</button>
+        </div>
+      </header>
+
+      <section id="chatScroll" class="chat-scroll">
+        <div id="welcome" class="welcome">
+          <div class="welcome-orbit"><span>DS</span></div>
+          <p class="eyebrow">DEEPSEEK V4 FLASH</p>
+          <h1>问点需要查证的问题</h1>
+          <p>模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。</p>
+          <div class="suggestions">
+            <button data-prompt="搜索并梳理今天最重要的人工智能新闻，说明事件发生时间并附上来源。">今日 AI 动态</button>
+            <button data-prompt="调查一个近期有争议的科技话题，分别列出各方证据和不确定之处。">多源调查</button>
+            <button data-prompt="搜索最近一周值得关注的开源项目，按用途整理并附上项目地址。">开源项目</button>
+          </div>
+        </div>
+        <div id="messages" class="messages"></div>
+        <button id="jumpBottom" class="jump-bottom hidden">↓ 回到最新</button>
+      </section>
+
+      <footer class="composer-wrap">
+        <form id="composer" class="composer">
+          <textarea id="prompt" rows="1" maxlength="100000" placeholder="输入问题，Enter 发送，Shift + Enter 换行"></textarea>
+          <div class="composer-foot">
+            <div class="model-line"><span class="native-pill">● Native Web</span><select id="providerSelect"><option value="">请先添加 API</option></select></div>
+            <div class="send-actions">
+              <button id="stopButton" class="stop hidden" type="button">■ 停止</button>
+              <button id="sendButton" class="send" type="submit" aria-label="发送">↑</button>
+            </div>
+          </div>
+        </form>
+        <p class="footnote">搜索由 DeepSeek Responses API 执行；重要信息仍建议核对原始来源。</p>
+      </footer>
+    </main>
+  </div>
+
+  <dialog id="providerModal" class="modal">
+    <div class="modal-head"><div><p class="eyebrow">CONNECTIONS</p><h3>DeepSeek API</h3></div><button class="icon-btn close-modal">×</button></div>
+    <div id="providerList" class="item-list"></div>
+    <form id="providerForm" class="form-grid">
+      <label>配置名称<input id="providerName" placeholder="例如：我的 DeepSeek" required></label>
+      <label>API Key<input id="providerKey" type="password" autocomplete="off" placeholder="sk-…" required></label>
+      <label class="wide">API 地址<input id="providerBase" value="https://api.deepseek.com" required></label>
+      <label>模型
+        <select id="providerModel"><option value="deepseek-v4-flash">deepseek-v4-flash</option></select>
+      </label>
+      <label>手动模型名<input id="manualModel" placeholder="可选"></label>
+      <div class="wide form-actions"><button id="testProvider" class="soft-btn" type="button">测试并读取模型</button><button class="primary" type="submit">保存 API</button></div>
+      <p id="providerStatus" class="wide muted"></p>
+    </form>
+  </dialog>
+
+  <dialog id="usersModal" class="modal small-modal">
+    <div class="modal-head"><div><p class="eyebrow">ADMIN</p><h3>账号管理</h3></div><button class="icon-btn close-modal">×</button></div>
+    <div id="userList" class="item-list"></div>
+    <form id="userForm" class="form-grid">
+      <label>用户名<input id="newUsername" required minlength="2"></label>
+      <label>密码<input id="newPassword" type="password" required minlength="8"></label>
+      <label class="check"><input id="newAdmin" type="checkbox"> 管理员账号</label>
+      <div class="form-actions"><button class="primary" type="submit">新增账号</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast"></div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>
