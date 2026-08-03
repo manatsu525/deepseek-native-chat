@@ -181,6 +181,18 @@ async def stream_response(
             # intentionally execute only the first; the next round decides the
             # next operation, enforcing one tool call per round.
             call = calls[0]
+            # Keep the model's assistant turn paired with its tool result. The
+            # previous implementation appended only the `tool` message, which
+            # made the next request an invalid/incomplete Chat Completions
+            # history and prevented providers from reusing the full prefix.
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": round_answer,
+                "tool_calls": [call],
+            }
+            if config["thinking"] == "enabled":
+                assistant_message["reasoning_content"] = round_reasoning
+            conversation.append(assistant_message)
             tool_rounds_used += 1
             call_id = call["id"]
             function = call.get("function") or {}
