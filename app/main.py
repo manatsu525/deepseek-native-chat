@@ -37,6 +37,10 @@ class UserBody(BaseModel):
     is_admin: bool = False
 
 
+class PasswordBody(BaseModel):
+    password: str = Field(min_length=8, max_length=128)
+
+
 class ProviderBody(BaseModel):
     name: str = Field(min_length=1, max_length=40)
     api_key: str = Field(min_length=8, max_length=300)
@@ -268,6 +272,14 @@ def delete_user(user_id: int, admin: dict[str, Any] = Depends(admin_user)) -> di
     if target["is_admin"] and db.one("SELECT COUNT(*) AS n FROM users WHERE is_admin=1")["n"] <= 1:
         raise HTTPException(400, "必须保留一个管理员")
     db.run("DELETE FROM users WHERE id=?", (user_id,))
+    return {"ok": True}
+
+
+@app.put("/api/users/{user_id}/password")
+def change_password(user_id: int, body: PasswordBody, _: dict[str, Any] = Depends(admin_user)) -> dict[str, bool]:
+    if not db.one("SELECT id FROM users WHERE id=?", (user_id,)):
+        raise HTTPException(404, "账号不存在")
+    db.run("UPDATE users SET password_hash=? WHERE id=?", (password_hash(body.password), user_id))
     return {"ok": True}
 
 

@@ -11,7 +11,7 @@ INSTALL_DIR=/opt/deepseek-native-chat
 DATA_DIR=$INSTALL_DIR/data
 SERVICE_FILE=/etc/systemd/system/deepseek-native-chat.service
 ADMIN_USER=${1:-admin}
-ADMIN_PASS=${2:-}
+ADMIN_PASS=${2:-admin123456}
 PUBLIC_IP=${PUBLIC_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}
 PORT=${PORT:-8000}
 
@@ -20,9 +20,6 @@ if [[ -f $INSTALL_DIR/.env && -s $DATA_DIR/chat.db ]]; then
   existing_pass=$(sed -n 's/^ADMIN_PASSWORD=//p' "$INSTALL_DIR/.env" | head -n1)
   ADMIN_USER=${existing_user:-$ADMIN_USER}
   ADMIN_PASS=${existing_pass:-$ADMIN_PASS}
-fi
-if [[ -z $ADMIN_PASS ]]; then
-  ADMIN_PASS=$(openssl rand -base64 18 | tr -d '/+=' | head -c 18)
 fi
 if [[ ${#ADMIN_PASS} -lt 8 || $ADMIN_PASS == *$'\n'* ]]; then
   echo "管理员密码必须至少 8 位且不能包含换行。" >&2
@@ -93,5 +90,5 @@ echo
 echo "安装完成"
 echo "地址: https://${PUBLIC_IP:-服务器IP}:$PORT"
 echo "管理员: $ADMIN_USER"
-echo "初始密码: $ADMIN_PASS"
+echo "初始密码: $ADMIN_PASS（登录后请在账号管理中修改）"
 echo "浏览器会提示自签证书不受信任，手动继续访问即可。"

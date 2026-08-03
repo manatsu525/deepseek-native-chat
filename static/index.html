@@ -6,6 +6,7 @@
   <meta name="theme-color" content="#0b1220">
   <title>DeepSeek Native Chat</title>
   <link rel="stylesheet" href="/assets/style.css">
+  <style>.item-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap}</style>
 </head>
 <body>
   <section id="loginView" class="login-view">
@@ -108,6 +109,17 @@
       <label>密码<input id="newPassword" type="password" required minlength="8"></label>
       <label class="check"><input id="newAdmin" type="checkbox"> 管理员账号</label>
       <div class="form-actions"><button class="primary" type="submit">新增账号</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="passwordModal" class="modal small-modal">
+    <div class="modal-head"><div><p class="eyebrow">SECURITY</p><h3>修改密码</h3><p id="passwordTarget" class="muted"></p></div><button class="icon-btn close-modal">×</button></div>
+    <form id="passwordForm" class="stack">
+      <input id="passwordUserId" type="hidden">
+      <label>新密码<input id="changePassword" type="password" minlength="8" maxlength="128" autocomplete="new-password" required></label>
+      <label>再次输入<input id="changePasswordAgain" type="password" minlength="8" maxlength="128" autocomplete="new-password" required></label>
+      <p id="passwordError" class="error"></p>
+      <div class="form-actions"><button class="primary" type="submit">保存新密码</button></div>
     </form>
   </dialog>
 
