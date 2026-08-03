@@ -95,10 +95,10 @@ function messageHtml(message, index, live=false) {
   const meta = message.meta || {};
   const content = message.content || '';
   const detailKey = `trace-${meta.job_id || `message-${index}`}`;
-  return `<article class="message ${assistant ? 'assistant' : 'user'}" data-index="${index}">
+  return `<article class="message ${assistant ? 'assistant' : 'user'}${live ? ' live-message' : ''}" data-index="${index}">
     <div class="message-icon">${assistant ? 'DS' : escapeHtml(((state.me && state.me.username) || 'U')[0].toUpperCase())}</div>
     <div class="message-body"><div class="message-head"><strong>${assistant ? 'DeepSeek' : escapeHtml((state.me && state.me.username) || '你')}</strong></div>
-    ${assistant ? traceHtml(meta, live, detailKey) : ''}<div class="message-content">${assistant ? (content ? markdown(content) : '<div class="typing"><i></i><i></i><i></i></div>') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div><div class="message-actions"><button data-action="copy">复制</button><button data-action="retry">重新回答</button></div>
+    ${assistant ? traceHtml(meta, live, detailKey) : ''}<div class="message-content">${assistant ? (content ? markdown(content) : '<div class="typing"><i></i><i></i><i></i></div>') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div><div class="message-actions"><button type="button" data-action="copy">复制</button><button type="button" data-action="retry">重新回答</button></div>
     ${meta.error ? `<p class="job-error">${escapeHtml(meta.error)}</p>` : ''}</div></article>`;
 }
 
@@ -114,6 +114,54 @@ function renderMessages() {
   scroll.scrollTop = oldTop;
   $$('details[data-detail-key]').forEach(detail => detail.addEventListener('toggle', () => detailState.set(detail.dataset.detailKey, detail.open)));
   wireMessageActions(items);
+}
+
+function replaceJobMessage(job, liveState) {
+  const current = $('#messages .live-message');
+  const live = {
+    role: 'assistant',
+    content: job.answer || '',
+    meta: {
+      job_id: job.id,
+      reasoning: job.reasoning,
+      searches: job.searches,
+      sources: job.sources,
+      usage: job.usage,
+      error: job.error,
+      stopped: job.status === 'stopped',
+    },
+  };
+  if (!current) {
+    if (liveState) renderMessages();
+    return liveState ? null : live;
+  }
+  $$('details[data-detail-key]').forEach(detail => detailState.set(detail.dataset.detailKey, detail.open));
+  const fragment = document.createRange().createContextualFragment(messageHtml(live, state.messages.length, liveState));
+  current.replaceWith(fragment.firstElementChild);
+  $$('details[data-detail-key]').forEach(detail => detail.addEventListener('toggle', () => detailState.set(detail.dataset.detailKey, detail.open)));
+  wireMessageActions([...state.messages, live]);
+  return live;
+}
+
+function updateLiveMessage() {
+  if (!state.job || !['queued','running'].includes(state.job.status)) {
+    renderMessages();
+    return;
+  }
+  replaceJobMessage(state.job, true);
+}
+
+function finalizeLiveMessage(job) {
+  const hadLiveNode = Boolean($('#messages .live-message'));
+  const assistant = replaceJobMessage(job, false);
+  if (assistant) {
+    state.messages.push(assistant);
+    state.job = null;
+    if (!hadLiveNode) renderMessages();
+  } else {
+    state.job = null;
+    renderMessages();
+  }
 }
 
 function wireMessageActions(items) {
@@ -176,7 +224,7 @@ async function submitPrompt(value) {
 
 function setRunning(on){$('#stopButton').classList.toggle('hidden',!on);$('#sendButton').disabled=on;$('#providerSelect').disabled=on}
 function stopPolling(){if(state.poll)clearTimeout(state.poll);state.poll=null}
-function startPolling(id){stopPolling();setRunning(true);const tick=async()=>{try{const job=await api(`/api/jobs/${id}`);state.job=job;renderMessages();if(['completed','failed','stopped'].includes(job.status)){stopPolling();setRunning(false);if(job.status==='completed')await openConversation(job.conversation_id);else renderMessages();return}}catch(err){toast(err.message);setRunning(false);return}state.poll=setTimeout(tick,700)};tick()}
+function startPolling(id){stopPolling();setRunning(true);const tick=async()=>{try{const job=await api(`/api/jobs/${id}`);state.job=job;if(job.status==='completed'){stopPolling();setRunning(false);finalizeLiveMessage(job);await loadHistory(1);return}if(['failed','stopped'].includes(job.status)){stopPolling();setRunning(false);renderMessages();return}updateLiveMessage()}catch(err){toast(err.message);setRunning(false);return}state.poll=setTimeout(tick,700)};tick()}
 
 async function loadProviders(){state.providers=await api('/api/providers');$('#providerSelect').innerHTML=state.providers.length?state.providers.map(p=>`<option value="${p.id}">${escapeHtml(p.name)} · ${escapeHtml(p.model)}</option>`).join(''):'<option value="">请先添加 API</option>';renderProviderList()}
 function renderProviderList(){$('#providerList').innerHTML=state.providers.map(p=>`<div class="list-item"><div class="list-item-main"><strong>${escapeHtml(p.name)}</strong><small>${escapeHtml(p.api_key_masked)} · ${escapeHtml(p.model)}</small></div><button class="danger-btn" data-id="${p.id}">删除</button></div>`).join('')||'<p class="muted">尚未添加 API。</p>';$$('.danger-btn',$('#providerList')).forEach(b=>b.onclick=async()=>{if(!confirm('删除这个 API 配置？'))return;try{await api(`/api/providers/${b.dataset.id}`,{method:'DELETE'});await loadProviders()}catch(err){toast(err.message)}})}
