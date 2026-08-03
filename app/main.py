@@ -217,7 +217,7 @@ async def run_job(job_id: str) -> None:
         # its matching tool result can make compatible gateways reject history.
         if kind == "custom" and is_mimo_model(job.get("model")) and row["role"] == "assistant":
             meta = db.decode(row.get("meta_json", "{}"), {})
-            if meta.get("reasoning"):
+            if meta.get("reasoning") and not meta.get("invalid_answer"):
                 message["reasoning_content"] = meta.get("reasoning", "")
         history.append(message)
     db.update_job(job_id, status="running", error="", stop_requested=0)
