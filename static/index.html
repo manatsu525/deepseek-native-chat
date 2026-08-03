@@ -6,7 +6,10 @@
   <meta name="theme-color" content="#0b1220">
   <title>DeepSeek Native Chat</title>
   <link rel="stylesheet" href="/assets/style.css">
-  <style>.item-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap}</style>
+  <style>
+    .item-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+    @media (prefers-color-scheme:dark){.message-content table{background:#192130;color:#e8edf6}.message-content th{background:#28354a;color:#fff}.message-content td{color:#e8edf6;border-color:#3a4658}}
+  </style>
 </head>
 <body>
   <section id="loginView" class="login-view">
@@ -47,7 +50,7 @@
         <button id="openSidebar" class="icon-btn mobile-only" aria-label="菜单">☰</button>
         <div class="title-block"><h2 id="conversationTitle">新对话</h2><span class="status-dot">原生搜索已就绪</span></div>
         <div class="top-actions">
-          <label class="compact-select"><span>思考</span><select id="effort"><option value="high">深度</option><option value="max">最大</option></select></label>
+          <label class="compact-select" title="控制模型推理投入，不限制联网搜索次数"><span>推理</span><select id="effort"><option value="high">高 · High</option><option value="max">最大 · Max</option></select></label>
           <button id="providerButton" class="soft-btn">API</button>
           <button id="usersButton" class="soft-btn hidden">账号</button>
         </div>
