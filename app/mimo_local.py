@@ -16,9 +16,10 @@ from .mimo import (
     MIMO_MAX_SEARCHES,
     MIMO_MAX_SEARCH_RESULTS,
     MIMO_MAX_TOOL_ROUNDS,
-    MIMO_SYSTEM_PROMPT,
+    CUSTOM_SYSTEM_PROMPT,
     SEARCH_WEB_TOOL,
     _canonical_url,
+    custom_auth_headers,
     _merge_usage,
     _merge_tool_call,
     _page_source,
@@ -48,15 +49,15 @@ async def stream_response(
     update: Callable[[dict[str, Any]], Awaitable[None]],
     settings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Run MiMo with explicit local DuckDuckGo and Jina tools.
+    """Run a custom OpenAI-compatible model with local web tools.
 
-    MiMo native web search is deliberately not sent here. Keeping search as a
-    normal function tool makes the tool visible to the model and lets the
+    Provider-native search is deliberately not sent here. Keeping search as a
+    normal function tool makes it visible to any compatible model and lets the
     backend enforce the search -> source URL -> reader provenance chain.
     """
     config = _settings(settings)
-    headers = {"api-key": api_key, "Content-Type": "application/json", "Accept": "text/event-stream"}
-    conversation: list[dict[str, Any]] = [{"role": "system", "content": MIMO_SYSTEM_PROMPT}, *[dict(message) for message in messages]]
+    headers = custom_auth_headers(api_key, stream=True)
+    conversation: list[dict[str, Any]] = [{"role": "system", "content": CUSTOM_SYSTEM_PROMPT}, *[dict(message) for message in messages]]
     answer = ""
     reasoning = ""
     usage: dict[str, Any] = {}
@@ -91,17 +92,21 @@ async def stream_response(
                 round_tools.append(SEARCH_WEB_TOOL)
             if tool_rounds_used < MIMO_MAX_TOOL_ROUNDS and reader_enabled and allowed_urls:
                 round_tools.append(FETCH_WEBPAGE_TOOL)
+            is_mimo_model = model.casefold().startswith("mimo-")
             payload: dict[str, Any] = {
                 "model": model,
                 "messages": conversation,
-                "max_completion_tokens": int(config["max_completion_tokens"]),
+                # Older MiMo gateways use max_completion_tokens; the generic
+                # OpenAI-compatible spelling remains max_tokens.
+                "max_completion_tokens" if is_mimo_model else "max_tokens": int(config["max_completion_tokens"]),
                 "stream": True,
-                "thinking": {"type": config["thinking"]},
             }
+            if is_mimo_model:
+                payload["thinking"] = {"type": config["thinking"]}
             if round_tools:
                 payload["tools"] = round_tools
                 payload["tool_choice"] = "auto"
-            if config["thinking"] == "disabled":
+            if not is_mimo_model or config["thinking"] == "disabled":
                 payload["temperature"] = float(config["temperature"])
                 payload["top_p"] = float(config["top_p"])
 
@@ -112,7 +117,7 @@ async def stream_response(
             async with api_client.stream("POST", _url(base_url, "/chat/completions"), headers=headers, json=payload) as response:
                 if response.status_code >= 400:
                     body = (await response.aread()).decode(errors="replace")[:2000]
-                    raise RuntimeError(f"MiMo API {response.status_code}: {body}")
+                    raise RuntimeError(f"Custom API {response.status_code}: {body}")
                 async for line in response.aiter_lines():
                     if stopped():
                         raise asyncio.CancelledError
@@ -128,7 +133,7 @@ async def stream_response(
                     except json.JSONDecodeError:
                         continue
                     if data.get("error"):
-                        raise RuntimeError(f"MiMo 响应失败: {data['error']}")
+                        raise RuntimeError(f"Custom 响应失败: {data['error']}")
                     raw_usage = data.get("usage")
                     if isinstance(raw_usage, dict):
                         round_usage = _normalize_usage(raw_usage)
