@@ -21,7 +21,7 @@ from .deepseek import list_models as deepseek_list_models
 from .deepseek import stream_response as deepseek_stream_response
 from .mimo import DEFAULT_SETTINGS as MIMO_DEFAULT_SETTINGS
 from .mimo import MIMO_MAX_COMPLETION_TOKENS, MIMO_MODELS, list_models as mimo_list_models
-from .mimo import stream_response as mimo_stream_response
+from .mimo_local import stream_response as mimo_stream_response
 from .security import load_secret, make_token, password_hash, password_ok, read_token
 
 
@@ -63,12 +63,6 @@ class ProviderBody(BaseModel):
 
 
 class MimoSettingsBody(BaseModel):
-    max_keyword: int = Field(default=3, ge=1, le=10)
-    limit: int = Field(default=5, ge=1, le=20)
-    force_search: bool = False
-    country: str = Field(default="", max_length=80)
-    region: str = Field(default="", max_length=80)
-    city: str = Field(default="", max_length=80)
     thinking: Literal["enabled", "disabled"] = "enabled"
     max_completion_tokens: int = Field(default=8192, ge=256, le=MIMO_MAX_COMPLETION_TOKENS)
     temperature: float = Field(default=1.0, ge=0, le=1.5)
