@@ -1,6 +1,7 @@
 const $ = (s, root=document) => root.querySelector(s);
 const $$ = (s, root=document) => [...root.querySelectorAll(s)];
 const state = {me:null, providers:[], conversation:null, messages:[], job:null, page:1, pages:1, poll:null};
+const detailState = new Map();
 
 async function api(path, options={}) {
   const headers = {...(options.headers || {})};
@@ -71,7 +72,7 @@ function usageHtml(usage={}) {
   return `<div class="usage"><span>输入 ${input.toLocaleString()}</span><span>缓存命中 ${cached.toLocaleString()}</span><span>输出 ${output.toLocaleString()}</span><span>推理 ${reasoning.toLocaleString()}</span><span>合计 ${(input+output).toLocaleString()}</span></div>`;
 }
 
-function traceHtml(meta={}, active=false) {
+function traceHtml(meta={}, active=false, detailKey='trace') {
   const reasoning = meta.reasoning || '';
   const searches = meta.searches || [];
   const sources = meta.sources || [];
@@ -79,33 +80,39 @@ function traceHtml(meta={}, active=false) {
   const status = active ? '进行中' : (meta.stopped ? '已停止' : '已完成');
   const searchHtml = searches.map((s,i) => {
     const label=s.action==='open_page'?'读取网页':'联网搜索';
+    const searchKey=`${detailKey}-search-${s.id || i}`;
+    const searchOpen=detailState.get(searchKey) ? ' open' : '';
     const detail=s.url?`<a href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(s.url)}</a>`:escapeHtml(Array.isArray(s.query)?s.query.filter(x=>!String(x).startsWith('ws_call_id=')).join('；'):(s.query||'DeepSeek 未返回查询词'));
-    return `<details class="search-step"><summary>${label} ${i+1} · ${escapeHtml(s.status || 'completed')}</summary><div class="search-detail">${detail}</div></details>`;
+    return `<details class="search-step" data-detail-key="${escapeHtml(searchKey)}"${searchOpen}><summary>${label} ${i+1} · ${escapeHtml(s.status || 'completed')}</summary><div class="search-detail">${detail}</div></details>`;
   }).join('');
   const sourceHtml = sources.length ? `<div class="sources">${sources.map(s => `<a class="source-chip" href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(s.title || s.url)}</a>`).join('')}</div>` : '';
-  return `<details class="trace" open><summary>思考与联网 · ${status}${searches.length ? ` · ${searches.length} 次搜索` : ''}</summary><div class="trace-body">${reasoning ? `<div class="reasoning-text">${escapeHtml(reasoning)}</div>` : active ? '<div class="typing"><i></i><i></i><i></i></div>' : ''}${searchHtml}${sourceHtml}${usageHtml(meta.usage || {})}</div></details>`;
+  const traceOpen=detailState.get(detailKey) ? ' open' : '';
+  return `<details class="trace" data-detail-key="${escapeHtml(detailKey)}"${traceOpen}><summary>思考与联网 · ${status}${searches.length ? ` · ${searches.length} 次搜索` : ''}</summary><div class="trace-body">${reasoning ? `<div class="reasoning-text">${escapeHtml(reasoning)}</div>` : active ? '<div class="typing"><i></i><i></i><i></i></div>' : ''}${searchHtml}${sourceHtml}${usageHtml(meta.usage || {})}</div></details>`;
 }
 
 function messageHtml(message, index, live=false) {
   const assistant = message.role === 'assistant';
   const meta = message.meta || {};
   const content = message.content || '';
+  const detailKey = `trace-${meta.job_id || `message-${index}`}`;
   return `<article class="message ${assistant ? 'assistant' : 'user'}" data-index="${index}">
     <div class="message-icon">${assistant ? 'DS' : escapeHtml(((state.me && state.me.username) || 'U')[0].toUpperCase())}</div>
     <div class="message-body"><div class="message-head"><strong>${assistant ? 'DeepSeek' : escapeHtml((state.me && state.me.username) || '你')}</strong><div class="message-actions"><button data-action="copy">复制</button><button data-action="retry">重新回答</button></div></div>
-    ${assistant ? traceHtml(meta, live) : ''}<div class="message-content">${assistant ? (content ? markdown(content) : '<div class="typing"><i></i><i></i><i></i></div>') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div>
+    ${assistant ? traceHtml(meta, live, detailKey) : ''}<div class="message-content">${assistant ? (content ? markdown(content) : '<div class="typing"><i></i><i></i><i></i></div>') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div>
     ${meta.error ? `<p class="job-error">${escapeHtml(meta.error)}</p>` : ''}</div></article>`;
 }
 
 function renderMessages() {
   const scroll = $('#chatScroll'); const oldTop = scroll.scrollTop;
+  $$('details[data-detail-key]').forEach(detail => detailState.set(detail.dataset.detailKey, detail.open));
   const items = [...state.messages];
   if (state.job && ['queued','running','failed','stopped'].includes(state.job.status)) {
-    items.push({role:'assistant', content:state.job.answer || '', meta:{reasoning:state.job.reasoning,searches:state.job.searches,sources:state.job.sources,usage:state.job.usage,error:state.job.error,stopped:state.job.status==='stopped'}, live:['queued','running'].includes(state.job.status)});
+    items.push({role:'assistant', content:state.job.answer || '', meta:{job_id:state.job.id,reasoning:state.job.reasoning,searches:state.job.searches,sources:state.job.sources,usage:state.job.usage,error:state.job.error,stopped:state.job.status==='stopped'}, live:['queued','running'].includes(state.job.status)});
   }
   $('#welcome').classList.toggle('hidden', items.length > 0);
   $('#messages').innerHTML = items.map((m,i)=>messageHtml(m,i,!!m.live)).join('');
   scroll.scrollTop = oldTop;
+  $$('details[data-detail-key]').forEach(detail => detail.addEventListener('toggle', () => detailState.set(detail.dataset.detailKey, detail.open)));
   wireMessageActions(items);
 }
 
