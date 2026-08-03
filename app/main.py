@@ -223,7 +223,7 @@ async def run_job(job_id: str) -> None:
                 stopped=stopped,
                 update=update,
             )
-        meta = {"job_id": job_id, "provider_type": kind, "model": job["model"], "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"]}
+        meta = {"job_id": job_id, "provider_id": job["provider_id"], "provider_type": kind, "model": job["model"], "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"]}
         if result.get("tool_calls"):
             meta["tool_calls"] = result["tool_calls"]
         db.run(
@@ -246,6 +246,7 @@ async def run_job(job_id: str) -> None:
             meta = {
                 "job_id": job_id,
                 "stopped": True,
+                "provider_id": job["provider_id"],
                 "provider_type": provider_type(provider),
                 "model": job["model"],
                 "reasoning": partial.get("reasoning", ""),
