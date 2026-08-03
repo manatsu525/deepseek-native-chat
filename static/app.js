@@ -1,6 +1,6 @@
 const $ = (s, root=document) => root.querySelector(s);
 const $$ = (s, root=document) => [...root.querySelectorAll(s)];
-const state = {me:null, providers:[], conversation:null, messages:[], job:null, page:1, pages:1, poll:null};
+const state = {me:null, providers:[], conversation:null, messages:[], job:null, page:1, pages:1, poll:null, latestConversationId:null};
 const detailState = new Map();
 
 function storageKey(name) { return `deepseek-native-chat.${name}.${state.me ? state.me.id : 'guest'}`; }
@@ -308,6 +308,7 @@ function wireMessageActions(items) {
 
 async function loadHistory(page=1) {
   const data = await api(`/api/conversations?page=${page}`); state.page=data.page; state.pages=data.pages;
+  if(page===1) state.latestConversationId=data.items[0] ? data.items[0].id : null;
   $('#historyCount').textContent=data.total;
   $('#history').innerHTML=data.items.map(c=>`<button class="history-item ${state.conversation&&state.conversation.id===c.id?'active':''}" data-id="${c.id}"><span>${escapeHtml(c.title)}</span><b class="history-delete" title="删除">×</b></button>`).join('') || '<p class="muted" style="padding:10px;font-size:12px">还没有对话</p>';
   $$('.history-item').forEach(button => {
@@ -334,7 +335,7 @@ async function openConversation(id) {
   return false;
 }
 
-function newConversation(){stopPolling();state.conversation=null;state.messages=[];state.job=null;storeValue('active-conversation', null);$('#conversationTitle').textContent='新对话';renderMessages();loadHistory(1)}
+function newConversation(){stopPolling();state.conversation=null;state.messages=[];state.job=null;storeValue('active-conversation', '__new__');$('#conversationTitle').textContent='新对话';renderMessages();loadHistory(1)}
 
 async function submitPrompt(value) {
   const content=(value == null ? $('#prompt').value : value).trim(); if(!content)return;
@@ -456,7 +457,7 @@ async function loadUsers(){const users=await api('/api/users');$('#userList').in
 function resizePrompt(){const p=$('#prompt');p.style.height='auto';p.style.height=Math.min(p.scrollHeight,180)+'px'}
 function openSidebar(){$('#sidebar').classList.add('open')}function closeSidebar(){$('#sidebar').classList.remove('open')}
 
-async function boot(){try{state.me=await api('/api/me');$('#loginView').classList.add('hidden');$('#appView').classList.remove('hidden');$('#accountName').textContent=state.me.username;$('#accountRole').textContent=state.me.is_admin?'管理员':'用户';$('#avatar').textContent=state.me.username[0].toUpperCase();$('#usersButton').classList.toggle('hidden',!state.me.is_admin);await Promise.all([loadProviders(),loadHistory(1)]);const activeId=storedValue('active-conversation');const restored=activeId?await openConversation(activeId):false;if(!restored)renderMessages()}catch{$('#loginView').classList.remove('hidden');$('#appView').classList.add('hidden')}}
+async function boot(){try{state.me=await api('/api/me');$('#loginView').classList.add('hidden');$('#appView').classList.remove('hidden');$('#accountName').textContent=state.me.username;$('#accountRole').textContent=state.me.is_admin?'管理员':'用户';$('#avatar').textContent=state.me.username[0].toUpperCase();$('#usersButton').classList.toggle('hidden',!state.me.is_admin);await Promise.all([loadProviders(),loadHistory(1)]);const stored=storedValue('active-conversation');const activeId=stored==='__new__'?null:(stored||state.latestConversationId);const restored=activeId?await openConversation(activeId):false;if(!restored)renderMessages()}catch{$('#loginView').classList.remove('hidden');$('#appView').classList.add('hidden')}}
 
 $('#loginForm').onsubmit=async e=>{e.preventDefault();$('#loginError').textContent='';try{await api('/api/login',{method:'POST',body:{username:$('#loginUser').value,password:$('#loginPass').value}});await boot()}catch(err){$('#loginError').textContent=err.message}};
 $('#logout').onclick=async()=>{await api('/api/logout',{method:'POST'});location.reload()};
