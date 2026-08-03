@@ -190,7 +190,13 @@ async def stream_response(
                 "content": round_answer,
                 "tool_calls": [call],
             }
-            if config["thinking"] == "enabled":
+            # MiMo requires its reasoning field when thinking is enabled.  A
+            # generic OpenAI-compatible provider, however, may reject the
+            # MiMo-only `reasoning_content` field even when the UI's shared
+            # thinking setting is enabled.  Preserve reasoning only when the
+            # provider actually returned it (or when this is MiMo, whose
+            # protocol expects the field on tool-call turns).
+            if round_reasoning or (is_mimo_model and config["thinking"] == "enabled"):
                 assistant_message["reasoning_content"] = round_reasoning
             conversation.append(assistant_message)
             tool_rounds_used += 1
