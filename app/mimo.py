@@ -70,6 +70,11 @@ JINA_REMOVE_SELECTORS = (
     "header, nav, aside, footer, .sidebar, .side-bar, .navigation, .navbar, "
     ".menu, .advertisement, .ads, .ad, .cookie-banner, .cookie-consent, .popup"
 )
+JINA_FAILURE_MARKERS = (
+    "warning: target url returned error",
+    "warning: this page maybe requiring captcha",
+    "warning: target url was blocked",
+)
 
 # The custom provider uses ordinary OpenAI-compatible Chat Completions. These
 # two tools are executed by this process; search results become the only
@@ -476,6 +481,15 @@ async def _read_with_jina(client: Any, url: str, stopped: Callable[[], bool]) ->
     content = b"".join(chunks).decode("utf-8", errors="replace").strip()
     if not content:
         raise RuntimeError("Jina Reader 返回空内容")
+    # Jina itself may return HTTP 200 even when the target website returned a
+    # 403/429 challenge.  Those wrapper diagnostics are not webpage content
+    # and must not be counted as a successful read or injected into context.
+    diagnostic = content[:2000].casefold()
+    if any(marker in diagnostic for marker in JINA_FAILURE_MARKERS):
+        raise RuntimeError("Jina Reader 未能读取目标网页：目标站点返回错误或人机验证")
+    header, separator, markdown_body = content.partition("Markdown Content:")
+    if separator and not markdown_body.strip() and ("warning:" in header.casefold() or "error" in header.casefold()):
+        raise RuntimeError("Jina Reader 未返回可用网页正文")
     if len(content) > JINA_MAX_CHARS:
         content = content[:JINA_MAX_CHARS].rstrip() + "\n\n[网页内容已截断，仅保留前面部分]"
     return content

@@ -41,6 +41,23 @@ class UnapprovedSourceError(ValueError):
     pass
 
 
+FINAL_ANSWER_ATTEMPTS = 2
+FINAL_ANSWER_PROMPT = (
+    "The local web-tool budget is exhausted. You cannot call any more tools. "
+    "Do not emit tool_calls, XML such as <tool_call>, function-call JSON, or a request to read another URL. "
+    "Use only the evidence already present in the conversation and answer the user's original question now "
+    "in natural language. Clearly state uncertainty when the available evidence is insufficient."
+)
+
+
+def _looks_like_text_tool_call(value: str) -> bool:
+    """Detect a tool request emitted as answer text after tools are disabled."""
+    stripped = str(value or "").strip().casefold()
+    if stripped.startswith("```"):
+        stripped = stripped.split("\n", 1)[-1].lstrip()
+    return stripped.startswith("<tool_call") or stripped.startswith("<function=")
+
+
 async def stream_response(
     *,
     base_url: str,
@@ -76,6 +93,7 @@ async def stream_response(
     allowed_urls = _user_urls(messages)
     attempted_urls: set[str] = set()
     reader_enabled = bool(allowed_urls)
+    final_answer_attempts = 0
     api_limits = httpx.Timeout(timeout, connect=30)
     async with (
         httpx.AsyncClient(timeout=api_limits) as api_client,
@@ -91,9 +109,10 @@ async def stream_response(
             headers=JINA_BROWSER_HEADERS,
         ) as jina_client,
     ):
-        # The extra iteration after the eighth tool round is answer-only. It
-        # lets the model finish cleanly without exceeding eight tool calls.
-        for round_number in range(MIMO_MAX_TOOL_ROUNDS + 1):
+        # Tool calls stay capped at eight. Up to two answer-only attempts are
+        # reserved for providers that try to print a tool request as plain
+        # text after the tools have been removed.
+        for round_number in range(MIMO_MAX_TOOL_ROUNDS + FINAL_ANSWER_ATTEMPTS):
             if stopped():
                 raise asyncio.CancelledError
             round_tools: list[dict[str, Any]] = []
@@ -101,10 +120,22 @@ async def stream_response(
                 round_tools.append(SEARCH_WEB_TOOL)
             if tool_rounds_used < MIMO_MAX_TOOL_ROUNDS and reader_enabled and allowed_urls:
                 round_tools.append(FETCH_WEBPAGE_TOOL)
+            final_answer_only = not round_tools
             is_mimo_model = model.casefold().startswith("mimo-")
+            request_messages = conversation
+            if final_answer_only:
+                retry_note = (
+                    " Your preceding finalization attempt still tried to call a tool and was discarded."
+                    if final_answer_attempts
+                    else ""
+                )
+                request_messages = [
+                    *conversation,
+                    {"role": "system", "content": FINAL_ANSWER_PROMPT + retry_note},
+                ]
             payload: dict[str, Any] = {
                 "model": model,
-                "messages": conversation,
+                "messages": request_messages,
                 # Older MiMo gateways use max_completion_tokens; the generic
                 # OpenAI-compatible spelling remains max_tokens.
                 "max_completion_tokens" if is_mimo_model else "max_tokens": int(config["max_completion_tokens"]),
@@ -170,11 +201,26 @@ async def stream_response(
                         }
                     )
 
-            answer += round_answer
-            reasoning += round_reasoning
             usage = _merge_usage(usage, round_usage)
             calls = _tool_calls(round_tools_by_index, round_number)
-            if not calls or not round_tools:
+            if final_answer_only and (calls or _looks_like_text_tool_call(round_answer)):
+                final_answer_attempts += 1
+                await update(
+                    {
+                        "answer": answer,
+                        "reasoning": reasoning,
+                        "searches": steps,
+                        "usage": usage,
+                        "sources": list(sources.values()),
+                    }
+                )
+                if final_answer_attempts < FINAL_ANSWER_ATTEMPTS:
+                    continue
+                raise RuntimeError("模型在工具额度用完后仍反复输出工具调用，未生成最终答案")
+
+            answer += round_answer
+            reasoning += round_reasoning
+            if not calls or final_answer_only:
                 break
 
             # A compatible gateway may emit several calls in one response. We
