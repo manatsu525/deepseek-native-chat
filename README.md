@@ -38,6 +38,8 @@ sudo ./install.sh admin '至少八位的密码'
 sudo ./install.sh
 ```
 
+重复运行安装脚本会更新程序并保留已有数据库、证书和原管理员登录凭据。
+
 默认访问地址为 `https://服务器IP:8000`。证书为自签证书，首次访问需要在浏览器中确认继续。
 
 进入页面后，在右上角打开“API”，填写 DeepSeek 官方 API Key，点击“测试并读取模型”，确认存在 `deepseek-v4-flash` 后保存。

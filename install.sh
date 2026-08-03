@@ -15,6 +15,12 @@ ADMIN_PASS=${2:-}
 PUBLIC_IP=${PUBLIC_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}
 PORT=${PORT:-8000}
 
+if [[ -f $INSTALL_DIR/.env && -s $DATA_DIR/chat.db ]]; then
+  existing_user=$(sed -n 's/^ADMIN_USERNAME=//p' "$INSTALL_DIR/.env" | head -n1)
+  existing_pass=$(sed -n 's/^ADMIN_PASSWORD=//p' "$INSTALL_DIR/.env" | head -n1)
+  ADMIN_USER=${existing_user:-$ADMIN_USER}
+  ADMIN_PASS=${existing_pass:-$ADMIN_PASS}
+fi
 if [[ -z $ADMIN_PASS ]]; then
   ADMIN_PASS=$(openssl rand -base64 18 | tr -d '/+=' | head -c 18)
 fi
