@@ -98,6 +98,11 @@ class Database:
             job_columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)").fetchall()}
             if "provider_type" not in job_columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN provider_type TEXT NOT NULL DEFAULT 'deepseek'")
+            # Older releases called the OpenAI-compatible provider "mimo".
+            # Keep existing API configurations and job history, but expose the
+            # new generic name everywhere after the next startup.
+            db.execute("UPDATE providers SET provider_type='custom' WHERE provider_type='mimo'")
+            db.execute("UPDATE jobs SET provider_type='custom' WHERE provider_type='mimo'")
         self.path.chmod(0o600)
 
     def one(self, sql: str, args: tuple[Any, ...] = ()) -> Optional[dict[str, Any]]:

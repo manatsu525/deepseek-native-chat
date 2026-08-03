@@ -222,9 +222,10 @@ function messageHtml(message, index, live=false) {
   const meta = message.meta || {};
   const content = message.content || '';
   const detailKey = `trace-${meta.job_id || `message-${index}`}`;
-  const assistantName = meta.provider_type === 'mimo' ? 'MiMo' : 'DeepSeek';
+  const custom = normalizeProviderType(meta.provider_type)==='custom';
+  const assistantName = custom ? 'Custom' : 'DeepSeek';
   return `<article class="message ${assistant ? 'assistant' : 'user'}${live ? ' live-message' : ''}" data-index="${index}">
-    <div class="message-icon">${assistant ? (meta.provider_type === 'mimo' ? 'MM' : 'DS') : escapeHtml(((state.me && state.me.username) || 'U')[0].toUpperCase())}</div>
+    <div class="message-icon">${assistant ? (custom ? 'CU' : 'DS') : escapeHtml(((state.me && state.me.username) || 'U')[0].toUpperCase())}</div>
     <div class="message-body"><div class="message-head"><strong>${assistant ? assistantName : escapeHtml((state.me && state.me.username) || '你')}</strong></div>
     ${assistant ? traceHtml(meta, live, detailKey) : ''}<div class="message-content">${assistant ? (content ? markdown(content) : live ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div><div class="message-actions"><button type="button" data-action="copy">复制</button><button type="button" data-action="retry">重新回答</button></div>
     ${meta.error ? `<p class="job-error">${escapeHtml(meta.error)}</p>` : ''}</div></article>`;
@@ -350,12 +351,13 @@ function newConversation(){stopPolling();state.conversation=null;state.messages=
 async function submitPrompt(value) {
   const content=(value == null ? $('#prompt').value : value).trim(); if(!content)return;
   const provider=selectedProvider(); if(!provider){$('#providerModal').showModal();toast('请先添加 API 配置');return}
+  const model=selectedModel(); if(!model){$('#providerModal').showModal();toast('请先选择模型');return}
   if(state.job && ['queued','running'].includes(state.job.status)){toast('请先停止当前回答');return}
   $('#prompt').value='';resizePrompt();
-  state.messages.push({role:'user',content,meta:{}});state.job={status:'queued',provider_type:provider.provider_type,provider_id:provider.id,answer:'',reasoning:'',searches:[],sources:[],usage:{}};renderMessages();
+  state.messages.push({role:'user',content,meta:{}});state.job={status:'queued',provider_type:provider.provider_type,provider_id:provider.id,model,answer:'',reasoning:'',searches:[],sources:[],usage:{}};renderMessages();
   $('#chatScroll').scrollTop=$('#chatScroll').scrollHeight;setRunning(true);
   try{
-    const data=await api('/api/chat',{method:'POST',body:{conversation_id:(state.conversation&&state.conversation.id)||null,content,provider_id:provider.id,model:provider.model,effort:$('#effort').value}});
+    const data=await api('/api/chat',{method:'POST',body:{conversation_id:(state.conversation&&state.conversation.id)||null,content,provider_id:provider.id,model,effort:$('#effort').value}});
     if(!state.conversation)state.conversation={id:data.conversation_id,title:content.slice(0,36)};
     storeValue('active-conversation', state.conversation.id);
     state.job.id=data.job_id;$('#conversationTitle').textContent=state.conversation.title;loadHistory(1);startPolling(data.job_id);
@@ -364,101 +366,121 @@ async function submitPrompt(value) {
 
 function setRunning(on){$('#stopButton').classList.toggle('hidden',!on);$('#sendButton').disabled=on;$('#providerSelect').disabled=on}
 function stopPolling(){if(state.poll)clearTimeout(state.poll);state.poll=null}
-function startPolling(id){stopPolling();setRunning(true);const tick=async()=>{try{const job=await api(`/api/jobs/${id}`);if(job.provider_id)selectProvider(job.provider_id,false);state.job=job;if(job.status==='completed'){stopPolling();setRunning(false);finalizeLiveMessage(job);await loadHistory(1);return}if(['failed','stopped'].includes(job.status)){stopPolling();setRunning(false);renderMessages();return}updateLiveMessage()}catch(err){toast(err.message);setRunning(false);return}state.poll=setTimeout(tick,700)};tick()}
+function startPolling(id){stopPolling();setRunning(true);const tick=async()=>{try{const job=await api(`/api/jobs/${id}`);if(job.provider_id)selectProvider(job.provider_id,false,job.model);state.job=job;if(job.status==='completed'){stopPolling();setRunning(false);finalizeLiveMessage(job);await loadHistory(1);return}if(['failed','stopped'].includes(job.status)){stopPolling();setRunning(false);renderMessages();return}updateLiveMessage()}catch(err){toast(err.message);setRunning(false);return}state.poll=setTimeout(tick,700)};tick()}
 
-function providerLabel(provider){return provider.provider_type==='mimo'?'MiMo':'DeepSeek'}
-function selectedProvider(){return state.providers.find(x=>String(x.id)===$('#providerSelect').value)}
-function selectProvider(providerId, persist=true) {
+function normalizeProviderType(value){return value==='mimo'?'custom':(value||'deepseek')}
+function providerLabel(provider){return normalizeProviderType(provider.provider_type)==='custom'?'Custom':'DeepSeek'}
+function providerModels(provider){const models=Array.isArray(provider&&provider.models)&&provider.models.length?provider.models:[provider&&provider.model];return [...new Set(models.filter(Boolean).map(String))]}
+function selectedOption(){return $('#providerSelect').selectedOptions[0]||null}
+function selectedProvider(){const option=selectedOption();const id=option&&option.dataset.providerId||$('#providerSelect').value;return state.providers.find(x=>String(x.id)===String(id))}
+function selectedModel(){const option=selectedOption();const provider=selectedProvider();return option&&option.dataset.model||providerModels(provider)[0]||''}
+function selectProvider(providerId, persist=true, model='') {
   const provider=state.providers.find(x=>String(x.id)===String(providerId));
   if(!provider) return null;
-  const changed=$('#providerSelect').value!==String(provider.id);
-  $('#providerSelect').value=String(provider.id);
-  if(persist) storeValue('active-provider', provider.id);
+  const option=[...$('#providerSelect').options].find(item=>String(item.dataset.providerId)===String(provider.id)&&(!model||item.dataset.model===String(model)))||[...$('#providerSelect').options].find(item=>String(item.dataset.providerId)===String(provider.id));
+  if(!option)return null;
+  const changed=$('#providerSelect').value!==option.value;
+  $('#providerSelect').value=option.value;
+  if(persist){storeValue('active-provider', provider.id);storeValue('active-model', option.dataset.model||'')}
   if(changed) updateProviderUi();
   return provider;
 }
 function providerForConversation(data) {
   const job=data.active_job;
-  if(job && job.provider_id) return job.provider_id;
+  if(job && job.provider_id) return {id:job.provider_id,model:job.model||''};
   for(const message of [...(data.messages || [])].reverse()) {
     const meta=message.meta || {};
-    if(meta.provider_id) return meta.provider_id;
+    if(meta.provider_id) return {id:meta.provider_id,model:meta.model||''};
     if(meta.provider_type || meta.model) {
       const match=state.providers.find(provider =>
-        (!meta.provider_type || provider.provider_type===meta.provider_type) &&
-        (!meta.model || provider.model===meta.model)
+        (!meta.provider_type || normalizeProviderType(provider.provider_type)===normalizeProviderType(meta.provider_type)) &&
+        (!meta.model || providerModels(provider).includes(meta.model))
       );
-      if(match) return match.id;
+      if(match) return {id:match.id,model:meta.model||''};
     }
   }
-  return storedValue('active-provider');
+  const stored=storedValue('active-provider');
+  return stored?{id:stored,model:''}:null;
 }
 function restoreProviderForConversation(data) {
-  const providerId=providerForConversation(data);
-  if(providerId) selectProvider(providerId);
+  const target=providerForConversation(data);
+  if(target) selectProvider(target.id,true,target.model);
 }
 function updateProviderUi(){
-  const provider=selectedProvider(), mimo=provider&&provider.provider_type==='mimo';
-  $('#mimoSettingsButton').classList.toggle('hidden',!mimo);
-  $('#effort').disabled=!!mimo;
-  $('#effort').title=mimo?'MiMo 的思考开关在“MiMo 联网”设置中配置':'控制 DeepSeek 模型推理投入';
-  $('#nativePill').textContent=mimo?'● DDG + Jina':'● Native Web';
-  $('#welcomeOrbitMark').textContent=mimo?'MM':'DS';
-  $('#welcomeEyebrow').textContent=mimo?'XIAOMI MIMO V2.5': 'DEEPSEEK V4 FLASH';
-  $('#welcomeTitle').textContent=mimo?'使用 DuckDuckGo + Jina 联网':'问点需要查证的问题';
-  $('#welcomeDescription').textContent=mimo?'模型会通过本地 DuckDuckGo 工具搜索，再按需用 Jina 读取真实来源。':'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
+  const provider=selectedProvider(), custom=provider&&normalizeProviderType(provider.provider_type)==='custom';
+  $('#customSettingsButton').classList.toggle('hidden',!custom);
+  $('#effort').disabled=!!custom;
+  $('#effort').title=custom?'Custom 使用接口自身参数；本地联网工具由后端控制':'控制 DeepSeek 模型推理投入';
+  $('#nativePill').textContent=custom?'● DDG + Jina':'● Native Web';
+  $('#welcomeOrbitMark').textContent=custom?'CU':'DS';
+  $('#welcomeEyebrow').textContent=custom?'CUSTOM · OPENAI CHAT': 'DEEPSEEK V4 FLASH';
+  $('#welcomeTitle').textContent=custom?'使用 Custom 本地联网':'问点需要查证的问题';
+  $('#welcomeDescription').textContent=custom?'模型通过标准 Chat Completions 调用本地 DuckDuckGo 搜索，再按需用 Jina 读取真实来源。':'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
 }
 
 async function loadProviders(){
   state.providers=await api('/api/providers');
-  $('#providerSelect').innerHTML=state.providers.length?state.providers.map(p=>`<option value="${p.id}">${escapeHtml(p.name)} · ${providerLabel(p)} · ${escapeHtml(p.model)}</option>`).join(''):'<option value="">请先添加 API</option>';
+  const options=state.providers.flatMap(p=>providerModels(p).map((model,index)=>`<option value="${p.id}:${index}" data-provider-id="${p.id}" data-model="${escapeHtml(model)}">${escapeHtml(p.name)} · ${providerLabel(p)} · ${escapeHtml(model)}</option>`));
+  $('#providerSelect').innerHTML=options.length?options.join(''):'<option value="">请先添加 API</option>';
   const preferred=storedValue('active-provider');
-  if(state.providers.length) selectProvider(state.providers.some(p=>String(p.id)===String(preferred)) ? preferred : state.providers[0].id);
+  const preferredModel=storedValue('active-model')||'';
+  if(state.providers.length) selectProvider(state.providers.some(p=>String(p.id)===String(preferred)) ? preferred : state.providers[0].id,true,preferredModel);
   renderProviderList(); updateProviderUi();
 }
 function renderProviderList(){
-  $('#providerList').innerHTML=state.providers.map(p=>`<div class="list-item"><div class="list-item-main"><strong>${escapeHtml(p.name)} <span class="provider-kind">${providerLabel(p)}</span></strong><small>${escapeHtml(p.api_key_masked)} · ${escapeHtml(p.model)}</small></div><button class="danger-btn" data-id="${p.id}">删除</button></div>`).join('')||'<p class="muted">尚未添加 API。</p>';
+  $('#providerList').innerHTML=state.providers.map(p=>`<div class="list-item"><div class="list-item-main"><strong>${escapeHtml(p.name)} <span class="provider-kind">${providerLabel(p)}</span></strong><small>${escapeHtml(p.api_key_masked)} · ${escapeHtml(providerModels(p).join('、'))}</small></div><button class="danger-btn" data-id="${p.id}">删除</button></div>`).join('')||'<p class="muted">尚未添加 API。</p>';
   $$('.danger-btn',$('#providerList')).forEach(b=>b.onclick=async()=>{if(!confirm('删除这个 API 配置？'))return;try{await api(`/api/providers/${b.dataset.id}`,{method:'DELETE'});await loadProviders()}catch(err){toast(err.message)}})
 }
 
 function providerType(){return $('#providerType').value||'deepseek'}
+function manualModelList(){return $('#manualModel').value.split(/[\n,]+/).map(item=>item.trim()).filter(Boolean).filter((item,index,array)=>array.indexOf(item)===index)}
+function renderCustomModels(models=[], selected=[]){
+  const list=$('#customModelList'), selectedSet=new Set(selected), values=[...new Set((models||[]).map(String).filter(Boolean))];
+  list.innerHTML=values.length?values.map(model=>`<label class="custom-model-option" data-model="${escapeHtml(model.toLowerCase())}"><input type="checkbox" value="${escapeHtml(model)}" ${selectedSet.has(model)?'checked':''}><span title="${escapeHtml(model)}">${escapeHtml(model)}</span></label>`).join(''):'<p class="custom-model-empty">测试 API 后显示可勾选模型。</p>';
+  $('#customModelCount').textContent=values.length?`共 ${values.length} 个，可勾选保存`:'请先测试 API';
+  $('#customModelsPanel').classList.toggle('hidden',providerType()!=='custom'||!values.length);
+}
 function syncProviderForm(){
-  const mimo=providerType()==='mimo';
+  const custom=providerType()==='custom';
   const base=$('#providerBase'), model=$('#providerModel');
-  base.value=mimo?'https://api.xiaomimimo.com/v1':'https://api.deepseek.com';
-  model.innerHTML=mimo?'<option value="mimo-v2.5-pro">mimo-v2.5-pro</option><option value="mimo-v2.5">mimo-v2.5</option>':'<option value="deepseek-v4-flash">deepseek-v4-flash</option>';
-  $('#providerName').placeholder=mimo?'例如：我的 MiMo':'例如：我的 DeepSeek';
+  base.value=custom?'https://api.openai.com/v1':'https://api.deepseek.com';
+  model.innerHTML='<option value="deepseek-v4-flash">deepseek-v4-flash</option>';
+  $('#providerModelField').classList.toggle('hidden',custom);
+  $('#manualModelField').classList.toggle('hidden',!custom);
+  $('#customModelsPanel').classList.toggle('hidden',!custom||!$('#customModelList input'));
+  $('#providerName').placeholder=custom?'例如：我的 Custom API':'例如：我的 DeepSeek';
+  if(!custom)renderCustomModels([],[]);
   $('#providerStatus').textContent='';
 }
 async function testProvider(){
-  const button=$('#testProvider');button.disabled=true;$('#providerStatus').textContent=`正在连接 ${providerType()==='mimo'?'MiMo':'DeepSeek'}…`;
+  const button=$('#testProvider');button.disabled=true;$('#providerStatus').textContent=`正在连接 ${providerType()==='custom'?'Custom':'DeepSeek'}…`;
   try{
-    const body=providerFormData();const result=await api('/api/providers/test',{method:'POST',body});const select=$('#providerModel');
-    const fallback=providerType()==='mimo'?['mimo-v2.5-pro','mimo-v2.5']:['deepseek-v4-flash'];
-    // The provider may list TTS/ASR models too; this chat only accepts the
-    // text models supported by the selected provider.
-    const advertised=result.models || [];
-    const supportedModels=(result.supported_models||[]).filter(m=>advertised.includes(m));
-    const models=supportedModels.length?supportedModels:fallback;
-    select.innerHTML=models.map(m=>`<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('');
-    const supported=(result.supported_models||[]).filter(m=>models.includes(m));
-    $('#providerStatus').textContent=supported.length?`连接成功，可用联网模型：${supported.join('、')}`:`API 可用，但没有检测到当前服务商支持的联网模型。`;
+    const body=providerFormData();const result=await api('/api/providers/test',{method:'POST',body});
+    if(providerType()==='custom'){
+      const selected=[...new Set([...checkedCustomModels(),...manualModelList()])];
+      renderCustomModels(result.models||[],selected.length?selected:(result.models||[]).slice(0,1));
+      $('#providerStatus').textContent=`连接成功，读取 ${(result.models||[]).length} 个模型${(result.manual_tested||[]).length?`，手填模型验证 ${result.manual_tested.length} 个`:''}${result.models_warning?'（/models 不可用，已使用手填模型验证）':''}。请勾选后保存。`;
+    }else{
+      $('#providerModel').value='deepseek-v4-flash';
+      $('#providerStatus').textContent='连接成功，可用模型：deepseek-v4-flash';
+    }
   }catch(err){$('#providerStatus').textContent=err.message}finally{button.disabled=false}
 }
-function providerFormData(){return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:$('#manualModel').value.trim()||$('#providerModel').value|| (providerType()==='mimo'?'mimo-v2.5-pro':'deepseek-v4-flash')}}
+function checkedCustomModels(){return $$('#customModelList input[type="checkbox"]:checked').map(input=>input.value)}
+function providerFormData(){const custom=providerType()==='custom';const manual=custom?manualModelList():[];const selected=custom?[...new Set([...checkedCustomModels(),...manual])]:['deepseek-v4-flash'];return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:selected[0]||$('#providerModel').value||'deepseek-v4-flash',selected_models:selected,manual_models:manual}}
 
-function mimoSettings(provider){return {...{thinking:'enabled',max_completion_tokens:8192,temperature:1,top_p:.95},...(provider&&provider.settings||{})}}
-function fillMimoSettings(){
-  const config=mimoSettings(selectedProvider());
-  $('#mimoThinking').value=config.thinking;$('#mimoMaxCompletion').value=config.max_completion_tokens;$('#mimoTemperature').value=config.temperature;$('#mimoTopP').value=config.top_p;
-  syncMimoThinkingFields();
+function customSettings(provider){return {...{thinking:'enabled',max_completion_tokens:8192,temperature:1,top_p:.95},...(provider&&provider.settings||{})}}
+function fillCustomSettings(){
+  const config=customSettings(selectedProvider());
+  $('#customThinking').value=config.thinking;$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;
+  syncCustomThinkingFields();
 }
-function syncMimoThinkingFields(){const disabled=$('#mimoThinking').value==='enabled';$('#mimoTemperature').disabled=disabled;$('#mimoTopP').disabled=disabled;$('#mimoSamplingNote').textContent=disabled?'深度思考开启时，MiMo 会强制使用 temperature=1.0、top_p=0.95。':'关闭思考后可自定义 temperature 和 top_p。'}
-function openMimoSettings(){if(!selectedProvider()||selectedProvider().provider_type!=='mimo'){toast('请先选择 MiMo API');return}fillMimoSettings();$('#mimoModal').showModal()}
-async function saveMimoSettings(event){
+function syncCustomThinkingFields(){const disabled=$('#customThinking').value==='enabled';$('#customTemperature').disabled=disabled;$('#customTopP').disabled=disabled;$('#customSamplingNote').textContent=disabled?'开启时仅对兼容模型发送 thinking 参数；其他 Custom 模型仍使用标准参数。':'所有 Custom 模型使用可自定义的 temperature/top_p。'}
+function openCustomSettings(){if(!selectedProvider()||normalizeProviderType(selectedProvider().provider_type)!=='custom'){toast('请先选择 Custom API');return}fillCustomSettings();$('#customModal').showModal()}
+async function saveCustomSettings(event){
   event.preventDefault(); const provider=selectedProvider(); if(!provider)return;
-  const body={thinking:$('#mimoThinking').value,max_completion_tokens:Number($('#mimoMaxCompletion').value),temperature:Number($('#mimoTemperature').value),top_p:Number($('#mimoTopP').value)};
-  try{const updated=await api(`/api/providers/${provider.id}/settings`,{method:'PUT',body});const index=state.providers.findIndex(x=>x.id===provider.id);if(index>=0)state.providers[index]=updated;$('#mimoModal').close();updateProviderUi();toast('MiMo 参数已保存')}catch(err){$('#mimoStatus').textContent=err.message}
+  const body={thinking:$('#customThinking').value,max_completion_tokens:Number($('#customMaxCompletion').value),temperature:Number($('#customTemperature').value),top_p:Number($('#customTopP').value)};
+  try{const updated=await api(`/api/providers/${provider.id}/settings`,{method:'PUT',body});const index=state.providers.findIndex(x=>x.id===provider.id);if(index>=0)state.providers[index]=updated;$('#customModal').close();updateProviderUi();toast('Custom 参数已保存')}catch(err){$('#customStatus').textContent=err.message}
 }
 
 async function loadUsers(){const users=await api('/api/users');$('#userList').innerHTML=users.map(u=>`<div class="list-item"><span class="avatar">${escapeHtml(u.username[0].toUpperCase())}</span><div class="list-item-main"><strong>${escapeHtml(u.username)}</strong><small>${u.is_admin?'管理员':'普通账号'}</small></div><div class="item-actions"><button class="soft-btn" data-password-user="${u.id}" data-username="${escapeHtml(u.username)}">改密码</button>${u.id!==state.me.id?`<button class="danger-btn" data-user="${u.id}">删除</button>`:''}</div></div>`).join('');$$('[data-user]',$('#userList')).forEach(b=>b.onclick=async()=>{if(!confirm('删除账号及其全部独立数据？'))return;try{await api(`/api/users/${b.dataset.user}`,{method:'DELETE'});loadUsers()}catch(err){toast(err.message)}});$$('[data-password-user]',$('#userList')).forEach(b=>b.onclick=()=>{$('#passwordUserId').value=b.dataset.passwordUser;$('#passwordTarget').textContent=`正在修改：${b.dataset.username}`;$('#changePassword').value='';$('#changePasswordAgain').value='';$('#passwordError').textContent='';$('#passwordModal').showModal()})}
@@ -475,10 +497,10 @@ $('#newChat').onclick=()=>{newConversation();closeSidebar()};$('#composer').onsu
 $('#prompt').oninput=resizePrompt;
 $('#stopButton').onclick=async()=>{if(state.job&&state.job.id){await api(`/api/jobs/${state.job.id}/stop`,{method:'POST'});toast('正在停止')}};
 $('#providerButton').onclick=()=>{$('#providerModal').showModal();renderProviderList()};$('#usersButton').onclick=()=>{loadUsers();$('#usersModal').showModal()};
-$('#mimoSettingsButton').onclick=openMimoSettings;$('#providerSelect').onchange=()=>{storeValue('active-provider',$('#providerSelect').value);updateProviderUi()};$('#providerType').onchange=syncProviderForm;$('#mimoThinking').onchange=syncMimoThinkingFields;
+$('#customSettingsButton').onclick=openCustomSettings;$('#providerSelect').onchange=()=>{const provider=selectedProvider();if(provider){storeValue('active-provider',provider.id);storeValue('active-model',selectedModel())}updateProviderUi()};$('#providerType').onchange=syncProviderForm;$('#customThinking').onchange=syncCustomThinkingFields;$('#customModelFilter').oninput=e=>{const value=e.target.value.trim().toLowerCase();$$('.custom-model-option',$('#customModelList')).forEach(item=>item.dataset.hidden=value&&!item.dataset.model.includes(value)?'1':'0')};
 $$('.close-modal').forEach(b=>b.onclick=()=>b.closest('dialog').close());$$('dialog').forEach(d=>d.onclick=e=>{if(e.target===d)d.close()});
-$('#testProvider').onclick=testProvider;$('#providerForm').onsubmit=async e=>{e.preventDefault();try{const body=providerFormData();await api('/api/providers',{method:'POST',body});e.target.reset();$('#providerType').value='deepseek';syncProviderForm();$('#providerKey').value='';$('#manualModel').value='';$('#providerStatus').textContent='';await loadProviders();toast('API 已保存')}catch(err){$('#providerStatus').textContent=err.message}};
-$('#mimoForm').onsubmit=saveMimoSettings;
+$('#testProvider').onclick=testProvider;$('#providerForm').onsubmit=async e=>{e.preventDefault();try{const body=providerFormData();await api('/api/providers',{method:'POST',body});e.target.reset();$('#providerType').value='deepseek';syncProviderForm();$('#providerKey').value='';$('#manualModel').value='';renderCustomModels([],[]);$('#providerStatus').textContent='';await loadProviders();toast('API 已保存')}catch(err){$('#providerStatus').textContent=err.message}};
+$('#customForm').onsubmit=saveCustomSettings;
 $('#userForm').onsubmit=async e=>{e.preventDefault();try{await api('/api/users',{method:'POST',body:{username:$('#newUsername').value,password:$('#newPassword').value,is_admin:$('#newAdmin').checked}});e.target.reset();await loadUsers();toast('账号已新增')}catch(err){toast(err.message)}};
 $('#passwordForm').onsubmit=async e=>{e.preventDefault();const password=$('#changePassword').value;if(password!==$('#changePasswordAgain').value){$('#passwordError').textContent='两次输入的密码不一致';return}try{await api(`/api/users/${$('#passwordUserId').value}/password`,{method:'PUT',body:{password}});$('#passwordModal').close();toast('密码已修改')}catch(err){$('#passwordError').textContent=err.message}};
 $('#openSidebar').onclick=openSidebar;$('#closeSidebar').onclick=closeSidebar;$('#scrim').onclick=closeSidebar;

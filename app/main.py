@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal, Optional
 
+import httpx
 import uvicorn
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse
@@ -19,9 +20,9 @@ from .config import settings
 from .db import Database
 from .deepseek import list_models as deepseek_list_models
 from .deepseek import stream_response as deepseek_stream_response
-from .mimo import DEFAULT_SETTINGS as MIMO_DEFAULT_SETTINGS
-from .mimo import MIMO_MAX_COMPLETION_TOKENS, MIMO_MODELS, list_models as mimo_list_models
-from .mimo_local import stream_response as mimo_stream_response
+from .mimo import DEFAULT_SETTINGS as CUSTOM_DEFAULT_SETTINGS
+from .mimo import MIMO_MAX_COMPLETION_TOKENS, custom_auth_headers, list_models as custom_list_models
+from .mimo_local import stream_response as custom_stream_response
 from .security import load_secret, make_token, password_hash, password_ok, read_token
 
 
@@ -30,11 +31,13 @@ secret = b""
 tasks: dict[str, asyncio.Task[Any]] = {}
 SUPPORTED_MODELS = {
     "deepseek": {"deepseek-v4-flash"},
-    "mimo": MIMO_MODELS,
+    # Custom providers advertise their own model IDs through /models or a
+    # manually entered model name, so there is no static allow-list here.
+    "custom": set(),
 }
 DEFAULT_BASE_URLS = {
     "deepseek": "https://api.deepseek.com",
-    "mimo": "https://api.xiaomimimo.com/v1",
+    "custom": "https://api.openai.com/v1",
 }
 
 
@@ -56,13 +59,15 @@ class PasswordBody(BaseModel):
 class ProviderBody(BaseModel):
     name: str = Field(min_length=1, max_length=40)
     api_key: str = Field(min_length=8, max_length=300)
-    provider_type: Literal["deepseek", "mimo"] = "deepseek"
+    provider_type: Literal["deepseek", "custom"] = "deepseek"
     base_url: str = ""
     model: str = ""
-    mimo_settings: Optional[dict[str, Any]] = None
+    selected_models: list[str] = Field(default_factory=list, max_length=500)
+    manual_models: Optional[list[str]] = Field(default=None, max_length=500)
+    custom_settings: Optional[dict[str, Any]] = None
 
 
-class MimoSettingsBody(BaseModel):
+class CustomSettingsBody(BaseModel):
     thinking: Literal["enabled", "disabled"] = "enabled"
     max_completion_tokens: int = Field(default=8192, ge=256, le=MIMO_MAX_COMPLETION_TOKENS)
     temperature: float = Field(default=1.0, ge=0, le=1.5)
@@ -77,22 +82,59 @@ class ChatBody(BaseModel):
     effort: str = "high"
 
 
-def normalize_mimo_settings(value: Any = None) -> dict[str, Any]:
-    data = dict(MIMO_DEFAULT_SETTINGS)
-    if isinstance(value, MimoSettingsBody):
+def normalize_custom_settings(value: Any = None) -> dict[str, Any]:
+    data = dict(CUSTOM_DEFAULT_SETTINGS)
+    if isinstance(value, CustomSettingsBody):
         data.update(value.model_dump())
     elif isinstance(value, dict):
         data.update(value)
-    return MimoSettingsBody(**data).model_dump()
+    return CustomSettingsBody(**data).model_dump()
+
+
+# Kept as a source-compatible alias for older integrations importing the
+# original class/function names.
+MimoSettingsBody = CustomSettingsBody
+normalize_mimo_settings = normalize_custom_settings
 
 
 def provider_type(row: dict[str, Any]) -> str:
-    return row.get("provider_type") or "deepseek"
+    kind = row.get("provider_type") or "deepseek"
+    return "custom" if kind == "mimo" else kind
 
 
-def validate_provider_selection(kind: str, model: str) -> None:
+def _clean_model_ids(values: Any) -> list[str]:
+    if not isinstance(values, (list, tuple, set)):
+        return []
+    models = list(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
+    if any(len(item) > 300 for item in models):
+        raise HTTPException(400, "模型名称过长")
+    if len(models) > 500:
+        raise HTTPException(400, "一次最多保存 500 个模型")
+    return models
+
+
+def _models_from_settings(model: Any, settings_json: Any) -> list[str]:
+    settings_value = settings_json if isinstance(settings_json, dict) else db.decode(str(settings_json or "{}"), {})
+    selected = _clean_model_ids(settings_value.get("models", [])) if isinstance(settings_value, dict) else []
+    fallback = str(model or "").strip()
+    if fallback and fallback not in selected:
+        selected.insert(0, fallback)
+    return selected
+
+
+def provider_models(row: dict[str, Any]) -> list[str]:
+    return _models_from_settings(row.get("model"), row.get("settings_json", "{}"))
+
+
+def validate_provider_selection(kind: str, model: str, provider: Optional[dict[str, Any]] = None) -> None:
     if kind not in SUPPORTED_MODELS:
         raise HTTPException(400, "不支持的服务商类型")
+    if kind == "custom":
+        if not model.strip():
+            raise HTTPException(400, "请选择或填写一个 custom 模型")
+        if provider is not None and model not in provider_models(provider):
+            raise HTTPException(400, "该模型未在此 custom API 配置中启用")
+        return
     if model not in SUPPORTED_MODELS[kind]:
         available = "、".join(sorted(SUPPORTED_MODELS[kind]))
         raise HTTPException(400, f"{kind} 当前支持的模型为：{available}")
@@ -104,8 +146,8 @@ def now() -> int:
 
 def clean_base_url(value: str) -> str:
     value = value.strip().rstrip("/")
-    if not value.startswith("https://"):
-        raise HTTPException(400, "API 地址必须使用 HTTPS")
+    if not value.startswith(("https://", "http://")):
+        raise HTTPException(400, "API 地址必须使用 http:// 或 https://")
     return value
 
 
@@ -127,9 +169,13 @@ def admin_user(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
 
 
 def public_provider(row: dict[str, Any]) -> dict[str, Any]:
+    saved_settings = db.decode(row.get("settings_json", "{}"), {})
+    saved_models = _models_from_settings(row.get("model"), saved_settings)
     key = row.pop("api_key", "")
-    row["provider_type"] = row.get("provider_type") or "deepseek"
-    row["settings"] = db.decode(row.pop("settings_json", "{}"), {})
+    row["provider_type"] = provider_type(row)
+    row["settings"] = saved_settings
+    row["models"] = saved_models
+    row.pop("settings_json", None)
     row["api_key_masked"] = (key[:3] + "••••" + key[-4:]) if len(key) > 8 else "••••••••"
     return row
 
@@ -138,6 +184,8 @@ def public_job(row: dict[str, Any]) -> dict[str, Any]:
     for name, fallback in (("searches_json", []), ("sources_json", []), ("usage_json", {})):
         row[name.removesuffix("_json")] = db.decode(row.pop(name), fallback)
     row["stop_requested"] = bool(row["stop_requested"])
+    if row.get("provider_type") == "mimo":
+        row["provider_type"] = "custom"
     return row
 
 
@@ -162,11 +210,12 @@ async def run_job(job_id: str) -> None:
     history: list[dict[str, Any]] = []
     for row in reversed(history_rows):
         message: dict[str, Any] = {"role": row["role"], "content": row["content"]}
-        # MiMo accepts historical reasoning_content in later turns. Client-side
+        # Custom Chat Completions gateways may accept historical reasoning_content
+        # in later turns. Client-side
         # tool messages are intentionally not replayed here: the final assistant
         # message is persisted, while replaying an assistant tool_call without
         # its matching tool result can make compatible gateways reject history.
-        if kind == "mimo" and row["role"] == "assistant":
+        if kind == "custom" and str(job.get("model") or "").casefold().startswith("mimo-") and row["role"] == "assistant":
             meta = db.decode(row.get("meta_json", "{}"), {})
             if meta.get("reasoning"):
                 message["reasoning_content"] = meta.get("reasoning", "")
@@ -195,8 +244,8 @@ async def run_job(job_id: str) -> None:
 
     try:
         provider_settings = db.decode(provider.get("settings_json", "{}"), {})
-        if kind == "mimo":
-            result = await mimo_stream_response(
+        if kind == "custom":
+            result = await custom_stream_response(
                 base_url=provider["base_url"],
                 api_key=provider["api_key"],
                 model=job["model"],
@@ -362,25 +411,97 @@ def providers(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, An
     return [public_provider(row) for row in db.all("SELECT * FROM providers WHERE user_id=? ORDER BY id", (user["id"],))]
 
 
+async def test_custom_model(base_url: str, api_key: str, model: str) -> None:
+    """Validate a manually entered model with a one-token chat request."""
+    is_mimo_model = model.casefold().startswith("mimo-")
+    token_field = "max_completion_tokens" if is_mimo_model else "max_tokens"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "Reply OK"}],
+        token_field: 1,
+        "stream": False,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30, connect=5), follow_redirects=True) as client:
+            response = await client.post(
+                base_url.rstrip("/") + "/chat/completions",
+                headers=custom_auth_headers(api_key),
+                json=payload,
+            )
+    except Exception as exc:
+        raise HTTPException(502, f"手填模型 {model} 连接失败：{type(exc).__name__}") from exc
+    if response.status_code >= 400:
+        message = ""
+        try:
+            data = response.json()
+            error = data.get("error") or {}
+            message = error.get("message") if isinstance(error, dict) else data.get("detail")
+        except Exception:
+            pass
+        detail = f"手填模型 {model} 测试失败（HTTP {response.status_code}）"
+        if message:
+            detail += f"：{str(message)[:300]}"
+        raise HTTPException(400, detail)
+
+
 @app.post("/api/providers/test")
 async def test_provider(body: ProviderBody, _: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     kind = body.provider_type
     base = clean_base_url(body.base_url or DEFAULT_BASE_URLS[kind])
+    # The current UI sends checkbox selections separately from manually typed
+    # names. Fall back to selected_models for older clients.
+    manual_models = _clean_model_ids(body.manual_models if body.manual_models is not None else body.selected_models)
+    manual_tested: list[str] = []
     try:
-        models = await (mimo_list_models(base, body.api_key) if kind == "mimo" else deepseek_list_models(base, body.api_key))
+        models = await (custom_list_models(base, body.api_key) if kind == "custom" else deepseek_list_models(base, body.api_key))
     except Exception as exc:
-        raise HTTPException(400, f"API 测试失败：{exc}") from exc
-    supported = sorted(SUPPORTED_MODELS[kind])
-    return {"ok": True, "provider_type": kind, "models": models, "supported_models": supported, "native_search_models": [m for m in models if m in SUPPORTED_MODELS[kind]]}
+        if kind != "custom" or not manual_models:
+            raise HTTPException(400, f"API 测试失败：{exc}") from exc
+        models = []
+        models_warning = str(exc)
+    else:
+        models_warning = ""
+    if kind == "custom":
+        if len(manual_models) > 20:
+            raise HTTPException(400, "一次最多测试 20 个手填模型")
+        advertised = set(models)
+        for model_id in manual_models:
+            if model_id not in advertised:
+                await test_custom_model(base, body.api_key, model_id)
+                manual_tested.append(model_id)
+        models = list(dict.fromkeys([*models, *manual_models]))
+        supported = models
+    else:
+        supported = sorted(SUPPORTED_MODELS[kind])
+    return {
+        "ok": True,
+        "provider_type": kind,
+        "models": models,
+        "supported_models": supported,
+        "native_search_models": [m for m in models if m in SUPPORTED_MODELS[kind]],
+        "manual_tested": manual_tested,
+        "models_warning": models_warning,
+    }
 
 
 @app.post("/api/providers")
 def add_provider(body: ProviderBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     kind = body.provider_type
     base = clean_base_url(body.base_url or DEFAULT_BASE_URLS[kind])
-    model = body.model.strip() or ("mimo-v2.5-pro" if kind == "mimo" else "deepseek-v4-flash")
+    selected_models = _clean_model_ids(body.selected_models)
+    if kind == "custom":
+        model = body.model.strip() or (selected_models[0] if selected_models else "")
+        if model and model not in selected_models:
+            selected_models.insert(0, model)
+        if not selected_models:
+            raise HTTPException(400, "请至少选择或填写一个 custom 模型")
+    else:
+        model = body.model.strip() or "deepseek-v4-flash"
+        selected_models = [model]
     validate_provider_selection(kind, model)
-    settings_json = json.dumps(normalize_mimo_settings(body.mimo_settings if kind == "mimo" else None), ensure_ascii=False)
+    settings_value = normalize_custom_settings(body.custom_settings if kind == "custom" else None)
+    settings_value["models"] = selected_models
+    settings_json = json.dumps(settings_value, ensure_ascii=False)
     provider_id = db.run(
         "INSERT INTO providers(user_id,name,api_key,base_url,model,provider_type,settings_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
         (user["id"], body.name.strip(), body.api_key.strip(), base, model, kind, settings_json, now()),
@@ -399,13 +520,16 @@ def delete_provider(provider_id: int, user: dict[str, Any] = Depends(current_use
 
 
 @app.put("/api/providers/{provider_id}/settings")
-def update_provider_settings(provider_id: int, body: MimoSettingsBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    provider = db.one("SELECT provider_type FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"]))
+def update_provider_settings(provider_id: int, body: CustomSettingsBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"]))
     if not provider:
         raise HTTPException(404, "API 配置不存在")
-    if provider_type(provider) != "mimo":
-        raise HTTPException(400, "只有 MiMo API 支持这组联网参数")
-    db.run("UPDATE providers SET settings_json=? WHERE id=? AND user_id=?", (json.dumps(body.model_dump(), ensure_ascii=False), provider_id, user["id"]))
+    if provider_type(provider) != "custom":
+        raise HTTPException(400, "只有 custom API 支持这组参数")
+    settings_value = db.decode(provider.get("settings_json", "{}"), {})
+    settings_value.update(body.model_dump())
+    settings_value["models"] = provider_models(provider)
+    db.run("UPDATE providers SET settings_json=? WHERE id=? AND user_id=?", (json.dumps(settings_value, ensure_ascii=False), provider_id, user["id"]))
     return public_provider(db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"])))
 
 
@@ -445,9 +569,9 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
         raise HTTPException(404, "请选择有效的 API 配置")
     kind = provider_type(provider)
     model = body.model.strip() or provider["model"]
-    if model != provider["model"]:
+    if kind == "deepseek" and model != provider["model"]:
         raise HTTPException(400, "当前回答使用的模型与 API 配置不一致，请重新选择模型配置")
-    validate_provider_selection(kind, model)
+    validate_provider_selection(kind, model, provider)
     if body.effort not in {"high", "max"}:
         raise HTTPException(400, "无效的思考深度")
     conversation_id = body.conversation_id
