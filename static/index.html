@@ -152,7 +152,7 @@
       <label>temperature<input id="mimoTemperature" type="number" min="0" max="1.5" step="0.05" value="1"></label>
       <label>top_p<input id="mimoTopP" type="number" min="0.01" max="1" step="0.01" value="0.95"></label>
       <p id="mimoSamplingNote" class="wide muted">深度思考开启时，MiMo 会强制使用 temperature=1.0、top_p=0.95。</p>
-      <p class="wide muted mimo-cost-note">MiMo 不再使用官方原生搜索。每个回答最多执行 8 个工具轮次，每轮只执行 1 个工具；每次 DuckDuckGo 搜索最多返回 10 条结果，Jina 最多读取 3 个网页。Jina Reader 会自动移除常见导航、页眉、页脚、侧边栏和广告选择器，并且单页最多保留约 8,000 字符。</p>
+      <p class="wide muted mimo-cost-note">MiMo 不再使用官方原生搜索。每个回答最多执行 8 个工具轮次，每轮只执行 1 个工具；最多搜索 4 次、最多读取 4 个网页（每次搜索最多返回 10 条结果）。资料足够时模型可以提前停止。Jina Reader 会自动移除常见导航、页眉、页脚、侧边栏和广告选择器，并且单页最多保留约 8,000 字符。</p>
       <p id="mimoStatus" class="wide error"></p>
       <div class="wide form-actions"><button class="primary" type="submit">保存 MiMo 参数</button></div>
     </form>
