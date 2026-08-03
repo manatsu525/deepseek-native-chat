@@ -200,7 +200,8 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
     const searchOpen=detailState.get(searchKey) ? ' open' : '';
     const detail=s.url?`<a href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(s.url)}</a>`:escapeHtml(Array.isArray(s.query)?s.query.filter(x=>!String(x).startsWith('ws_call_id=')).join('；'):(s.query||'DeepSeek 未返回查询词'));
     const error=s.error?`<div class="search-error">${escapeHtml(s.error)}</div>`:'';
-    return `<details class="search-step" data-detail-key="${escapeHtml(searchKey)}"${searchOpen}><summary>${label} ${i+1} · ${escapeHtml(s.status || 'completed')}</summary><div class="search-detail">${detail}${error}</div></details>`;
+    const statusLabels={running:'进行中',searching:'搜索中',completed:'已完成',failed:'失败'};
+    return `<details class="search-step" data-detail-key="${escapeHtml(searchKey)}"${searchOpen}><summary>${label} ${i+1} · ${escapeHtml(statusLabels[s.status] || s.status || '已完成')}</summary><div class="search-detail">${detail}${error}</div></details>`;
   }).join('');
   const sourceChips = sources.map(s => { const logo=s.logo_url&&safeUrl(s.logo_url)!=='#'?`<img src="${safeUrl(s.logo_url)}" alt="" loading="lazy">`:''; return `<a class="source-chip" href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(s.summary || s.url)}">${logo}<span>${escapeHtml(s.title || s.url)}</span></a>`; }).join('');
   const sourceKey = `${detailKey}-sources`;
@@ -402,7 +403,7 @@ function updateProviderUi(){
   $('#welcomeOrbitMark').textContent=mimo?'MM':'DS';
   $('#welcomeEyebrow').textContent=mimo?'XIAOMI MIMO V2.5': 'DEEPSEEK V4 FLASH';
   $('#welcomeTitle').textContent=mimo?'使用 MiMo 原生联网':'问点需要查证的问题';
-  $('#welcomeDescription').textContent=mimo?'模型会通过 MiMo 服务端联网工具获取实时公开信息。':'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
+  $('#welcomeDescription').textContent=mimo?'模型会通过 MiMo 原生搜索获取实时信息，需要细读来源时按需读取网页正文。':'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
 }
 
 async function loadProviders(){

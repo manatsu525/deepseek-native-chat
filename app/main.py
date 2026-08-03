@@ -168,14 +168,14 @@ async def run_job(job_id: str) -> None:
     history: list[dict[str, Any]] = []
     for row in reversed(history_rows):
         message: dict[str, Any] = {"role": row["role"], "content": row["content"]}
-        # MiMo requires reasoning_content when an assistant message also carries
-        # client-visible tool calls. DeepSeek uses a different protocol and must
-        # receive the compact role/content history only.
+        # MiMo accepts historical reasoning_content in later turns. Client-side
+        # tool messages are intentionally not replayed here: the final assistant
+        # message is persisted, while replaying an assistant tool_call without
+        # its matching tool result can make compatible gateways reject history.
         if kind == "mimo" and row["role"] == "assistant":
             meta = db.decode(row.get("meta_json", "{}"), {})
-            if meta.get("tool_calls"):
+            if meta.get("reasoning"):
                 message["reasoning_content"] = meta.get("reasoning", "")
-                message["tool_calls"] = meta["tool_calls"]
         history.append(message)
     db.update_job(job_id, status="running", error="", stop_requested=0)
     last_write = 0.0
@@ -224,8 +224,8 @@ async def run_job(job_id: str) -> None:
                 update=update,
             )
         meta = {"job_id": job_id, "provider_id": job["provider_id"], "provider_type": kind, "model": job["model"], "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"]}
-        if result.get("tool_calls"):
-            meta["tool_calls"] = result["tool_calls"]
+        if result.get("tool_trace"):
+            meta["tool_trace"] = result["tool_trace"]
         db.run(
             "INSERT INTO messages(conversation_id, role, content, meta_json, created_at) VALUES(?,?,?,?,?)",
             (job["conversation_id"], "assistant", result["answer"], json.dumps(meta, ensure_ascii=False), now()),
