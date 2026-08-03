@@ -187,7 +187,7 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
   const searches = meta.searches || [];
   const sources = [];
   const seenSources = new Set();
-  [...(meta.sources || []), ...searches.filter(item => item.action === 'open_page' && item.url).map(item => ({url:item.url,title:item.url}))].forEach(source => {
+  [...(meta.sources || []), ...searches.filter(item => item.action === 'open_page' && item.status === 'completed' && item.url).map(item => ({url:item.url,title:item.url}))].forEach(source => {
     const url = String(source.url || '');
     if (!/^https?:\/\//i.test(url) || seenSources.has(url)) return;
     seenSources.add(url); sources.push(source);
@@ -200,7 +200,7 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
     const searchOpen=detailState.get(searchKey) ? ' open' : '';
     const detail=s.url?`<a href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(s.url)}</a>`:escapeHtml(Array.isArray(s.query)?s.query.filter(x=>!String(x).startsWith('ws_call_id=')).join('；'):(s.query||'DeepSeek 未返回查询词'));
     const error=s.error?`<div class="search-error">${escapeHtml(s.error)}</div>`:'';
-    const statusLabels={running:'进行中',searching:'搜索中',completed:'已完成',failed:'失败'};
+    const statusLabels={running:'进行中',searching:'搜索中',completed:'已完成',failed:'失败',rejected:'已拒绝',skipped:'已跳过'};
     return `<details class="search-step" data-detail-key="${escapeHtml(searchKey)}"${searchOpen}><summary>${label} ${i+1} · ${escapeHtml(statusLabels[s.status] || s.status || '已完成')}</summary><div class="search-detail">${detail}${error}</div></details>`;
   }).join('');
   const sourceChips = sources.map(s => { const logo=s.logo_url&&safeUrl(s.logo_url)!=='#'?`<img src="${safeUrl(s.logo_url)}" alt="" loading="lazy">`:''; return `<a class="source-chip" href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(s.summary || s.url)}">${logo}<span>${escapeHtml(s.title || s.url)}</span></a>`; }).join('');
@@ -211,7 +211,10 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
     : `<div class="sources"><span class="sources-label">来源</span>${sourceChips}</div>`)
     : '';
   const traceOpen=detailState.get(detailKey) ? ' open' : '';
-  return `<details class="trace" data-detail-key="${escapeHtml(detailKey)}"${traceOpen}><summary>思考与联网 · ${status}${searches.length ? ` · ${searches.length} 次搜索` : ''}</summary><div class="trace-body">${reasoning ? `<div class="reasoning-text">${escapeHtml(reasoning)}</div>` : active ? '<div class="typing"><i></i><i></i><i></i></div>' : ''}${searchHtml}${sourceHtml}${usageHtml(meta.usage || {})}</div></details>`;
+  const searchCount=searches.filter(item=>item.action!=='open_page').length;
+  const readCount=searches.filter(item=>item.action==='open_page'&&item.status==='completed').length;
+  const activity=`${searchCount ? ` · ${searchCount} 次搜索` : ''}${readCount ? ` · ${readCount} 次读取` : ''}`;
+  return `<details class="trace" data-detail-key="${escapeHtml(detailKey)}"${traceOpen}><summary>思考与联网 · ${status}${activity}</summary><div class="trace-body">${reasoning ? `<div class="reasoning-text">${escapeHtml(reasoning)}</div>` : active ? '<div class="typing"><i></i><i></i><i></i></div>' : ''}${searchHtml}${sourceHtml}${usageHtml(meta.usage || {})}</div></details>`;
 }
 
 function messageHtml(message, index, live=false) {
