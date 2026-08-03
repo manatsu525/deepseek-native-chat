@@ -402,11 +402,11 @@ function updateProviderUi(){
   $('#mimoSettingsButton').classList.toggle('hidden',!mimo);
   $('#effort').disabled=!!mimo;
   $('#effort').title=mimo?'MiMo 的思考开关在“MiMo 联网”设置中配置':'控制 DeepSeek 模型推理投入';
-  $('#nativePill').textContent=mimo?'● MiMo Web':'● Native Web';
+  $('#nativePill').textContent=mimo?'● DDG + Jina':'● Native Web';
   $('#welcomeOrbitMark').textContent=mimo?'MM':'DS';
   $('#welcomeEyebrow').textContent=mimo?'XIAOMI MIMO V2.5': 'DEEPSEEK V4 FLASH';
-  $('#welcomeTitle').textContent=mimo?'使用 MiMo 原生联网':'问点需要查证的问题';
-  $('#welcomeDescription').textContent=mimo?'模型会通过 MiMo 原生搜索获取实时信息，需要细读来源时按需读取网页正文。':'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
+  $('#welcomeTitle').textContent=mimo?'使用 DuckDuckGo + Jina 联网':'问点需要查证的问题';
+  $('#welcomeDescription').textContent=mimo?'模型会通过本地 DuckDuckGo 工具搜索，再按需用 Jina 读取真实来源。':'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
 }
 
 async function loadProviders(){
@@ -436,7 +436,7 @@ async function testProvider(){
     const body=providerFormData();const result=await api('/api/providers/test',{method:'POST',body});const select=$('#providerModel');
     const fallback=providerType()==='mimo'?['mimo-v2.5-pro','mimo-v2.5']:['deepseek-v4-flash'];
     // The provider may list TTS/ASR models too; this chat only accepts the
-    // text models that support the native web-search workflow.
+    // text models supported by the selected provider.
     const advertised=result.models || [];
     const supportedModels=(result.supported_models||[]).filter(m=>advertised.includes(m));
     const models=supportedModels.length?supportedModels:fallback;
@@ -447,18 +447,17 @@ async function testProvider(){
 }
 function providerFormData(){return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:$('#manualModel').value.trim()||$('#providerModel').value|| (providerType()==='mimo'?'mimo-v2.5-pro':'deepseek-v4-flash')}}
 
-function mimoSettings(provider){return {...{max_keyword:3,limit:5,force_search:false,country:'',region:'',city:'',thinking:'enabled',max_completion_tokens:8192,temperature:1,top_p:.95},...(provider&&provider.settings||{})}}
+function mimoSettings(provider){return {...{thinking:'enabled',max_completion_tokens:8192,temperature:1,top_p:.95},...(provider&&provider.settings||{})}}
 function fillMimoSettings(){
   const config=mimoSettings(selectedProvider());
-  $('#mimoMaxKeyword').value=config.max_keyword;$('#mimoLimit').value=config.limit;$('#mimoForceSearch').checked=!!config.force_search;
   $('#mimoThinking').value=config.thinking;$('#mimoMaxCompletion').value=config.max_completion_tokens;$('#mimoTemperature').value=config.temperature;$('#mimoTopP').value=config.top_p;
-  $('#mimoCountry').value=config.country||'';$('#mimoRegion').value=config.region||'';$('#mimoCity').value=config.city||'';syncMimoThinkingFields();
+  syncMimoThinkingFields();
 }
 function syncMimoThinkingFields(){const disabled=$('#mimoThinking').value==='enabled';$('#mimoTemperature').disabled=disabled;$('#mimoTopP').disabled=disabled;$('#mimoSamplingNote').textContent=disabled?'深度思考开启时，MiMo 会强制使用 temperature=1.0、top_p=0.95。':'关闭思考后可自定义 temperature 和 top_p。'}
 function openMimoSettings(){if(!selectedProvider()||selectedProvider().provider_type!=='mimo'){toast('请先选择 MiMo API');return}fillMimoSettings();$('#mimoModal').showModal()}
 async function saveMimoSettings(event){
   event.preventDefault(); const provider=selectedProvider(); if(!provider)return;
-  const body={max_keyword:Number($('#mimoMaxKeyword').value),limit:Number($('#mimoLimit').value),force_search:$('#mimoForceSearch').checked,thinking:$('#mimoThinking').value,max_completion_tokens:Number($('#mimoMaxCompletion').value),temperature:Number($('#mimoTemperature').value),top_p:Number($('#mimoTopP').value),country:$('#mimoCountry').value.trim(),region:$('#mimoRegion').value.trim(),city:$('#mimoCity').value.trim()};
+  const body={thinking:$('#mimoThinking').value,max_completion_tokens:Number($('#mimoMaxCompletion').value),temperature:Number($('#mimoTemperature').value),top_p:Number($('#mimoTopP').value)};
   try{const updated=await api(`/api/providers/${provider.id}/settings`,{method:'PUT',body});const index=state.providers.findIndex(x=>x.id===provider.id);if(index>=0)state.providers[index]=updated;$('#mimoModal').close();updateProviderUi();toast('MiMo 参数已保存')}catch(err){$('#mimoStatus').textContent=err.message}
 }
 

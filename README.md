@@ -1,11 +1,11 @@
 # DeepSeek Native Chat
 
-一个面向低配置 VPS 的私人 DeepSeek / Xiaomi MiMo 聊天站。联网搜索由所选服务商的原生工具执行，不安装 SearXNG、浏览器或网页抓取器。
+一个面向低配置 VPS 的私人 DeepSeek / Xiaomi MiMo 聊天站。DeepSeek 使用服务端原生联网；MiMo 使用本地 DuckDuckGo 搜索和 Jina Reader，不安装 SearXNG 或浏览器。
 
 ## 功能
 
 - DeepSeek V4 Flash Responses API 原生多轮联网搜索
-- 小米 MiMo V2.5 / V2.5 Pro Chat Completions 原生联网搜索
+- 小米 MiMo V2.5 / V2.5 Pro Chat Completions 外部 DuckDuckGo 多轮搜索
 - 流式回答、思考过程、搜索步骤和来源折叠展示
 - 输入、缓存命中、输出和推理 Token 统计
 - 后台生成：刷新页面、切换应用或锁屏后任务继续运行
@@ -16,7 +16,7 @@
 - 最多 3 个账号，管理员可在前端新增或删除账号
 - 各账号的对话和 API 配置相互隔离
 - 前端测试 API、读取模型列表、手动填写模型名、删除 API
-- MiMo 联网参数：最大关键词数、每轮结果数、强制搜索、用户位置、思考开关和生成上限
+- MiMo 联网参数：思考开关、采样参数和生成上限；搜索预算由后端固定保护
 - MiMo 按需网页读取：模型可自动调用免费 Jina Reader 读取公开网页、文档页或 PDF，无需额外 API Key
 - SQLite 单文件数据库、自签 HTTPS、systemd 守护
 - 手机和桌面端响应式界面
@@ -45,7 +45,7 @@ sudo ./install.sh
 
 默认访问地址为 `https://服务器IP:8000`。证书为自签证书，首次访问需要在浏览器中确认继续。
 
-进入页面后，在右上角打开“API”，选择服务商并填写对应 API Key，点击“测试并读取模型”后保存。DeepSeek 使用 `https://api.deepseek.com`；MiMo 使用 `https://api.xiaomimimo.com/v1`。MiMo 联网搜索需要先在小米控制台开通联网服务插件。
+进入页面后，在右上角打开“API”，选择服务商并填写对应 API Key，点击“测试并读取模型”后保存。DeepSeek 使用 `https://api.deepseek.com`；MiMo 使用 `https://api.xiaomimimo.com/v1`。MiMo 的搜索由 VPS 直接请求 DuckDuckGo，不需要在小米控制台开通原生联网插件。
 
 ## 卸载
 
@@ -65,11 +65,11 @@ sudo ./uninstall.sh --yes
 
 ## 设计说明
 
-DeepSeek 使用官方 `/responses` 路由，当前原生 `web_search` 适配 `deepseek-v4-flash`。MiMo 的联网搜索按官方示例使用 `/v1/chat/completions`，工具参数由 MiMo 服务端处理并在流式响应的 annotations 中返回来源；MiMo 同时支持与自定义 Function 混合调用，后端将 `fetch_webpage` 注册为 `tool_choice=auto` 的函数工具，模型自己决定是否读取页面。两种协议由后端分别解析，不能共用 DeepSeek 的 Responses SSE 事件处理器。
+DeepSeek 使用官方 `/responses` 路由，当前原生 `web_search` 适配 `deepseek-v4-flash`。MiMo 使用 `/v1/chat/completions`，但不再发送小米的 provider-executed `web_search`；后端注册一个模型可见的 `web_search` Function Tool，直接请求 DuckDuckGo Lite，失败时再尝试 DuckDuckGo HTML 页面。这样模型能明确看到搜索工具，搜索结果 URL 也由后端统一登记，再交给读取器使用。两种协议由后端分别解析，不能共用 DeepSeek 的 Responses SSE 事件处理器。
 
-`fetch_webpage` 不直接抓网页，而是把模型选中的公开 URL 交给 `https://r.jina.ai/`，得到干净 Markdown 后再作为 `tool` 结果回传给 MiMo。Jina Reader 不需要 API Key；后端按约 20 次/分钟做进程级节流，每个回答最多读取 3 页，每页最多保留约 8,000 字符，并拒绝本机、内网和带账号密码的 URL。
+MiMo 每个工具轮最多执行 1 个工具，最多 8 个工具轮；每次搜索最多返回 10 条结果。模型可以在资料足够时直接停止工具调用。搜索查询按标准化文本去重，不会重复请求同一个查询。`fetch_webpage` 只能读取用户提供或 DuckDuckGo 返回的 URL，搜索引擎结果页、编造 URL、本机和内网地址都会被拒绝；同一个 URL 也不会重复注入正文。
 
-为避免模型把读取器误当搜索引擎，后端只执行来自用户消息或 MiMo 原生搜索来源的 URL。模型首次请求无来源 URL 时不会访问 Jina，而会在下一轮强制执行一次原生搜索；若仍请求无来源 URL，本回答将关闭读取器。相同 URL 会按规范化地址去重，不会把同一篇正文重复塞进模型上下文。
+`fetch_webpage` 把公开 URL 交给 `https://r.jina.ai/`，得到干净 Markdown 后作为 `tool` 结果回传给 MiMo。Jina Reader 不需要 API Key；后端按约 20 次/分钟做进程级节流，每个回答最多读取 3 页，每页最多保留约 8,000 字符，并设置 `X-Respond-With: markdown`、`X-Timeout: 30` 和 `X-Remove-Selector`，自动移除常见 header、nav、aside、footer、sidebar、菜单、广告和 cookie 弹窗元素。Jina 官方支持通过 `X-Remove-Selector` 排除这些 CSS 选择器；如果目标站点有明确的文章容器，后续还可以针对该站点增加 `X-Target-Selector`。
 
 DeepSeek 当前会忽略 Responses API 的 `max_tool_calls`。项目在系统提示中要求单次回答最多搜索五次，但无法像客户端工具循环一样做强制的逐次拦截；实际搜索次数以 DeepSeek 服务端执行结果为准。
 

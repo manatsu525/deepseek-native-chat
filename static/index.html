@@ -55,7 +55,7 @@
       <div class="brand-mark">AI</div>
       <p class="eyebrow">PRIVATE WORKSPACE</p>
       <h1>Native Web Chat</h1>
-      <p class="muted">原生联网搜索，不经过本地搜索代理。</p>
+      <p class="muted">DeepSeek 保留原生联网；MiMo 使用本地 DuckDuckGo 搜索与 Jina 阅读。</p>
       <form id="loginForm" class="stack">
         <label>账号<input id="loginUser" autocomplete="username" required></label>
         <label>密码<input id="loginPass" type="password" autocomplete="current-password" required></label>
@@ -86,7 +86,7 @@
     <main class="main">
       <header class="topbar">
         <button id="openSidebar" class="icon-btn mobile-only" aria-label="菜单">☰</button>
-        <div class="title-block"><h2 id="conversationTitle">新对话</h2><span class="status-dot">原生搜索已就绪</span></div>
+        <div class="title-block"><h2 id="conversationTitle">新对话</h2><span class="status-dot">外部搜索工具已就绪</span></div>
         <div class="top-actions">
           <label class="compact-select" title="控制 DeepSeek 模型推理投入"><span id="effortLabel">推理</span><select id="effort"><option value="high">高 · High</option><option value="max">最大 · Max</option></select></label>
           <button id="providerButton" class="soft-btn">API</button>
@@ -122,7 +122,7 @@
             </div>
           </div>
         </form>
-        <p class="footnote">联网由所选服务商的原生工具执行；重要信息仍建议核对原始来源。</p>
+        <p class="footnote">MiMo 使用本地 DuckDuckGo 搜索与 Jina Reader；DeepSeek 使用服务端原生联网。重要信息仍建议核对原始来源。</p>
       </footer>
     </main>
   </div>
@@ -145,18 +145,14 @@
   </dialog>
 
   <dialog id="mimoModal" class="modal small-modal">
-    <div class="modal-head"><div><p class="eyebrow">MIMO WEB SEARCH</p><h3>联网参数</h3></div><button class="icon-btn close-modal">×</button></div>
+    <div class="modal-head"><div><p class="eyebrow">MIMO WEB TOOLS</p><h3>联网参数</h3></div><button class="icon-btn close-modal">×</button></div>
     <form id="mimoForm" class="form-grid">
-      <label>最大关键词数<input id="mimoMaxKeyword" type="number" min="1" max="10" step="1" value="3"></label>
-      <label>每轮结果数<input id="mimoLimit" type="number" min="1" max="20" step="1" value="5"></label>
-      <label class="check wide"><input id="mimoForceSearch" type="checkbox"> 强制每次联网搜索</label>
       <label>思考<select id="mimoThinking"><option value="enabled">开启</option><option value="disabled">关闭</option></select></label>
       <label>最大生成 Token<input id="mimoMaxCompletion" type="number" min="256" max="131072" step="256" value="8192"></label>
       <label>temperature<input id="mimoTemperature" type="number" min="0" max="1.5" step="0.05" value="1"></label>
       <label>top_p<input id="mimoTopP" type="number" min="0.01" max="1" step="0.01" value="0.95"></label>
-      <div class="wide location-fields"><p class="field-title">用户位置（可选，帮助本地化搜索）</p><div class="location-grid"><input id="mimoCountry" placeholder="国家，例如 China"><input id="mimoRegion" placeholder="地区，例如 Hubei"><input id="mimoCity" placeholder="城市，例如 Wuhan"></div></div>
       <p id="mimoSamplingNote" class="wide muted">深度思考开启时，MiMo 会强制使用 temperature=1.0、top_p=0.95。</p>
-      <p class="wide muted mimo-cost-note">注意：需先在 MiMo 控制台开通联网服务插件；一次搜索可能按“最大关键词数”并发消耗多次额度，开关变更约 5 分钟后生效。不开启强制搜索时由模型自行判断。需要细读网页时，模型可按需调用免费 Jina Reader；只允许读取用户提供或原生搜索返回的链接，单回答最多 3 页，单页最多保留约 8,000 字符。</p>
+      <p class="wide muted mimo-cost-note">MiMo 不再使用官方原生搜索。每个回答最多执行 8 个工具轮次，每轮只执行 1 个工具；每次 DuckDuckGo 搜索最多返回 10 条结果，Jina 最多读取 3 个网页。Jina Reader 会自动移除常见导航、页眉、页脚、侧边栏和广告选择器，并且单页最多保留约 8,000 字符。</p>
       <p id="mimoStatus" class="wide error"></p>
       <div class="wide form-actions"><button class="primary" type="submit">保存 MiMo 参数</button></div>
     </form>
