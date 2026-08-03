@@ -409,7 +409,8 @@ async function boot(){try{state.me=await api('/api/me');$('#loginView').classLis
 $('#loginForm').onsubmit=async e=>{e.preventDefault();$('#loginError').textContent='';try{await api('/api/login',{method:'POST',body:{username:$('#loginUser').value,password:$('#loginPass').value}});await boot()}catch(err){$('#loginError').textContent=err.message}};
 $('#logout').onclick=async()=>{await api('/api/logout',{method:'POST'});location.reload()};
 $('#newChat').onclick=()=>{newConversation();closeSidebar()};$('#composer').onsubmit=e=>{e.preventDefault();submitPrompt()};
-$('#prompt').oninput=resizePrompt;$('#prompt').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();submitPrompt()}};
+// Enter always inserts a newline. Sending is explicit via the send button.
+$('#prompt').oninput=resizePrompt;
 $('#stopButton').onclick=async()=>{if(state.job&&state.job.id){await api(`/api/jobs/${state.job.id}/stop`,{method:'POST'});toast('正在停止')}};
 $('#providerButton').onclick=()=>{$('#providerModal').showModal();renderProviderList()};$('#usersButton').onclick=()=>{loadUsers();$('#usersModal').showModal()};
 $('#mimoSettingsButton').onclick=openMimoSettings;$('#providerSelect').onchange=updateProviderUi;$('#providerType').onchange=syncProviderForm;$('#mimoThinking').onchange=syncMimoThinkingFields;
