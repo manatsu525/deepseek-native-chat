@@ -7,12 +7,15 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+from curl_cffi import requests as curl_requests
 
 from .mimo import (
+    DDG_BROWSER_HEADERS,
     DDG_CONNECT_TIMEOUT,
     DDG_SEARCH_TIMEOUT,
     FETCH_WEBPAGE_TOOL,
     JINA_MAX_FETCHES_PER_RESPONSE,
+    JINA_BROWSER_HEADERS,
     MIMO_MAX_SEARCHES,
     MIMO_MAX_SEARCH_RESULTS,
     MIMO_MAX_TOOL_ROUNDS,
@@ -74,13 +77,19 @@ async def stream_response(
     attempted_urls: set[str] = set()
     reader_enabled = bool(allowed_urls)
     api_limits = httpx.Timeout(timeout, connect=30)
-    search_limits = httpx.Timeout(DDG_SEARCH_TIMEOUT, connect=DDG_CONNECT_TIMEOUT)
-    jina_limits = httpx.Timeout(90, connect=15)
-
     async with (
         httpx.AsyncClient(timeout=api_limits) as api_client,
-        httpx.AsyncClient(timeout=search_limits, follow_redirects=True) as search_client,
-        httpx.AsyncClient(timeout=jina_limits, follow_redirects=True) as jina_client,
+        curl_requests.AsyncSession(
+            impersonate="chrome",
+            timeout=(DDG_CONNECT_TIMEOUT, DDG_SEARCH_TIMEOUT),
+            allow_redirects=True,
+            headers=DDG_BROWSER_HEADERS,
+        ) as search_client,
+        curl_requests.AsyncSession(
+            timeout=(15, 90),
+            allow_redirects=True,
+            headers=JINA_BROWSER_HEADERS,
+        ) as jina_client,
     ):
         # The extra iteration after the eighth tool round is answer-only. It
         # lets the model finish cleanly without exceeding eight tool calls.

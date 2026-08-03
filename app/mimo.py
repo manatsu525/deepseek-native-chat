@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import parse_qsl, parse_qs, unquote, urlencode, urldefrag, urlsplit, urlunsplit
 
 import httpx
+from curl_cffi import requests as curl_requests
 
 
 MIMO_MODELS = {"mimo-v2.5-pro", "mimo-v2.5"}
@@ -33,10 +34,35 @@ DDG_SEARCH_TIMEOUT = 8
 DDG_CONNECT_TIMEOUT = 3
 DDG_RATE_LIMIT = 12
 DDG_RATE_WINDOW = 60.0
+DDG_COOLDOWN_SECONDS = 120.0
 DDG_MAX_SNIPPET_CHARS = 500
-DDG_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+DDG_BROWSER_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "max-age=0",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+JINA_BROWSER_HEADERS = {
+    "Accept": "text/markdown, text/plain;q=0.9, */*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
+DDG_CHALLENGE_MARKERS = (
+    "anomaly-modal",
+    "anomaly.js",
+    "challenge-form",
+    "unfortunately, bots use duckduckgo too",
+    "select all squares containing a duck",
+    "captcha",
+    "unusual traffic",
+    "verify you are human",
 )
 URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 TRACKING_QUERY_KEYS = {"fbclid", "gclid", "msclkid", "igshid", "yclid"}
@@ -66,10 +92,19 @@ _jina_call_times: deque[float] = deque()
 _jina_rate_lock = asyncio.Lock()
 _ddg_call_times: deque[float] = deque()
 _ddg_rate_lock = asyncio.Lock()
+_ddg_cooldown_until = 0.0
 
 
 class UnapprovedSourceError(ValueError):
     pass
+
+
+class DDGChallengeError(RuntimeError):
+    """DuckDuckGo returned an anti-bot challenge instead of search results."""
+
+
+class DDGCooldownError(RuntimeError):
+    """A recent DDG challenge is still within the cooldown window."""
 
 
 def _url(base: str, path: str) -> str:
@@ -241,6 +276,9 @@ async def _acquire_ddg_slot(stopped: Callable[[], bool]) -> None:
             raise asyncio.CancelledError
         async with _ddg_rate_lock:
             now = time.monotonic()
+            if _ddg_cooldown_until > now:
+                remaining = max(1, int(_ddg_cooldown_until - now + 0.999))
+                raise DDGCooldownError(f"DuckDuckGo 正在冷却，还需约 {remaining} 秒")
             while _ddg_call_times and now - _ddg_call_times[0] >= DDG_RATE_WINDOW:
                 _ddg_call_times.popleft()
             if len(_ddg_call_times) < DDG_RATE_LIMIT:
@@ -250,8 +288,31 @@ async def _acquire_ddg_slot(stopped: Callable[[], bool]) -> None:
         await asyncio.sleep(min(wait_for, 1.0))
 
 
+async def _activate_ddg_cooldown(reason: str) -> int:
+    """Pause all DDG requests after an anti-bot response."""
+    del reason  # Kept in the signature so callers can document the trigger.
+    global _ddg_cooldown_until
+    async with _ddg_rate_lock:
+        now = time.monotonic()
+        _ddg_cooldown_until = max(_ddg_cooldown_until, now + DDG_COOLDOWN_SECONDS)
+        return max(1, int(_ddg_cooldown_until - now + 0.999))
+
+
+def _ddg_challenge_reason(response: Any) -> str:
+    status = int(getattr(response, "status_code", 0) or 0)
+    try:
+        body = str(getattr(response, "text", "") or "").lower()
+    except Exception:
+        body = ""
+    if any(marker in body for marker in DDG_CHALLENGE_MARKERS):
+        return "检测到人机验证页面"
+    if status in {202, 403, 429}:
+        return f"HTTP {status}"
+    return ""
+
+
 async def _duckduckgo_search(
-    client: httpx.AsyncClient,
+    client: Any,
     query: str,
     limit: int,
     stopped: Callable[[], bool],
@@ -266,23 +327,25 @@ async def _duckduckgo_search(
             response = await client.get(
                 endpoint,
                 params={"q": query, "kl": "wt-wt", "kp": "-1"},
-                headers={"User-Agent": DDG_USER_AGENT, "Accept": "text/html"},
+                headers=DDG_BROWSER_HEADERS,
             )
+            challenge = _ddg_challenge_reason(response)
+            if challenge:
+                remaining = await _activate_ddg_cooldown(challenge)
+                raise DDGChallengeError(f"DuckDuckGo {challenge}，已冷却 {remaining} 秒")
             if response.status_code >= 400:
                 errors.append(f"HTTP {response.status_code}")
                 continue
             html = response.text
-            lower = html.lower()
-            if any(marker in lower for marker in ("captcha", "unusual traffic", "verify you are human")):
-                errors.append("触发验证")
-                continue
             results = _parse_ddg_results(html, limit)
             if results:
                 return results
             errors.append("无有效结果")
+        except (DDGChallengeError, DDGCooldownError):
+            raise
         except asyncio.CancelledError:
             raise
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, curl_requests.errors.CurlError) as exc:
             errors.append(type(exc).__name__)
     suffix = f"（{'; '.join(errors)}）" if errors else ""
     raise RuntimeError(f"DuckDuckGo 搜索失败{suffix}")
@@ -364,7 +427,12 @@ async def _acquire_jina_slot(stopped: Callable[[], bool]) -> None:
         await asyncio.sleep(min(wait_for, 1.0))
 
 
-async def _read_with_jina(client: httpx.AsyncClient, url: str, stopped: Callable[[], bool]) -> str:
+def _response_bytes(response: Any):
+    iterator = getattr(response, "aiter_content", None)
+    return iterator() if iterator else response.aiter_bytes()
+
+
+async def _read_with_jina(client: Any, url: str, stopped: Callable[[], bool]) -> str:
     await _acquire_jina_slot(stopped)
     reader_url = JINA_READER_PREFIX + url
     try:
@@ -372,19 +440,26 @@ async def _read_with_jina(client: httpx.AsyncClient, url: str, stopped: Callable
             "GET",
             reader_url,
             headers={
-                "Accept": "text/markdown",
-                "User-Agent": "deepseek-native-chat/1.0",
+                **JINA_BROWSER_HEADERS,
                 "X-Respond-With": "markdown",
                 "X-Timeout": "30",
                 "X-Remove-Selector": JINA_REMOVE_SELECTORS,
             },
         ) as response:
             if response.status_code >= 400:
-                body = (await response.aread()).decode(errors="replace")[:500]
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in _response_bytes(response):
+                    piece = bytes(chunk)[: 500 - size]
+                    chunks.append(piece)
+                    size += len(piece)
+                    if size >= 500:
+                        break
+                body = b"".join(chunks).decode(errors="replace")[:500]
                 raise RuntimeError(f"Jina Reader HTTP {response.status_code}: {body}")
             chunks: list[bytes] = []
             size = 0
-            async for chunk in response.aiter_bytes():
+            async for chunk in _response_bytes(response):
                 if stopped():
                     raise asyncio.CancelledError
                 if size >= JINA_MAX_BYTES:
@@ -396,7 +471,7 @@ async def _read_with_jina(client: httpx.AsyncClient, url: str, stopped: Callable
                     break
     except asyncio.CancelledError:
         raise
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, curl_requests.errors.CurlError) as exc:
         raise RuntimeError(f"Jina Reader 请求失败：{exc}") from exc
     content = b"".join(chunks).decode("utf-8", errors="replace").strip()
     if not content:
@@ -548,9 +623,11 @@ async def stream_response(
     fetched_urls: set[str] = set()
     native_source_urls: set[str] = set()
     api_limits = httpx.Timeout(timeout, connect=30)
-    jina_limits = httpx.Timeout(90, connect=15)
-
-    async with httpx.AsyncClient(timeout=api_limits) as api_client, httpx.AsyncClient(timeout=jina_limits, follow_redirects=True) as jina_client:
+    async with httpx.AsyncClient(timeout=api_limits) as api_client, curl_requests.AsyncSession(
+        timeout=(15, 90),
+        allow_redirects=True,
+        headers=JINA_BROWSER_HEADERS,
+    ) as jina_client:
         for round_number in range(MIMO_MAX_TOOL_ROUNDS):
             if stopped():
                 raise asyncio.CancelledError
