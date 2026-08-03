@@ -32,7 +32,7 @@ cd deepseek-native-chat
 sudo ./install.sh admin '至少八位的密码'
 ```
 
-也可以不传密码，安装脚本会生成随机初始密码：
+不传第二个参数时，初始管理员密码为 `admin123456`。首次登录后请立即在“账号管理”中修改为个人管理密码：
 
 ```bash
 sudo ./install.sh
