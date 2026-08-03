@@ -3,6 +3,17 @@ const $$ = (s, root=document) => [...root.querySelectorAll(s)];
 const state = {me:null, providers:[], conversation:null, messages:[], job:null, page:1, pages:1, poll:null};
 const detailState = new Map();
 
+function storageKey(name) { return `deepseek-native-chat.${name}.${state.me ? state.me.id : 'guest'}`; }
+function storedValue(name) {
+  try { return localStorage.getItem(storageKey(name)); } catch { return null; }
+}
+function storeValue(name, value) {
+  try {
+    if (value == null || value === '') localStorage.removeItem(storageKey(name));
+    else localStorage.setItem(storageKey(name), String(value));
+  } catch {}
+}
+
 async function api(path, options={}) {
   const headers = {...(options.headers || {})};
   if (options.body && typeof options.body !== 'string') {
@@ -214,7 +225,7 @@ function renderMessages() {
   $$('details[data-detail-key]').forEach(detail => detailState.set(detail.dataset.detailKey, detail.open));
   const items = [...state.messages];
   if (state.job && ['queued','running','failed','stopped'].includes(state.job.status)) {
-    items.push({role:'assistant', content:state.job.answer || '', meta:{job_id:state.job.id,provider_type:state.job.provider_type,reasoning:state.job.reasoning,searches:state.job.searches,sources:state.job.sources,usage:state.job.usage,error:state.job.error,stopped:state.job.status==='stopped'}, live:['queued','running'].includes(state.job.status)});
+    items.push({role:'assistant', content:state.job.answer || '', meta:{job_id:state.job.id,provider_id:state.job.provider_id,provider_type:state.job.provider_type,model:state.job.model,reasoning:state.job.reasoning,searches:state.job.searches,sources:state.job.sources,usage:state.job.usage,error:state.job.error,stopped:state.job.status==='stopped'}, live:['queued','running'].includes(state.job.status)});
   }
   $('#welcome').classList.toggle('hidden', items.length > 0);
   $('#messages').innerHTML = items.map((m,i)=>messageHtml(m,i,!!m.live)).join('');
@@ -230,7 +241,9 @@ function replaceJobMessage(job, liveState) {
     content: job.answer || '',
     meta: {
       job_id: job.id,
+      provider_id: job.provider_id,
       provider_type: job.provider_type || (selectedProvider() && selectedProvider().provider_type),
+      model: job.model,
       reasoning: job.reasoning,
       searches: job.searches,
       sources: job.sources,
@@ -309,12 +322,19 @@ async function openConversation(id) {
   stopPolling();
   try {
     const data=await api(`/api/conversations/${id}`); state.conversation=data.conversation; state.messages=data.messages; state.job=data.active_job;
+    restoreProviderForConversation(data);
+    storeValue('active-conversation', state.conversation.id);
     $('#conversationTitle').textContent=state.conversation.title; renderMessages(); await loadHistory(state.page);
     if(state.job)startPolling(state.job.id);
-  } catch(err){toast(err.message)}
+    return true;
+  } catch(err){
+    if (err.message === '对话不存在') storeValue('active-conversation', null);
+    toast(err.message);
+  }
+  return false;
 }
 
-function newConversation(){stopPolling();state.conversation=null;state.messages=[];state.job=null;$('#conversationTitle').textContent='新对话';renderMessages();loadHistory(1)}
+function newConversation(){stopPolling();state.conversation=null;state.messages=[];state.job=null;storeValue('active-conversation', null);$('#conversationTitle').textContent='新对话';renderMessages();loadHistory(1)}
 
 async function submitPrompt(value) {
   const content=(value == null ? $('#prompt').value : value).trim(); if(!content)return;
@@ -326,16 +346,46 @@ async function submitPrompt(value) {
   try{
     const data=await api('/api/chat',{method:'POST',body:{conversation_id:(state.conversation&&state.conversation.id)||null,content,provider_id:provider.id,model:provider.model,effort:$('#effort').value}});
     if(!state.conversation)state.conversation={id:data.conversation_id,title:content.slice(0,36)};
+    storeValue('active-conversation', state.conversation.id);
     state.job.id=data.job_id;$('#conversationTitle').textContent=state.conversation.title;loadHistory(1);startPolling(data.job_id);
   }catch(err){state.messages.pop();state.job=null;setRunning(false);renderMessages();toast(err.message)}
 }
 
 function setRunning(on){$('#stopButton').classList.toggle('hidden',!on);$('#sendButton').disabled=on;$('#providerSelect').disabled=on}
 function stopPolling(){if(state.poll)clearTimeout(state.poll);state.poll=null}
-function startPolling(id){stopPolling();setRunning(true);const tick=async()=>{try{const job=await api(`/api/jobs/${id}`);state.job=job;if(job.status==='completed'){stopPolling();setRunning(false);finalizeLiveMessage(job);await loadHistory(1);return}if(['failed','stopped'].includes(job.status)){stopPolling();setRunning(false);renderMessages();return}updateLiveMessage()}catch(err){toast(err.message);setRunning(false);return}state.poll=setTimeout(tick,700)};tick()}
+function startPolling(id){stopPolling();setRunning(true);const tick=async()=>{try{const job=await api(`/api/jobs/${id}`);if(job.provider_id)selectProvider(job.provider_id,false);state.job=job;if(job.status==='completed'){stopPolling();setRunning(false);finalizeLiveMessage(job);await loadHistory(1);return}if(['failed','stopped'].includes(job.status)){stopPolling();setRunning(false);renderMessages();return}updateLiveMessage()}catch(err){toast(err.message);setRunning(false);return}state.poll=setTimeout(tick,700)};tick()}
 
 function providerLabel(provider){return provider.provider_type==='mimo'?'MiMo':'DeepSeek'}
 function selectedProvider(){return state.providers.find(x=>String(x.id)===$('#providerSelect').value)}
+function selectProvider(providerId, persist=true) {
+  const provider=state.providers.find(x=>String(x.id)===String(providerId));
+  if(!provider) return null;
+  const changed=$('#providerSelect').value!==String(provider.id);
+  $('#providerSelect').value=String(provider.id);
+  if(persist) storeValue('active-provider', provider.id);
+  if(changed) updateProviderUi();
+  return provider;
+}
+function providerForConversation(data) {
+  const job=data.active_job;
+  if(job && job.provider_id) return job.provider_id;
+  for(const message of [...(data.messages || [])].reverse()) {
+    const meta=message.meta || {};
+    if(meta.provider_id) return meta.provider_id;
+    if(meta.provider_type || meta.model) {
+      const match=state.providers.find(provider =>
+        (!meta.provider_type || provider.provider_type===meta.provider_type) &&
+        (!meta.model || provider.model===meta.model)
+      );
+      if(match) return match.id;
+    }
+  }
+  return storedValue('active-provider');
+}
+function restoreProviderForConversation(data) {
+  const providerId=providerForConversation(data);
+  if(providerId) selectProvider(providerId);
+}
 function updateProviderUi(){
   const provider=selectedProvider(), mimo=provider&&provider.provider_type==='mimo';
   $('#mimoSettingsButton').classList.toggle('hidden',!mimo);
@@ -351,6 +401,8 @@ function updateProviderUi(){
 async function loadProviders(){
   state.providers=await api('/api/providers');
   $('#providerSelect').innerHTML=state.providers.length?state.providers.map(p=>`<option value="${p.id}">${escapeHtml(p.name)} · ${providerLabel(p)} · ${escapeHtml(p.model)}</option>`).join(''):'<option value="">请先添加 API</option>';
+  const preferred=storedValue('active-provider');
+  if(state.providers.length) selectProvider(state.providers.some(p=>String(p.id)===String(preferred)) ? preferred : state.providers[0].id);
   renderProviderList(); updateProviderUi();
 }
 function renderProviderList(){
@@ -404,7 +456,7 @@ async function loadUsers(){const users=await api('/api/users');$('#userList').in
 function resizePrompt(){const p=$('#prompt');p.style.height='auto';p.style.height=Math.min(p.scrollHeight,180)+'px'}
 function openSidebar(){$('#sidebar').classList.add('open')}function closeSidebar(){$('#sidebar').classList.remove('open')}
 
-async function boot(){try{state.me=await api('/api/me');$('#loginView').classList.add('hidden');$('#appView').classList.remove('hidden');$('#accountName').textContent=state.me.username;$('#accountRole').textContent=state.me.is_admin?'管理员':'用户';$('#avatar').textContent=state.me.username[0].toUpperCase();$('#usersButton').classList.toggle('hidden',!state.me.is_admin);await Promise.all([loadProviders(),loadHistory(1)]);renderMessages()}catch{$('#loginView').classList.remove('hidden');$('#appView').classList.add('hidden')}}
+async function boot(){try{state.me=await api('/api/me');$('#loginView').classList.add('hidden');$('#appView').classList.remove('hidden');$('#accountName').textContent=state.me.username;$('#accountRole').textContent=state.me.is_admin?'管理员':'用户';$('#avatar').textContent=state.me.username[0].toUpperCase();$('#usersButton').classList.toggle('hidden',!state.me.is_admin);await Promise.all([loadProviders(),loadHistory(1)]);const activeId=storedValue('active-conversation');const restored=activeId?await openConversation(activeId):false;if(!restored)renderMessages()}catch{$('#loginView').classList.remove('hidden');$('#appView').classList.add('hidden')}}
 
 $('#loginForm').onsubmit=async e=>{e.preventDefault();$('#loginError').textContent='';try{await api('/api/login',{method:'POST',body:{username:$('#loginUser').value,password:$('#loginPass').value}});await boot()}catch(err){$('#loginError').textContent=err.message}};
 $('#logout').onclick=async()=>{await api('/api/logout',{method:'POST'});location.reload()};
@@ -413,7 +465,7 @@ $('#newChat').onclick=()=>{newConversation();closeSidebar()};$('#composer').onsu
 $('#prompt').oninput=resizePrompt;
 $('#stopButton').onclick=async()=>{if(state.job&&state.job.id){await api(`/api/jobs/${state.job.id}/stop`,{method:'POST'});toast('正在停止')}};
 $('#providerButton').onclick=()=>{$('#providerModal').showModal();renderProviderList()};$('#usersButton').onclick=()=>{loadUsers();$('#usersModal').showModal()};
-$('#mimoSettingsButton').onclick=openMimoSettings;$('#providerSelect').onchange=updateProviderUi;$('#providerType').onchange=syncProviderForm;$('#mimoThinking').onchange=syncMimoThinkingFields;
+$('#mimoSettingsButton').onclick=openMimoSettings;$('#providerSelect').onchange=()=>{storeValue('active-provider',$('#providerSelect').value);updateProviderUi()};$('#providerType').onchange=syncProviderForm;$('#mimoThinking').onchange=syncMimoThinkingFields;
 $$('.close-modal').forEach(b=>b.onclick=()=>b.closest('dialog').close());$$('dialog').forEach(d=>d.onclick=e=>{if(e.target===d)d.close()});
 $('#testProvider').onclick=testProvider;$('#providerForm').onsubmit=async e=>{e.preventDefault();try{const body=providerFormData();await api('/api/providers',{method:'POST',body});e.target.reset();$('#providerType').value='deepseek';syncProviderForm();$('#providerKey').value='';$('#manualModel').value='';$('#providerStatus').textContent='';await loadProviders();toast('API 已保存')}catch(err){$('#providerStatus').textContent=err.message}};
 $('#mimoForm').onsubmit=saveMimoSettings;
