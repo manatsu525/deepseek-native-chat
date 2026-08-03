@@ -97,8 +97,8 @@ function messageHtml(message, index, live=false) {
   const detailKey = `trace-${meta.job_id || `message-${index}`}`;
   return `<article class="message ${assistant ? 'assistant' : 'user'}" data-index="${index}">
     <div class="message-icon">${assistant ? 'DS' : escapeHtml(((state.me && state.me.username) || 'U')[0].toUpperCase())}</div>
-    <div class="message-body"><div class="message-head"><strong>${assistant ? 'DeepSeek' : escapeHtml((state.me && state.me.username) || '你')}</strong><div class="message-actions"><button data-action="copy">复制</button><button data-action="retry">重新回答</button></div></div>
-    ${assistant ? traceHtml(meta, live, detailKey) : ''}<div class="message-content">${assistant ? (content ? markdown(content) : '<div class="typing"><i></i><i></i><i></i></div>') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div>
+    <div class="message-body"><div class="message-head"><strong>${assistant ? 'DeepSeek' : escapeHtml((state.me && state.me.username) || '你')}</strong></div>
+    ${assistant ? traceHtml(meta, live, detailKey) : ''}<div class="message-content">${assistant ? (content ? markdown(content) : '<div class="typing"><i></i><i></i><i></i></div>') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div><div class="message-actions"><button data-action="copy">复制</button><button data-action="retry">重新回答</button></div>
     ${meta.error ? `<p class="job-error">${escapeHtml(meta.error)}</p>` : ''}</div></article>`;
 }
 
@@ -153,7 +153,6 @@ async function openConversation(id) {
   try {
     const data=await api(`/api/conversations/${id}`); state.conversation=data.conversation; state.messages=data.messages; state.job=data.active_job;
     $('#conversationTitle').textContent=state.conversation.title; renderMessages(); await loadHistory(state.page);
-    $('#chatScroll').scrollTop=$('#chatScroll').scrollHeight;
     if(state.job)startPolling(state.job.id);
   } catch(err){toast(err.message)}
 }
