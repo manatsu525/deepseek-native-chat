@@ -202,7 +202,13 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
     const error=s.error?`<div class="search-error">${escapeHtml(s.error)}</div>`:'';
     return `<details class="search-step" data-detail-key="${escapeHtml(searchKey)}"${searchOpen}><summary>${label} ${i+1} · ${escapeHtml(s.status || 'completed')}</summary><div class="search-detail">${detail}${error}</div></details>`;
   }).join('');
-  const sourceHtml = sources.length ? `<div class="sources"><span class="sources-label">来源</span>${sources.map(s => { const logo=s.logo_url&&safeUrl(s.logo_url)!=='#'?`<img src="${safeUrl(s.logo_url)}" alt="" loading="lazy">`:''; return `<a class="source-chip" href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(s.summary || s.url)}">${logo}<span>${escapeHtml(s.title || s.url)}</span></a>`; }).join('')}</div>` : '';
+  const sourceChips = sources.map(s => { const logo=s.logo_url&&safeUrl(s.logo_url)!=='#'?`<img src="${safeUrl(s.logo_url)}" alt="" loading="lazy">`:''; return `<a class="source-chip" href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(s.summary || s.url)}">${logo}<span>${escapeHtml(s.title || s.url)}</span></a>`; }).join('');
+  const sourceKey = `${detailKey}-sources`;
+  const sourceOpen = detailState.get(sourceKey) ? ' open' : '';
+  const sourceHtml = sources.length ? (sources.length > 5
+    ? `<details class="source-list" data-detail-key="${escapeHtml(sourceKey)}"${sourceOpen}><summary>来源 · ${sources.length} 条</summary><div class="sources">${sourceChips}</div></details>`
+    : `<div class="sources"><span class="sources-label">来源</span>${sourceChips}</div>`)
+    : '';
   const traceOpen=detailState.get(detailKey) ? ' open' : '';
   return `<details class="trace" data-detail-key="${escapeHtml(detailKey)}"${traceOpen}><summary>思考与联网 · ${status}${searches.length ? ` · ${searches.length} 次搜索` : ''}</summary><div class="trace-body">${reasoning ? `<div class="reasoning-text">${escapeHtml(reasoning)}</div>` : active ? '<div class="typing"><i></i><i></i><i></i></div>' : ''}${searchHtml}${sourceHtml}${usageHtml(meta.usage || {})}</div></details>`;
 }
