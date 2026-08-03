@@ -1,10 +1,11 @@
 # DeepSeek Native Chat
 
-一个面向低配置 VPS 的私人 DeepSeek 聊天站。它只使用 DeepSeek 官方 `deepseek-v4-flash` Responses API，并把 `web_search` 作为服务端工具交给 DeepSeek 执行，不安装 SearXNG、浏览器或网页抓取器。
+一个面向低配置 VPS 的私人 DeepSeek / Xiaomi MiMo 聊天站。联网搜索由所选服务商的原生工具执行，不安装 SearXNG、浏览器或网页抓取器。
 
 ## 功能
 
-- DeepSeek V4 Flash 原生多轮联网搜索
+- DeepSeek V4 Flash Responses API 原生多轮联网搜索
+- 小米 MiMo V2.5 / V2.5 Pro Chat Completions 原生联网搜索
 - 流式回答、思考过程、搜索步骤和来源折叠展示
 - 输入、缓存命中、输出和推理 Token 统计
 - 后台生成：刷新页面、切换应用或锁屏后任务继续运行
@@ -15,6 +16,7 @@
 - 最多 3 个账号，管理员可在前端新增或删除账号
 - 各账号的对话和 API 配置相互隔离
 - 前端测试 API、读取模型列表、手动填写模型名、删除 API
+- MiMo 联网参数：最大关键词数、每轮结果数、强制搜索、用户位置、思考开关和生成上限
 - SQLite 单文件数据库、自签 HTTPS、systemd 守护
 - 手机和桌面端响应式界面
 
@@ -42,7 +44,7 @@ sudo ./install.sh
 
 默认访问地址为 `https://服务器IP:8000`。证书为自签证书，首次访问需要在浏览器中确认继续。
 
-进入页面后，在右上角打开“API”，填写 DeepSeek 官方 API Key，点击“测试并读取模型”，确认存在 `deepseek-v4-flash` 后保存。
+进入页面后，在右上角打开“API”，选择服务商并填写对应 API Key，点击“测试并读取模型”后保存。DeepSeek 使用 `https://api.deepseek.com`；MiMo 使用 `https://api.xiaomimimo.com/v1`。MiMo 联网搜索需要先在小米控制台开通联网服务插件。
 
 ## 卸载
 
@@ -62,11 +64,11 @@ sudo ./uninstall.sh --yes
 
 ## 设计说明
 
-DeepSeek 官方 Responses API 当前只有 `deepseek-v4-flash` 支持服务端 `web_search`。Chat Completions 路由以及 NVIDIA NIM 的 Chat Completions 接口没有同等的 provider-executed search，因此本项目固定使用 DeepSeek 官方 `/responses` 路由。
+DeepSeek 使用官方 `/responses` 路由，当前原生 `web_search` 适配 `deepseek-v4-flash`。MiMo 的联网搜索按官方示例使用 `/v1/chat/completions`，工具参数由 MiMo 服务端处理并在流式响应的 annotations 中返回来源；两种协议由后端分别解析，不能共用 DeepSeek 的 Responses SSE 事件处理器。
 
 DeepSeek 当前会忽略 Responses API 的 `max_tool_calls`。项目在系统提示中要求单次回答最多搜索五次，但无法像客户端工具循环一样做强制的逐次拦截；实际搜索次数以 DeepSeek 服务端执行结果为准。
 
-DeepSeek V4 Flash Responses API 当前不支持图片或文件输入，所以项目没有提供会误导用户的上传按钮。
+DeepSeek V4 Flash Responses API 当前不支持图片或文件输入，所以项目没有提供会误导用户的上传按钮。MiMo 的多模态能力不在本次聊天功能范围内。
 
 ## 数据与安全
 

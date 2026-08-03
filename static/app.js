@@ -166,7 +166,9 @@ function usageHtml(usage={}) {
   const input = usage.input_tokens == null ? 0 : usage.input_tokens, output = usage.output_tokens == null ? 0 : usage.output_tokens;
   const cached = usage.input_tokens_details && usage.input_tokens_details.cached_tokens != null ? usage.input_tokens_details.cached_tokens : 0;
   const reasoning = usage.output_tokens_details && usage.output_tokens_details.reasoning_tokens != null ? usage.output_tokens_details.reasoning_tokens : 0;
-  return `<div class="usage"><span>输入 ${input.toLocaleString()}</span><span>缓存命中 ${cached.toLocaleString()}</span><span>输出 ${output.toLocaleString()}</span><span>推理 ${reasoning.toLocaleString()}</span><span>合计 ${(input+output).toLocaleString()}</span></div>`;
+  const web = usage.web_search_usage || {};
+  const webUsage = web.tool_usage == null ? '' : `<span>联网 ${Number(web.tool_usage).toLocaleString()} 次</span><span>网页 ${Number(web.page_usage || 0).toLocaleString()} 篇</span>`;
+  return `<div class="usage"><span>输入 ${input.toLocaleString()}</span><span>缓存命中 ${cached.toLocaleString()}</span><span>输出 ${output.toLocaleString()}</span><span>推理 ${reasoning.toLocaleString()}</span><span>合计 ${(input+output).toLocaleString()}</span>${webUsage}</div>`;
 }
 
 function traceHtml(meta={}, active=false, detailKey='trace') {
@@ -177,7 +179,7 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
   [...(meta.sources || []), ...searches.filter(item => item.action === 'open_page' && item.url).map(item => ({url:item.url,title:item.url}))].forEach(source => {
     const url = String(source.url || '');
     if (!/^https?:\/\//i.test(url) || seenSources.has(url)) return;
-    seenSources.add(url); sources.push({url, title:source.title || url});
+    seenSources.add(url); sources.push(source);
   });
   if (!reasoning && !searches.length && !active && !Object.keys(meta.usage || {}).length) return '';
   const status = active ? '进行中' : (meta.stopped ? '已停止' : '已完成');
@@ -186,9 +188,10 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
     const searchKey=`${detailKey}-search-${s.id || i}`;
     const searchOpen=detailState.get(searchKey) ? ' open' : '';
     const detail=s.url?`<a href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(s.url)}</a>`:escapeHtml(Array.isArray(s.query)?s.query.filter(x=>!String(x).startsWith('ws_call_id=')).join('；'):(s.query||'DeepSeek 未返回查询词'));
-    return `<details class="search-step" data-detail-key="${escapeHtml(searchKey)}"${searchOpen}><summary>${label} ${i+1} · ${escapeHtml(s.status || 'completed')}</summary><div class="search-detail">${detail}</div></details>`;
+    const error=s.error?`<div class="search-error">${escapeHtml(s.error)}</div>`:'';
+    return `<details class="search-step" data-detail-key="${escapeHtml(searchKey)}"${searchOpen}><summary>${label} ${i+1} · ${escapeHtml(s.status || 'completed')}</summary><div class="search-detail">${detail}${error}</div></details>`;
   }).join('');
-  const sourceHtml = sources.length ? `<div class="sources"><span class="sources-label">来源</span>${sources.map(s => `<a class="source-chip" href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(s.url)}">${escapeHtml(s.title || s.url)}</a>`).join('')}</div>` : '';
+  const sourceHtml = sources.length ? `<div class="sources"><span class="sources-label">来源</span>${sources.map(s => { const logo=s.logo_url&&safeUrl(s.logo_url)!=='#'?`<img src="${safeUrl(s.logo_url)}" alt="" loading="lazy">`:''; return `<a class="source-chip" href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(s.summary || s.url)}">${logo}<span>${escapeHtml(s.title || s.url)}</span></a>`; }).join('')}</div>` : '';
   const traceOpen=detailState.get(detailKey) ? ' open' : '';
   return `<details class="trace" data-detail-key="${escapeHtml(detailKey)}"${traceOpen}><summary>思考与联网 · ${status}${searches.length ? ` · ${searches.length} 次搜索` : ''}</summary><div class="trace-body">${reasoning ? `<div class="reasoning-text">${escapeHtml(reasoning)}</div>` : active ? '<div class="typing"><i></i><i></i><i></i></div>' : ''}${searchHtml}${sourceHtml}${usageHtml(meta.usage || {})}</div></details>`;
 }
@@ -198,10 +201,11 @@ function messageHtml(message, index, live=false) {
   const meta = message.meta || {};
   const content = message.content || '';
   const detailKey = `trace-${meta.job_id || `message-${index}`}`;
+  const assistantName = meta.provider_type === 'mimo' ? 'MiMo' : 'DeepSeek';
   return `<article class="message ${assistant ? 'assistant' : 'user'}${live ? ' live-message' : ''}" data-index="${index}">
-    <div class="message-icon">${assistant ? 'DS' : escapeHtml(((state.me && state.me.username) || 'U')[0].toUpperCase())}</div>
-    <div class="message-body"><div class="message-head"><strong>${assistant ? 'DeepSeek' : escapeHtml((state.me && state.me.username) || '你')}</strong></div>
-    ${assistant ? traceHtml(meta, live, detailKey) : ''}<div class="message-content">${assistant ? (content ? markdown(content) : '<div class="typing"><i></i><i></i><i></i></div>') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div><div class="message-actions"><button type="button" data-action="copy">复制</button><button type="button" data-action="retry">重新回答</button></div>
+    <div class="message-icon">${assistant ? (meta.provider_type === 'mimo' ? 'MM' : 'DS') : escapeHtml(((state.me && state.me.username) || 'U')[0].toUpperCase())}</div>
+    <div class="message-body"><div class="message-head"><strong>${assistant ? assistantName : escapeHtml((state.me && state.me.username) || '你')}</strong></div>
+    ${assistant ? traceHtml(meta, live, detailKey) : ''}<div class="message-content">${assistant ? (content ? markdown(content) : live ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div><div class="message-actions"><button type="button" data-action="copy">复制</button><button type="button" data-action="retry">重新回答</button></div>
     ${meta.error ? `<p class="job-error">${escapeHtml(meta.error)}</p>` : ''}</div></article>`;
 }
 
@@ -210,7 +214,7 @@ function renderMessages() {
   $$('details[data-detail-key]').forEach(detail => detailState.set(detail.dataset.detailKey, detail.open));
   const items = [...state.messages];
   if (state.job && ['queued','running','failed','stopped'].includes(state.job.status)) {
-    items.push({role:'assistant', content:state.job.answer || '', meta:{job_id:state.job.id,reasoning:state.job.reasoning,searches:state.job.searches,sources:state.job.sources,usage:state.job.usage,error:state.job.error,stopped:state.job.status==='stopped'}, live:['queued','running'].includes(state.job.status)});
+    items.push({role:'assistant', content:state.job.answer || '', meta:{job_id:state.job.id,provider_type:state.job.provider_type,reasoning:state.job.reasoning,searches:state.job.searches,sources:state.job.sources,usage:state.job.usage,error:state.job.error,stopped:state.job.status==='stopped'}, live:['queued','running'].includes(state.job.status)});
   }
   $('#welcome').classList.toggle('hidden', items.length > 0);
   $('#messages').innerHTML = items.map((m,i)=>messageHtml(m,i,!!m.live)).join('');
@@ -226,6 +230,7 @@ function replaceJobMessage(job, liveState) {
     content: job.answer || '',
     meta: {
       job_id: job.id,
+      provider_type: job.provider_type || (selectedProvider() && selectedProvider().provider_type),
       reasoning: job.reasoning,
       searches: job.searches,
       sources: job.sources,
@@ -310,17 +315,16 @@ async function openConversation(id) {
 }
 
 function newConversation(){stopPolling();state.conversation=null;state.messages=[];state.job=null;$('#conversationTitle').textContent='新对话';renderMessages();loadHistory(1)}
-function selectedProvider(){return state.providers.find(x=>String(x.id)===$('#providerSelect').value)}
 
 async function submitPrompt(value) {
   const content=(value == null ? $('#prompt').value : value).trim(); if(!content)return;
-  const provider=selectedProvider(); if(!provider){$('#providerModal').showModal();toast('请先添加 DeepSeek API');return}
+  const provider=selectedProvider(); if(!provider){$('#providerModal').showModal();toast('请先添加 API 配置');return}
   if(state.job && ['queued','running'].includes(state.job.status)){toast('请先停止当前回答');return}
   $('#prompt').value='';resizePrompt();
-  state.messages.push({role:'user',content,meta:{}});state.job={status:'queued',answer:'',reasoning:'',searches:[],sources:[],usage:{}};renderMessages();
+  state.messages.push({role:'user',content,meta:{}});state.job={status:'queued',provider_type:provider.provider_type,provider_id:provider.id,answer:'',reasoning:'',searches:[],sources:[],usage:{}};renderMessages();
   $('#chatScroll').scrollTop=$('#chatScroll').scrollHeight;setRunning(true);
   try{
-    const data=await api('/api/chat',{method:'POST',body:{conversation_id:(state.conversation&&state.conversation.id)||null,content,provider_id:provider.id,model:'deepseek-v4-flash',effort:$('#effort').value}});
+    const data=await api('/api/chat',{method:'POST',body:{conversation_id:(state.conversation&&state.conversation.id)||null,content,provider_id:provider.id,model:provider.model,effort:$('#effort').value}});
     if(!state.conversation)state.conversation={id:data.conversation_id,title:content.slice(0,36)};
     state.job.id=data.job_id;$('#conversationTitle').textContent=state.conversation.title;loadHistory(1);startPolling(data.job_id);
   }catch(err){state.messages.pop();state.job=null;setRunning(false);renderMessages();toast(err.message)}
@@ -330,11 +334,70 @@ function setRunning(on){$('#stopButton').classList.toggle('hidden',!on);$('#send
 function stopPolling(){if(state.poll)clearTimeout(state.poll);state.poll=null}
 function startPolling(id){stopPolling();setRunning(true);const tick=async()=>{try{const job=await api(`/api/jobs/${id}`);state.job=job;if(job.status==='completed'){stopPolling();setRunning(false);finalizeLiveMessage(job);await loadHistory(1);return}if(['failed','stopped'].includes(job.status)){stopPolling();setRunning(false);renderMessages();return}updateLiveMessage()}catch(err){toast(err.message);setRunning(false);return}state.poll=setTimeout(tick,700)};tick()}
 
-async function loadProviders(){state.providers=await api('/api/providers');$('#providerSelect').innerHTML=state.providers.length?state.providers.map(p=>`<option value="${p.id}">${escapeHtml(p.name)} · ${escapeHtml(p.model)}</option>`).join(''):'<option value="">请先添加 API</option>';renderProviderList()}
-function renderProviderList(){$('#providerList').innerHTML=state.providers.map(p=>`<div class="list-item"><div class="list-item-main"><strong>${escapeHtml(p.name)}</strong><small>${escapeHtml(p.api_key_masked)} · ${escapeHtml(p.model)}</small></div><button class="danger-btn" data-id="${p.id}">删除</button></div>`).join('')||'<p class="muted">尚未添加 API。</p>';$$('.danger-btn',$('#providerList')).forEach(b=>b.onclick=async()=>{if(!confirm('删除这个 API 配置？'))return;try{await api(`/api/providers/${b.dataset.id}`,{method:'DELETE'});await loadProviders()}catch(err){toast(err.message)}})}
+function providerLabel(provider){return provider.provider_type==='mimo'?'MiMo':'DeepSeek'}
+function selectedProvider(){return state.providers.find(x=>String(x.id)===$('#providerSelect').value)}
+function updateProviderUi(){
+  const provider=selectedProvider(), mimo=provider&&provider.provider_type==='mimo';
+  $('#mimoSettingsButton').classList.toggle('hidden',!mimo);
+  $('#effort').disabled=!!mimo;
+  $('#effort').title=mimo?'MiMo 的思考开关在“MiMo 联网”设置中配置':'控制 DeepSeek 模型推理投入';
+  $('#nativePill').textContent=mimo?'● MiMo Web':'● Native Web';
+  $('#welcomeOrbitMark').textContent=mimo?'MM':'DS';
+  $('#welcomeEyebrow').textContent=mimo?'XIAOMI MIMO V2.5': 'DEEPSEEK V4 FLASH';
+  $('#welcomeTitle').textContent=mimo?'使用 MiMo 原生联网':'问点需要查证的问题';
+  $('#welcomeDescription').textContent=mimo?'模型会通过 MiMo 服务端联网工具获取实时公开信息。':'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
+}
 
-async function testProvider(){const button=$('#testProvider');button.disabled=true;$('#providerStatus').textContent='正在连接 DeepSeek…';try{const body=providerFormData();const result=await api('/api/providers/test',{method:'POST',body});const select=$('#providerModel');select.innerHTML=(result.models.length?result.models:['deepseek-v4-flash']).map(m=>`<option value="${escapeHtml(m)}" ${m==='deepseek-v4-flash'?'selected':''}>${escapeHtml(m)}</option>`).join('');$('#providerStatus').textContent=result.native_search_models.length?'连接成功，检测到 V4 Flash 原生搜索模型。':'API 可用，但模型列表中没有 deepseek-v4-flash。'}catch(err){$('#providerStatus').textContent=err.message}finally{button.disabled=false}}
-function providerFormData(){return{name:$('#providerName').value||'DeepSeek',api_key:$('#providerKey').value,base_url:$('#providerBase').value,model:$('#manualModel').value.trim()||$('#providerModel').value||'deepseek-v4-flash'}}
+async function loadProviders(){
+  state.providers=await api('/api/providers');
+  $('#providerSelect').innerHTML=state.providers.length?state.providers.map(p=>`<option value="${p.id}">${escapeHtml(p.name)} · ${providerLabel(p)} · ${escapeHtml(p.model)}</option>`).join(''):'<option value="">请先添加 API</option>';
+  renderProviderList(); updateProviderUi();
+}
+function renderProviderList(){
+  $('#providerList').innerHTML=state.providers.map(p=>`<div class="list-item"><div class="list-item-main"><strong>${escapeHtml(p.name)} <span class="provider-kind">${providerLabel(p)}</span></strong><small>${escapeHtml(p.api_key_masked)} · ${escapeHtml(p.model)}</small></div><button class="danger-btn" data-id="${p.id}">删除</button></div>`).join('')||'<p class="muted">尚未添加 API。</p>';
+  $$('.danger-btn',$('#providerList')).forEach(b=>b.onclick=async()=>{if(!confirm('删除这个 API 配置？'))return;try{await api(`/api/providers/${b.dataset.id}`,{method:'DELETE'});await loadProviders()}catch(err){toast(err.message)}})
+}
+
+function providerType(){return $('#providerType').value||'deepseek'}
+function syncProviderForm(){
+  const mimo=providerType()==='mimo';
+  const base=$('#providerBase'), model=$('#providerModel');
+  base.value=mimo?'https://api.xiaomimimo.com/v1':'https://api.deepseek.com';
+  model.innerHTML=mimo?'<option value="mimo-v2.5-pro">mimo-v2.5-pro</option><option value="mimo-v2.5">mimo-v2.5</option>':'<option value="deepseek-v4-flash">deepseek-v4-flash</option>';
+  $('#providerName').placeholder=mimo?'例如：我的 MiMo':'例如：我的 DeepSeek';
+  $('#providerStatus').textContent='';
+}
+async function testProvider(){
+  const button=$('#testProvider');button.disabled=true;$('#providerStatus').textContent=`正在连接 ${providerType()==='mimo'?'MiMo':'DeepSeek'}…`;
+  try{
+    const body=providerFormData();const result=await api('/api/providers/test',{method:'POST',body});const select=$('#providerModel');
+    const fallback=providerType()==='mimo'?['mimo-v2.5-pro','mimo-v2.5']:['deepseek-v4-flash'];
+    // The provider may list TTS/ASR models too; this chat only accepts the
+    // text models that support the native web-search workflow.
+    const advertised=result.models || [];
+    const supportedModels=(result.supported_models||[]).filter(m=>advertised.includes(m));
+    const models=supportedModels.length?supportedModels:fallback;
+    select.innerHTML=models.map(m=>`<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('');
+    const supported=(result.supported_models||[]).filter(m=>models.includes(m));
+    $('#providerStatus').textContent=supported.length?`连接成功，可用联网模型：${supported.join('、')}`:`API 可用，但没有检测到当前服务商支持的联网模型。`;
+  }catch(err){$('#providerStatus').textContent=err.message}finally{button.disabled=false}
+}
+function providerFormData(){return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:$('#manualModel').value.trim()||$('#providerModel').value|| (providerType()==='mimo'?'mimo-v2.5-pro':'deepseek-v4-flash')}}
+
+function mimoSettings(provider){return {...{max_keyword:3,limit:5,force_search:false,country:'',region:'',city:'',thinking:'enabled',max_completion_tokens:8192,temperature:1,top_p:.95},...(provider&&provider.settings||{})}}
+function fillMimoSettings(){
+  const config=mimoSettings(selectedProvider());
+  $('#mimoMaxKeyword').value=config.max_keyword;$('#mimoLimit').value=config.limit;$('#mimoForceSearch').checked=!!config.force_search;
+  $('#mimoThinking').value=config.thinking;$('#mimoMaxCompletion').value=config.max_completion_tokens;$('#mimoTemperature').value=config.temperature;$('#mimoTopP').value=config.top_p;
+  $('#mimoCountry').value=config.country||'';$('#mimoRegion').value=config.region||'';$('#mimoCity').value=config.city||'';syncMimoThinkingFields();
+}
+function syncMimoThinkingFields(){const disabled=$('#mimoThinking').value==='enabled';$('#mimoTemperature').disabled=disabled;$('#mimoTopP').disabled=disabled;$('#mimoSamplingNote').textContent=disabled?'深度思考开启时，MiMo 会强制使用 temperature=1.0、top_p=0.95。':'关闭思考后可自定义 temperature 和 top_p。'}
+function openMimoSettings(){if(!selectedProvider()||selectedProvider().provider_type!=='mimo'){toast('请先选择 MiMo API');return}fillMimoSettings();$('#mimoModal').showModal()}
+async function saveMimoSettings(event){
+  event.preventDefault(); const provider=selectedProvider(); if(!provider)return;
+  const body={max_keyword:Number($('#mimoMaxKeyword').value),limit:Number($('#mimoLimit').value),force_search:$('#mimoForceSearch').checked,thinking:$('#mimoThinking').value,max_completion_tokens:Number($('#mimoMaxCompletion').value),temperature:Number($('#mimoTemperature').value),top_p:Number($('#mimoTopP').value),country:$('#mimoCountry').value.trim(),region:$('#mimoRegion').value.trim(),city:$('#mimoCity').value.trim()};
+  try{const updated=await api(`/api/providers/${provider.id}/settings`,{method:'PUT',body});const index=state.providers.findIndex(x=>x.id===provider.id);if(index>=0)state.providers[index]=updated;$('#mimoModal').close();updateProviderUi();toast('MiMo 参数已保存')}catch(err){$('#mimoStatus').textContent=err.message}
+}
 
 async function loadUsers(){const users=await api('/api/users');$('#userList').innerHTML=users.map(u=>`<div class="list-item"><span class="avatar">${escapeHtml(u.username[0].toUpperCase())}</span><div class="list-item-main"><strong>${escapeHtml(u.username)}</strong><small>${u.is_admin?'管理员':'普通账号'}</small></div><div class="item-actions"><button class="soft-btn" data-password-user="${u.id}" data-username="${escapeHtml(u.username)}">改密码</button>${u.id!==state.me.id?`<button class="danger-btn" data-user="${u.id}">删除</button>`:''}</div></div>`).join('');$$('[data-user]',$('#userList')).forEach(b=>b.onclick=async()=>{if(!confirm('删除账号及其全部独立数据？'))return;try{await api(`/api/users/${b.dataset.user}`,{method:'DELETE'});loadUsers()}catch(err){toast(err.message)}});$$('[data-password-user]',$('#userList')).forEach(b=>b.onclick=()=>{$('#passwordUserId').value=b.dataset.passwordUser;$('#passwordTarget').textContent=`正在修改：${b.dataset.username}`;$('#changePassword').value='';$('#changePasswordAgain').value='';$('#passwordError').textContent='';$('#passwordModal').showModal()})}
 
@@ -349,11 +412,14 @@ $('#newChat').onclick=()=>{newConversation();closeSidebar()};$('#composer').onsu
 $('#prompt').oninput=resizePrompt;$('#prompt').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();submitPrompt()}};
 $('#stopButton').onclick=async()=>{if(state.job&&state.job.id){await api(`/api/jobs/${state.job.id}/stop`,{method:'POST'});toast('正在停止')}};
 $('#providerButton').onclick=()=>{$('#providerModal').showModal();renderProviderList()};$('#usersButton').onclick=()=>{loadUsers();$('#usersModal').showModal()};
+$('#mimoSettingsButton').onclick=openMimoSettings;$('#providerSelect').onchange=updateProviderUi;$('#providerType').onchange=syncProviderForm;$('#mimoThinking').onchange=syncMimoThinkingFields;
 $$('.close-modal').forEach(b=>b.onclick=()=>b.closest('dialog').close());$$('dialog').forEach(d=>d.onclick=e=>{if(e.target===d)d.close()});
-$('#testProvider').onclick=testProvider;$('#providerForm').onsubmit=async e=>{e.preventDefault();try{const body=providerFormData();if(body.model!=='deepseek-v4-flash')throw new Error('原生联网搜索目前必须选择 deepseek-v4-flash');await api('/api/providers',{method:'POST',body});e.target.reset();$('#providerBase').value='https://api.deepseek.com';$('#providerStatus').textContent='';await loadProviders();toast('API 已保存')}catch(err){$('#providerStatus').textContent=err.message}};
+$('#testProvider').onclick=testProvider;$('#providerForm').onsubmit=async e=>{e.preventDefault();try{const body=providerFormData();await api('/api/providers',{method:'POST',body});e.target.reset();$('#providerType').value='deepseek';syncProviderForm();$('#providerKey').value='';$('#manualModel').value='';$('#providerStatus').textContent='';await loadProviders();toast('API 已保存')}catch(err){$('#providerStatus').textContent=err.message}};
+$('#mimoForm').onsubmit=saveMimoSettings;
 $('#userForm').onsubmit=async e=>{e.preventDefault();try{await api('/api/users',{method:'POST',body:{username:$('#newUsername').value,password:$('#newPassword').value,is_admin:$('#newAdmin').checked}});e.target.reset();await loadUsers();toast('账号已新增')}catch(err){toast(err.message)}};
 $('#passwordForm').onsubmit=async e=>{e.preventDefault();const password=$('#changePassword').value;if(password!==$('#changePasswordAgain').value){$('#passwordError').textContent='两次输入的密码不一致';return}try{await api(`/api/users/${$('#passwordUserId').value}/password`,{method:'PUT',body:{password}});$('#passwordModal').close();toast('密码已修改')}catch(err){$('#passwordError').textContent=err.message}};
 $('#openSidebar').onclick=openSidebar;$('#closeSidebar').onclick=closeSidebar;$('#scrim').onclick=closeSidebar;
 $$('[data-prompt]').forEach(b=>b.onclick=()=>submitPrompt(b.dataset.prompt));
 $('#chatScroll').onscroll=()=>{const s=$('#chatScroll');$('#jumpBottom').classList.toggle('hidden',s.scrollHeight-s.scrollTop-s.clientHeight<220)};$('#jumpBottom').onclick=()=>$('#chatScroll').scrollTo({top:$('#chatScroll').scrollHeight,behavior:'smooth'});
+syncProviderForm();
 boot();

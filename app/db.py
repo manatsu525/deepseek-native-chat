@@ -47,6 +47,8 @@ class Database:
                     api_key TEXT NOT NULL,
                     base_url TEXT NOT NULL DEFAULT 'https://api.deepseek.com',
                     model TEXT NOT NULL DEFAULT 'deepseek-v4-flash',
+                    provider_type TEXT NOT NULL DEFAULT 'deepseek',
+                    settings_json TEXT NOT NULL DEFAULT '{}',
                     created_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS conversations (
@@ -71,6 +73,7 @@ class Database:
                     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
                     provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+                    provider_type TEXT NOT NULL DEFAULT 'deepseek',
                     model TEXT NOT NULL,
                     effort TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -87,6 +90,14 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id, created_at DESC);
                 """
             )
+            provider_columns = {row["name"] for row in db.execute("PRAGMA table_info(providers)").fetchall()}
+            if "provider_type" not in provider_columns:
+                db.execute("ALTER TABLE providers ADD COLUMN provider_type TEXT NOT NULL DEFAULT 'deepseek'")
+            if "settings_json" not in provider_columns:
+                db.execute("ALTER TABLE providers ADD COLUMN settings_json TEXT NOT NULL DEFAULT '{}'")
+            job_columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)").fetchall()}
+            if "provider_type" not in job_columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN provider_type TEXT NOT NULL DEFAULT 'deepseek'")
         self.path.chmod(0o600)
 
     def one(self, sql: str, args: tuple[Any, ...] = ()) -> Optional[dict[str, Any]]:
