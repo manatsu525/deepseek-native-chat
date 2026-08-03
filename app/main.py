@@ -7,7 +7,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import uvicorn
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response
@@ -17,13 +17,25 @@ from pydantic import BaseModel, Field
 
 from .config import settings
 from .db import Database
-from .deepseek import list_models, stream_response
+from .deepseek import list_models as deepseek_list_models
+from .deepseek import stream_response as deepseek_stream_response
+from .mimo import DEFAULT_SETTINGS as MIMO_DEFAULT_SETTINGS
+from .mimo import MIMO_MAX_COMPLETION_TOKENS, MIMO_MODELS, list_models as mimo_list_models
+from .mimo import stream_response as mimo_stream_response
 from .security import load_secret, make_token, password_hash, password_ok, read_token
 
 
 db = Database(settings.db_path)
 secret = b""
 tasks: dict[str, asyncio.Task[Any]] = {}
+SUPPORTED_MODELS = {
+    "deepseek": {"deepseek-v4-flash"},
+    "mimo": MIMO_MODELS,
+}
+DEFAULT_BASE_URLS = {
+    "deepseek": "https://api.deepseek.com",
+    "mimo": "https://api.xiaomimimo.com/v1",
+}
 
 
 class LoginBody(BaseModel):
@@ -44,16 +56,52 @@ class PasswordBody(BaseModel):
 class ProviderBody(BaseModel):
     name: str = Field(min_length=1, max_length=40)
     api_key: str = Field(min_length=8, max_length=300)
-    base_url: str = "https://api.deepseek.com"
-    model: str = "deepseek-v4-flash"
+    provider_type: Literal["deepseek", "mimo"] = "deepseek"
+    base_url: str = ""
+    model: str = ""
+    mimo_settings: Optional[dict[str, Any]] = None
+
+
+class MimoSettingsBody(BaseModel):
+    max_keyword: int = Field(default=3, ge=1, le=10)
+    limit: int = Field(default=5, ge=1, le=20)
+    force_search: bool = False
+    country: str = Field(default="", max_length=80)
+    region: str = Field(default="", max_length=80)
+    city: str = Field(default="", max_length=80)
+    thinking: Literal["enabled", "disabled"] = "enabled"
+    max_completion_tokens: int = Field(default=8192, ge=256, le=MIMO_MAX_COMPLETION_TOKENS)
+    temperature: float = Field(default=1.0, ge=0, le=1.5)
+    top_p: float = Field(default=0.95, ge=0.01, le=1)
 
 
 class ChatBody(BaseModel):
     conversation_id: Optional[str] = None
     content: str = Field(min_length=1, max_length=100_000)
     provider_id: int
-    model: str = "deepseek-v4-flash"
+    model: str = ""
     effort: str = "high"
+
+
+def normalize_mimo_settings(value: Any = None) -> dict[str, Any]:
+    data = dict(MIMO_DEFAULT_SETTINGS)
+    if isinstance(value, MimoSettingsBody):
+        data.update(value.model_dump())
+    elif isinstance(value, dict):
+        data.update(value)
+    return MimoSettingsBody(**data).model_dump()
+
+
+def provider_type(row: dict[str, Any]) -> str:
+    return row.get("provider_type") or "deepseek"
+
+
+def validate_provider_selection(kind: str, model: str) -> None:
+    if kind not in SUPPORTED_MODELS:
+        raise HTTPException(400, "不支持的服务商类型")
+    if model not in SUPPORTED_MODELS[kind]:
+        available = "、".join(sorted(SUPPORTED_MODELS[kind]))
+        raise HTTPException(400, f"{kind} 当前支持的模型为：{available}")
 
 
 def now() -> int:
@@ -86,6 +134,8 @@ def admin_user(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
 
 def public_provider(row: dict[str, Any]) -> dict[str, Any]:
     key = row.pop("api_key", "")
+    row["provider_type"] = row.get("provider_type") or "deepseek"
+    row["settings"] = db.decode(row.pop("settings_json", "{}"), {})
     row["api_key_masked"] = (key[:3] + "••••" + key[-4:]) if len(key) > 8 else "••••••••"
     return row
 
@@ -110,11 +160,23 @@ async def run_job(job_id: str) -> None:
     if not provider:
         db.update_job(job_id, status="failed", error="API 配置不存在")
         return
-    history = db.all(
-        "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 20",
+    kind = provider_type(provider)
+    history_rows = db.all(
+        "SELECT role, content, meta_json FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 20",
         (job["conversation_id"],),
     )
-    history.reverse()
+    history: list[dict[str, Any]] = []
+    for row in reversed(history_rows):
+        message: dict[str, Any] = {"role": row["role"], "content": row["content"]}
+        # MiMo requires reasoning_content when an assistant message also carries
+        # client-visible tool calls. DeepSeek uses a different protocol and must
+        # receive the compact role/content history only.
+        if kind == "mimo" and row["role"] == "assistant":
+            meta = db.decode(row.get("meta_json", "{}"), {})
+            if meta.get("tool_calls"):
+                message["reasoning_content"] = meta.get("reasoning", "")
+                message["tool_calls"] = meta["tool_calls"]
+        history.append(message)
     db.update_job(job_id, status="running", error="", stop_requested=0)
     last_write = 0.0
 
@@ -138,17 +200,32 @@ async def run_job(job_id: str) -> None:
         )
 
     try:
-        result = await stream_response(
-            base_url=provider["base_url"],
-            api_key=provider["api_key"],
-            model=job["model"],
-            messages=history,
-            effort=job["effort"],
-            timeout=settings.request_timeout,
-            stopped=stopped,
-            update=update,
-        )
-        meta = {"job_id": job_id, "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"]}
+        provider_settings = db.decode(provider.get("settings_json", "{}"), {})
+        if kind == "mimo":
+            result = await mimo_stream_response(
+                base_url=provider["base_url"],
+                api_key=provider["api_key"],
+                model=job["model"],
+                messages=history,
+                timeout=settings.request_timeout,
+                stopped=stopped,
+                update=update,
+                settings=provider_settings,
+            )
+        else:
+            result = await deepseek_stream_response(
+                base_url=provider["base_url"],
+                api_key=provider["api_key"],
+                model=job["model"],
+                messages=history,
+                effort=job["effort"],
+                timeout=settings.request_timeout,
+                stopped=stopped,
+                update=update,
+            )
+        meta = {"job_id": job_id, "provider_type": kind, "model": job["model"], "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"]}
+        if result.get("tool_calls"):
+            meta["tool_calls"] = result["tool_calls"]
         db.run(
             "INSERT INTO messages(conversation_id, role, content, meta_json, created_at) VALUES(?,?,?,?,?)",
             (job["conversation_id"], "assistant", result["answer"], json.dumps(meta, ensure_ascii=False), now()),
@@ -169,6 +246,8 @@ async def run_job(job_id: str) -> None:
             meta = {
                 "job_id": job_id,
                 "stopped": True,
+                "provider_type": provider_type(provider),
+                "model": job["model"],
                 "reasoning": partial.get("reasoning", ""),
                 "searches": db.decode(partial.get("searches_json", "[]"), []),
                 "sources": db.decode(partial.get("sources_json", "[]"), []),
@@ -290,20 +369,26 @@ def providers(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, An
 
 @app.post("/api/providers/test")
 async def test_provider(body: ProviderBody, _: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    base = clean_base_url(body.base_url)
+    kind = body.provider_type
+    base = clean_base_url(body.base_url or DEFAULT_BASE_URLS[kind])
     try:
-        models = await list_models(base, body.api_key)
+        models = await (mimo_list_models(base, body.api_key) if kind == "mimo" else deepseek_list_models(base, body.api_key))
     except Exception as exc:
         raise HTTPException(400, f"API 测试失败：{exc}") from exc
-    return {"ok": True, "models": models, "native_search_models": [m for m in models if m == "deepseek-v4-flash"]}
+    supported = sorted(SUPPORTED_MODELS[kind])
+    return {"ok": True, "provider_type": kind, "models": models, "supported_models": supported, "native_search_models": [m for m in models if m in SUPPORTED_MODELS[kind]]}
 
 
 @app.post("/api/providers")
 def add_provider(body: ProviderBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    base = clean_base_url(body.base_url)
+    kind = body.provider_type
+    base = clean_base_url(body.base_url or DEFAULT_BASE_URLS[kind])
+    model = body.model.strip() or ("mimo-v2.5-pro" if kind == "mimo" else "deepseek-v4-flash")
+    validate_provider_selection(kind, model)
+    settings_json = json.dumps(normalize_mimo_settings(body.mimo_settings if kind == "mimo" else None), ensure_ascii=False)
     provider_id = db.run(
-        "INSERT INTO providers(user_id,name,api_key,base_url,model,created_at) VALUES(?,?,?,?,?,?)",
-        (user["id"], body.name.strip(), body.api_key.strip(), base, body.model.strip(), now()),
+        "INSERT INTO providers(user_id,name,api_key,base_url,model,provider_type,settings_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        (user["id"], body.name.strip(), body.api_key.strip(), base, model, kind, settings_json, now()),
     )
     return public_provider(db.one("SELECT * FROM providers WHERE id=?", (provider_id,)))
 
@@ -316,6 +401,17 @@ def delete_provider(provider_id: int, user: dict[str, Any] = Depends(current_use
         raise HTTPException(409, "该 API 正在生成回答，暂时不能删除")
     db.run("DELETE FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"]))
     return {"ok": True}
+
+
+@app.put("/api/providers/{provider_id}/settings")
+def update_provider_settings(provider_id: int, body: MimoSettingsBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    provider = db.one("SELECT provider_type FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"]))
+    if not provider:
+        raise HTTPException(404, "API 配置不存在")
+    if provider_type(provider) != "mimo":
+        raise HTTPException(400, "只有 MiMo API 支持这组联网参数")
+    db.run("UPDATE providers SET settings_json=? WHERE id=? AND user_id=?", (json.dumps(body.model_dump(), ensure_ascii=False), provider_id, user["id"]))
+    return public_provider(db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"])))
 
 
 @app.get("/api/conversations")
@@ -352,8 +448,11 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
     provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (body.provider_id, user["id"]))
     if not provider:
         raise HTTPException(404, "请选择有效的 API 配置")
-    if body.model != "deepseek-v4-flash":
-        raise HTTPException(400, "DeepSeek 原生 Responses 联网搜索目前仅支持 deepseek-v4-flash")
+    kind = provider_type(provider)
+    model = body.model.strip() or provider["model"]
+    if model != provider["model"]:
+        raise HTTPException(400, "当前回答使用的模型与 API 配置不一致，请重新选择模型配置")
+    validate_provider_selection(kind, model)
     if body.effort not in {"high", "max"}:
         raise HTTPException(400, "无效的思考深度")
     conversation_id = body.conversation_id
@@ -372,8 +471,8 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
     db.run("UPDATE conversations SET updated_at=? WHERE id=?", (now(), conversation_id))
     job_id = uuid.uuid4().hex
     db.run(
-        "INSERT INTO jobs(id,user_id,conversation_id,provider_id,model,effort,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-        (job_id, user["id"], conversation_id, body.provider_id, body.model, body.effort, "queued", now(), now()),
+        "INSERT INTO jobs(id,user_id,conversation_id,provider_id,provider_type,model,effort,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (job_id, user["id"], conversation_id, body.provider_id, kind, model, body.effort, "queued", now(), now()),
     )
     launch(job_id)
     return {"job_id": job_id, "conversation_id": conversation_id}

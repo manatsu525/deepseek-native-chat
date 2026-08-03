@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#0b1220">
-  <title>DeepSeek Native Chat</title>
+  <title>Native Web Chat</title>
   <link rel="stylesheet" href="/assets/style.css">
   <style>
     .item-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
@@ -41,18 +41,20 @@
     .md-callout-warning{color:#8a5b05;border-color:#e6bf69;background:#fff9e9}.md-callout-warning .md-callout-title{background:#fff0c5}
     .md-callout-danger{color:#a13232;border-color:#e5a1a1;background:#fff1f1}.md-callout-danger .md-callout-title{background:#ffe0e0}
     .sources{align-items:center}.sources-label{font-size:11px;font-weight:750;color:var(--muted);margin-right:1px}.source-chip{color:#315ac8!important;text-decoration:none!important}.source-chip:hover{color:#24479f!important;border-color:#9aaedb}
-    .search-detail a{color:#315ac8;text-decoration:underline;text-decoration-color:#315ac866;text-underline-offset:2px;overflow-wrap:anywhere}
+    .source-chip{display:inline-flex;align-items:center;gap:5px}.source-chip img{width:14px;height:14px;border-radius:3px;object-fit:contain;background:#fff}.provider-kind{font-size:10px;font-weight:600;color:var(--muted);margin-left:4px}.location-fields{display:grid;gap:7px}.field-title{font-size:12px;font-weight:700;color:var(--muted);margin:0}.location-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.location-grid input{width:100%;border:1px solid var(--line);background:#fafbf9;border-radius:9px;padding:9px 10px;outline:none}.mimo-cost-note{font-size:11px;line-height:1.5;margin:0}.compact-select select:disabled{opacity:.65}
+    .search-detail a{color:#315ac8;text-decoration:underline;text-decoration-color:#315ac866;text-underline-offset:2px;overflow-wrap:anywhere}.search-error{margin-top:6px;color:#a13232;white-space:pre-wrap;overflow-wrap:anywhere}
     @media (prefers-color-scheme:dark){.message.user{background:#1d2a46}.message.assistant{background:#192130}.user .message-content{background:transparent}}
     @media (prefers-color-scheme:dark){.message-content a,.search-detail a{color:#83a9ff}.message-content a:hover,.search-detail a:hover{color:#b1c8ff}.message-content blockquote{color:#b4bfd1;background:#202b3d;border-left-color:#718ab9}.md-callout-note{color:#a9ceff;border-color:#4d87c5;background:#172b43}.md-callout-note .md-callout-title{background:#1d3b5e}.md-callout-tip{color:#a8e1b8;border-color:#4f9a68;background:#172d22}.md-callout-tip .md-callout-title{background:#1d4930}.md-callout-important{color:#d2bfff;border-color:#8363be;background:#281d3d}.md-callout-important .md-callout-title{background:#3a2a59}.md-callout-warning{color:#f4cf78;border-color:#ae7e26;background:#3b2e12}.md-callout-warning .md-callout-title{background:#574316}.md-callout-danger{color:#ffb0b0;border-color:#b96464;background:#3c2023}.md-callout-danger .md-callout-title{background:#572b30}}
-    @media (max-width:760px){.message{max-width:100%;padding:11px 12px;margin-bottom:14px}.message.user{max-width:92%;margin-left:auto}.message.assistant{margin-right:0}}
+    @media (prefers-color-scheme:dark){.location-grid input{background:#121925;color:var(--ink)}}
+    @media (max-width:760px){.message{max-width:100%;padding:11px 12px;margin-bottom:14px}.message.user{max-width:92%;margin-left:auto}.message.assistant{margin-right:0}.location-grid{grid-template-columns:1fr}.top-actions{flex-wrap:wrap;justify-content:flex-end}}
   </style>
 </head>
 <body>
   <section id="loginView" class="login-view">
     <div class="login-card">
-      <div class="brand-mark">DS</div>
+      <div class="brand-mark">AI</div>
       <p class="eyebrow">PRIVATE WORKSPACE</p>
-      <h1>DeepSeek Chat</h1>
+      <h1>Native Web Chat</h1>
       <p class="muted">原生联网搜索，不经过本地搜索代理。</p>
       <form id="loginForm" class="stack">
         <label>账号<input id="loginUser" autocomplete="username" required></label>
@@ -66,7 +68,7 @@
   <div id="appView" class="app hidden">
     <aside id="sidebar" class="sidebar">
       <div class="side-head">
-        <div><p class="eyebrow">DEEPSEEK</p><strong>Native Chat</strong></div>
+        <div><p class="eyebrow">NATIVE WEB</p><strong>AI Chat</strong></div>
         <button id="closeSidebar" class="icon-btn mobile-only" aria-label="关闭">×</button>
       </div>
       <button id="newChat" class="new-chat"><span>＋</span> 新对话</button>
@@ -86,18 +88,19 @@
         <button id="openSidebar" class="icon-btn mobile-only" aria-label="菜单">☰</button>
         <div class="title-block"><h2 id="conversationTitle">新对话</h2><span class="status-dot">原生搜索已就绪</span></div>
         <div class="top-actions">
-          <label class="compact-select" title="控制模型推理投入，不限制联网搜索次数"><span>推理</span><select id="effort"><option value="high">高 · High</option><option value="max">最大 · Max</option></select></label>
+          <label class="compact-select" title="控制 DeepSeek 模型推理投入"><span id="effortLabel">推理</span><select id="effort"><option value="high">高 · High</option><option value="max">最大 · Max</option></select></label>
           <button id="providerButton" class="soft-btn">API</button>
+          <button id="mimoSettingsButton" class="soft-btn hidden">MiMo 联网</button>
           <button id="usersButton" class="soft-btn hidden">账号</button>
         </div>
       </header>
 
       <section id="chatScroll" class="chat-scroll">
         <div id="welcome" class="welcome">
-          <div class="welcome-orbit"><span>DS</span></div>
-          <p class="eyebrow">DEEPSEEK V4 FLASH</p>
-          <h1>问点需要查证的问题</h1>
-          <p>模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。</p>
+          <div class="welcome-orbit"><span id="welcomeOrbitMark">AI</span></div>
+          <p id="welcomeEyebrow" class="eyebrow">DEEPSEEK V4 FLASH</p>
+          <h1 id="welcomeTitle">问点需要查证的问题</h1>
+          <p id="welcomeDescription">模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。</p>
           <div class="suggestions">
             <button data-prompt="搜索并梳理今天最重要的人工智能新闻，说明事件发生时间并附上来源。">今日 AI 动态</button>
             <button data-prompt="调查一个近期有争议的科技话题，分别列出各方证据和不确定之处。">多源调查</button>
@@ -112,31 +115,50 @@
         <form id="composer" class="composer">
           <textarea id="prompt" rows="1" maxlength="100000" placeholder="输入问题，Enter 发送，Shift + Enter 换行"></textarea>
           <div class="composer-foot">
-            <div class="model-line"><span class="native-pill">● Native Web</span><select id="providerSelect"><option value="">请先添加 API</option></select></div>
+            <div class="model-line"><span id="nativePill" class="native-pill">● Native Web</span><select id="providerSelect"><option value="">请先添加 API</option></select></div>
             <div class="send-actions">
               <button id="stopButton" class="stop hidden" type="button">■ 停止</button>
               <button id="sendButton" class="send" type="submit" aria-label="发送">↑</button>
             </div>
           </div>
         </form>
-        <p class="footnote">搜索由 DeepSeek Responses API 执行；重要信息仍建议核对原始来源。</p>
+        <p class="footnote">联网由所选服务商的原生工具执行；重要信息仍建议核对原始来源。</p>
       </footer>
     </main>
   </div>
 
   <dialog id="providerModal" class="modal">
-    <div class="modal-head"><div><p class="eyebrow">CONNECTIONS</p><h3>DeepSeek API</h3></div><button class="icon-btn close-modal">×</button></div>
+    <div class="modal-head"><div><p class="eyebrow">CONNECTIONS</p><h3>模型 API</h3></div><button class="icon-btn close-modal">×</button></div>
     <div id="providerList" class="item-list"></div>
     <form id="providerForm" class="form-grid">
       <label>配置名称<input id="providerName" placeholder="例如：我的 DeepSeek" required></label>
-      <label>API Key<input id="providerKey" type="password" autocomplete="off" placeholder="sk-…" required></label>
-      <label class="wide">API 地址<input id="providerBase" value="https://api.deepseek.com" required></label>
+      <label>API Key<input id="providerKey" type="password" autocomplete="off" placeholder="输入对应服务商 API Key" required></label>
+      <label>服务商<select id="providerType"><option value="deepseek">DeepSeek · Responses</option><option value="mimo">小米 MiMo · Chat</option></select></label>
+      <label>API 地址<input id="providerBase" value="https://api.deepseek.com" required></label>
       <label>模型
         <select id="providerModel"><option value="deepseek-v4-flash">deepseek-v4-flash</option></select>
       </label>
       <label>手动模型名<input id="manualModel" placeholder="可选"></label>
       <div class="wide form-actions"><button id="testProvider" class="soft-btn" type="button">测试并读取模型</button><button class="primary" type="submit">保存 API</button></div>
       <p id="providerStatus" class="wide muted"></p>
+    </form>
+  </dialog>
+
+  <dialog id="mimoModal" class="modal small-modal">
+    <div class="modal-head"><div><p class="eyebrow">MIMO WEB SEARCH</p><h3>联网参数</h3></div><button class="icon-btn close-modal">×</button></div>
+    <form id="mimoForm" class="form-grid">
+      <label>最大关键词数<input id="mimoMaxKeyword" type="number" min="1" max="10" step="1" value="3"></label>
+      <label>每轮结果数<input id="mimoLimit" type="number" min="1" max="20" step="1" value="5"></label>
+      <label class="check wide"><input id="mimoForceSearch" type="checkbox"> 强制每次联网搜索</label>
+      <label>思考<select id="mimoThinking"><option value="enabled">开启</option><option value="disabled">关闭</option></select></label>
+      <label>最大生成 Token<input id="mimoMaxCompletion" type="number" min="256" max="131072" step="256" value="8192"></label>
+      <label>temperature<input id="mimoTemperature" type="number" min="0" max="1.5" step="0.05" value="1"></label>
+      <label>top_p<input id="mimoTopP" type="number" min="0.01" max="1" step="0.01" value="0.95"></label>
+      <div class="wide location-fields"><p class="field-title">用户位置（可选，帮助本地化搜索）</p><div class="location-grid"><input id="mimoCountry" placeholder="国家，例如 China"><input id="mimoRegion" placeholder="地区，例如 Hubei"><input id="mimoCity" placeholder="城市，例如 Wuhan"></div></div>
+      <p id="mimoSamplingNote" class="wide muted">深度思考开启时，MiMo 会强制使用 temperature=1.0、top_p=0.95。</p>
+      <p class="wide muted mimo-cost-note">注意：一次搜索可能按“最大关键词数”并发消耗多次联网插件额度；不开启强制搜索时由模型自行判断。</p>
+      <p id="mimoStatus" class="wide error"></p>
+      <div class="wide form-actions"><button class="primary" type="submit">保存 MiMo 参数</button></div>
     </form>
   </dialog>
 
