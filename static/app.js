@@ -2,6 +2,20 @@ const $ = (s, root=document) => root.querySelector(s);
 const $$ = (s, root=document) => [...root.querySelectorAll(s)];
 const state = {me:null, providers:[], conversation:null, messages:[], job:null, page:1, pages:1, poll:null, latestConversationId:null};
 const detailState = new Map();
+const nestedScrollState = new Map();
+
+function rememberNestedScroll(root=document) {
+  $$('[data-scroll-key]', root).forEach(node => nestedScrollState.set(node.dataset.scrollKey, {top:node.scrollTop, left:node.scrollLeft}));
+}
+
+function restoreNestedScroll(root=document) {
+  $$('[data-scroll-key]', root).forEach(node => {
+    const position = nestedScrollState.get(node.dataset.scrollKey);
+    if (!position) return;
+    node.scrollTop = position.top;
+    node.scrollLeft = position.left;
+  });
+}
 
 function storageKey(name) { return `deepseek-native-chat.${name}.${state.me ? state.me.id : 'guest'}`; }
 function storedValue(name) {
@@ -214,7 +228,7 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
   const searchCount=searches.filter(item=>item.action!=='open_page').length;
   const readCount=searches.filter(item=>item.action==='open_page'&&item.status==='completed').length;
   const activity=`${searchCount ? ` · ${searchCount} 次搜索` : ''}${readCount ? ` · ${readCount} 次读取` : ''}`;
-  return `<details class="trace" data-detail-key="${escapeHtml(detailKey)}"${traceOpen}><summary>思考与联网 · ${status}${activity}</summary><div class="trace-body">${reasoning ? `<div class="reasoning-text">${escapeHtml(reasoning)}</div>` : active ? '<div class="typing"><i></i><i></i><i></i></div>' : ''}${searchHtml}${sourceHtml}${usageHtml(meta.usage || {})}</div></details>`;
+  return `<details class="trace" data-detail-key="${escapeHtml(detailKey)}"${traceOpen}><summary>思考与联网 · ${status}${activity}</summary><div class="trace-body">${reasoning ? `<div class="reasoning-text" data-scroll-key="${escapeHtml(detailKey)}-reasoning">${escapeHtml(reasoning)}</div>` : active ? '<div class="typing"><i></i><i></i><i></i></div>' : ''}${searchHtml}${sourceHtml}${usageHtml(meta.usage || {})}</div></details>`;
 }
 
 function messageHtml(message, index, live=false) {
@@ -234,12 +248,14 @@ function messageHtml(message, index, live=false) {
 function renderMessages() {
   const scroll = $('#chatScroll'); const oldTop = scroll.scrollTop;
   $$('details[data-detail-key]').forEach(detail => detailState.set(detail.dataset.detailKey, detail.open));
+  rememberNestedScroll($('#messages'));
   const items = [...state.messages];
   if (state.job && ['queued','running','failed','stopped'].includes(state.job.status)) {
     items.push({role:'assistant', content:state.job.answer || '', meta:{job_id:state.job.id,provider_id:state.job.provider_id,provider_type:state.job.provider_type,model:state.job.model,reasoning:state.job.reasoning,searches:state.job.searches,sources:state.job.sources,usage:state.job.usage,error:state.job.error,stopped:state.job.status==='stopped'}, live:['queued','running'].includes(state.job.status)});
   }
   $('#welcome').classList.toggle('hidden', items.length > 0);
   $('#messages').innerHTML = items.map((m,i)=>messageHtml(m,i,!!m.live)).join('');
+  restoreNestedScroll($('#messages'));
   scroll.scrollTop = oldTop;
   $$('details[data-detail-key]').forEach(detail => detail.addEventListener('toggle', () => detailState.set(detail.dataset.detailKey, detail.open)));
   wireMessageActions(items);
@@ -267,9 +283,15 @@ function replaceJobMessage(job, liveState) {
     if (liveState) renderMessages();
     return liveState ? null : live;
   }
+  const chatScroll = $('#chatScroll');
+  const oldTop = chatScroll.scrollTop;
   $$('details[data-detail-key]').forEach(detail => detailState.set(detail.dataset.detailKey, detail.open));
+  rememberNestedScroll(current);
   const fragment = document.createRange().createContextualFragment(messageHtml(live, state.messages.length, liveState));
-  current.replaceWith(fragment.firstElementChild);
+  const replacement = fragment.firstElementChild;
+  current.replaceWith(replacement);
+  restoreNestedScroll(replacement);
+  chatScroll.scrollTop = oldTop;
   $$('details[data-detail-key]').forEach(detail => detail.addEventListener('toggle', () => detailState.set(detail.dataset.detailKey, detail.open)));
   wireMessageActions([...state.messages, live]);
   return live;
