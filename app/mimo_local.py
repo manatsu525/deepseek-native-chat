@@ -4,8 +4,10 @@ import asyncio
 import json
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from curl_cffi import requests as curl_requests
@@ -81,6 +83,24 @@ def _looks_like_text_tool_call(value: str) -> bool:
     return "fetch_webpage" in head or "web_search" in head
 
 
+def _dated_system_prompt(base_prompt: str, user_timezone: str) -> str:
+    try:
+        timezone = ZoneInfo(user_timezone)
+        timezone_name = user_timezone
+    except (ZoneInfoNotFoundError, ValueError):
+        timezone = ZoneInfo("UTC")
+        timezone_name = "UTC"
+    local_date = datetime.now(timezone).date().isoformat()
+    return (
+        f"{base_prompt}\n\n"
+        "Runtime date context (authoritative): "
+        f"The user's current local date is {local_date}, in IANA timezone {timezone_name}. "
+        "Resolve words such as today, yesterday, tomorrow, currently, latest, and recently against this date. "
+        "For time-sensitive web searches, include the relevant absolute date in the objective or queries and compare source publication/event dates before answering. "
+        "Never assume that the newest result returned by a search is from today. If evidence for the requested date is unavailable, say so explicitly instead of presenting older information as current."
+    )
+
+
 async def stream_response(
     *,
     base_url: str,
@@ -92,6 +112,7 @@ async def stream_response(
     update: Callable[[dict[str, Any]], Awaitable[None]],
     settings: dict[str, Any] | None = None,
     conversation_id: str = "",
+    user_timezone: str = "UTC",
 ) -> dict[str, Any]:
     """Run a custom OpenAI-compatible model with local web tools.
 
@@ -102,7 +123,8 @@ async def stream_response(
     config = _settings(settings)
     parallel_mode = config.get("web_tool_backend") == "parallel"
     headers = custom_auth_headers(api_key, stream=True)
-    system_prompt = PARALLEL_CUSTOM_SYSTEM_PROMPT if parallel_mode else LEGACY_CUSTOM_SYSTEM_PROMPT
+    base_prompt = PARALLEL_CUSTOM_SYSTEM_PROMPT if parallel_mode else LEGACY_CUSTOM_SYSTEM_PROMPT
+    system_prompt = _dated_system_prompt(base_prompt, user_timezone)
     conversation: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}, *[dict(message) for message in messages]]
     answer = ""
     reasoning = ""

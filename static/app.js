@@ -27,6 +27,7 @@ function storeValue(name, value) {
     else localStorage.setItem(storageKey(name), String(value));
   } catch {}
 }
+function browserTimezone(){try{return Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC'}catch{return 'UTC'}}
 
 async function api(path, options={}) {
   const headers = {...(options.headers || {})};
@@ -379,7 +380,7 @@ async function submitPrompt(value) {
   state.messages.push({role:'user',content,meta:{}});state.job={status:'queued',provider_type:provider.provider_type,provider_id:provider.id,model,answer:'',reasoning:'',searches:[],sources:[],usage:{}};renderMessages();
   $('#chatScroll').scrollTop=$('#chatScroll').scrollHeight;setRunning(true);
   try{
-    const data=await api('/api/chat',{method:'POST',body:{conversation_id:(state.conversation&&state.conversation.id)||null,content,provider_id:provider.id,model,effort:$('#effort').value}});
+    const data=await api('/api/chat',{method:'POST',body:{conversation_id:(state.conversation&&state.conversation.id)||null,content,provider_id:provider.id,model,effort:$('#effort').value,timezone:browserTimezone()}});
     if(!state.conversation)state.conversation={id:data.conversation_id,title:content.slice(0,36)};
     storeValue('active-conversation', state.conversation.id);
     state.job.id=data.job_id;$('#conversationTitle').textContent=state.conversation.title;loadHistory(1);startPolling(data.job_id);

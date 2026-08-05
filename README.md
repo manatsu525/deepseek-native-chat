@@ -20,6 +20,7 @@
 - Custom 按需网页读取：默认调用免费的 Parallel Search MCP 搜索/提取，也可切换到 Jina Reader 备用方案，均无需额外 API Key
 - SQLite 单文件数据库、自签 HTTPS、systemd 守护
 - 手机和桌面端响应式界面
+- 浏览器自动上报 IANA 时区；Custom/MiMo 每次回答都会获得对应的当前本地日期，并要求按绝对日期核对“今天/最新”等时效性问题
 
 ## 资源占用
 
@@ -70,6 +71,8 @@ sudo ./uninstall.sh --yes
 DeepSeek 使用官方 `/responses` 路由，当前原生 `web_search` 适配 `deepseek-v4-flash`。Custom 使用标准 `/chat/completions`，不依赖模型供应商的原生搜索；后端把联网能力适配成模型可见的 `web_search` 与 `fetch_webpage` Function Tools。默认方案匿名连接 Parallel 官方 Streamable HTTP MCP 端点 `https://search.parallel.ai/mcp`，调用其 `web_search` / `web_fetch`，无需 Parallel API Key；备用方案直接请求 DuckDuckGo Lite/HTML，再使用 Jina Reader。查询词和待读取 URL 会发送给当前选择的搜索/读取服务。两种模型协议由后端分别解析，不能共用 DeepSeek 的 Responses SSE 事件处理器。
 
 Custom 每个工具轮最多执行 1 个工具，最多 6 个工具轮；每个回答最多搜索 3 次、最多读取 3 个网页，每次搜索最多向模型返回 10 条结果。模型可以在资料足够时直接停止工具调用。搜索查询按标准化文本去重，不会重复请求同一组查询。`fetch_webpage` 只能读取用户提供或当前搜索方案返回的 URL，搜索引擎结果页、编造 URL、本机和内网地址都会被拒绝；同一个 URL 也不会重复注入正文。Parallel 搜索每条摘录最多保留约 1,200 字符，读取默认使用相关摘录而非完整页面，每页最多约 8,000 字符，以限制上下文增长。
+
+前端发起问题时会同时提交浏览器的 IANA 时区（如 `Asia/Shanghai`）。后端只把“当前本地日期 + 时区”追加到 Custom 的固定系统提示词末尾，并要求模型把“今天、昨天、明天、目前、最新”等相对时间转换为绝对日期，核对来源的发布/事件日期，禁止把搜索返回的最新一篇误当作当天资料。日期每天只变化一次，且放在静态提示之后，以尽量保留固定前缀的缓存价值；旧客户端未提交时区时使用 UTC。
 
 MiMo 模型使用小米接口的 `thinking` 与 `max_completion_tokens` 字段；普通 Custom 模型使用标准 `max_tokens`、`temperature` 和 `top_p`，不会收到 MiMo 专用字段。工具额度结束后，后端会强制进入最终作答阶段；模型若把工具请求伪装成 `<tool_call>` 文本，该输出不会被保存为答案，而会进行一次受限纠正。
 

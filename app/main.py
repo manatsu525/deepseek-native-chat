@@ -8,6 +8,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 import uvicorn
@@ -81,6 +82,7 @@ class ChatBody(BaseModel):
     provider_id: int
     model: str = ""
     effort: str = "high"
+    timezone: str = Field(default="UTC", min_length=1, max_length=64)
 
 
 def normalize_custom_settings(value: Any = None) -> dict[str, Any]:
@@ -150,6 +152,15 @@ def clean_base_url(value: str) -> str:
     if not value.startswith(("https://", "http://")):
         raise HTTPException(400, "API 地址必须使用 http:// 或 https://")
     return value
+
+
+def clean_timezone(value: str) -> str:
+    name = str(value or "UTC").strip()
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise HTTPException(400, "无效的浏览器时区") from exc
+    return name
 
 
 def current_user(session: Optional[str] = Cookie(default=None)) -> dict[str, Any]:
@@ -256,6 +267,7 @@ async def run_job(job_id: str) -> None:
                 update=update,
                 settings=provider_settings,
                 conversation_id=job["conversation_id"],
+                user_timezone=job.get("timezone") or "UTC",
             )
         else:
             result = await deepseek_stream_response(
@@ -580,6 +592,7 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
     validate_provider_selection(kind, model, provider)
     if body.effort not in {"high", "max"}:
         raise HTTPException(400, "无效的思考深度")
+    timezone_name = clean_timezone(body.timezone)
     conversation_id = body.conversation_id
     if conversation_id:
         if not db.one("SELECT id FROM conversations WHERE id=? AND user_id=?", (conversation_id, user["id"])):
@@ -596,8 +609,8 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
     db.run("UPDATE conversations SET updated_at=? WHERE id=?", (now(), conversation_id))
     job_id = uuid.uuid4().hex
     db.run(
-        "INSERT INTO jobs(id,user_id,conversation_id,provider_id,provider_type,model,effort,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        (job_id, user["id"], conversation_id, body.provider_id, kind, model, body.effort, "queued", now(), now()),
+        "INSERT INTO jobs(id,user_id,conversation_id,provider_id,provider_type,model,effort,timezone,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (job_id, user["id"], conversation_id, body.provider_id, kind, model, body.effort, timezone_name, "queued", now(), now()),
     )
     launch(job_id)
     return {"job_id": job_id, "conversation_id": conversation_id}
