@@ -101,6 +101,12 @@ def _dated_system_prompt(base_prompt: str, user_timezone: str) -> str:
     )
 
 
+def _is_nvidia_deepseek_v4(base_url: str, model: str) -> bool:
+    host = (urlsplit(base_url).hostname or "").casefold()
+    model_name = str(model or "").casefold().rsplit("/", 1)[-1]
+    return host == "integrate.api.nvidia.com" and model_name in {"deepseek-v4-flash", "deepseek-v4-pro"}
+
+
 async def stream_response(
     *,
     base_url: str,
@@ -113,6 +119,7 @@ async def stream_response(
     settings: dict[str, Any] | None = None,
     conversation_id: str = "",
     user_timezone: str = "UTC",
+    effort: str = "high",
 ) -> dict[str, Any]:
     """Run a custom OpenAI-compatible model with local web tools.
 
@@ -200,6 +207,11 @@ async def stream_response(
             }
             if mimo_model:
                 payload["thinking"] = {"type": config["thinking"]}
+            elif _is_nvidia_deepseek_v4(base_url, model):
+                nvidia_thinking = config["thinking"] == "enabled"
+                payload["chat_template_kwargs"] = {"thinking": nvidia_thinking}
+                if nvidia_thinking:
+                    payload["chat_template_kwargs"]["reasoning_effort"] = effort if effort in {"high", "max"} else "high"
             if round_tools:
                 payload["tools"] = round_tools
                 payload["tool_choice"] = "auto"
@@ -238,11 +250,13 @@ async def stream_response(
                         delta = choice.get("delta") or {}
                         message = choice.get("message") or {}
                         round_answer += str(delta.get("content") or "")
-                        round_reasoning += str(delta.get("reasoning_content") or "")
+                        delta_reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                        round_reasoning += str(delta_reasoning or "")
                         if message.get("content") and not delta.get("content"):
                             round_answer += str(message.get("content") or "")
-                        if message.get("reasoning_content") and not delta.get("reasoning_content"):
-                            round_reasoning += str(message.get("reasoning_content") or "")
+                        message_reasoning = message.get("reasoning_content") or message.get("reasoning")
+                        if message_reasoning and not delta_reasoning:
+                            round_reasoning += str(message_reasoning)
                         for index, call in enumerate(delta.get("tool_calls") or []):
                             _merge_tool_call(round_tools_by_index, call, index)
                         for index, call in enumerate(message.get("tool_calls") or []):

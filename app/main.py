@@ -268,6 +268,7 @@ async def run_job(job_id: str) -> None:
                 settings=provider_settings,
                 conversation_id=job["conversation_id"],
                 user_timezone=job.get("timezone") or "UTC",
+                effort=job["effort"],
             )
         else:
             result = await deepseek_stream_response(

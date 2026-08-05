@@ -123,7 +123,7 @@ function renderCodeBlock(language, code) {
   const extension = CODE_EXTENSIONS[safeLanguage] || safeLanguage || 'txt';
   const label = escapeHtml(rawLanguage || 'code');
   const languageClass = safeLanguage ? ` class="language-${escapeHtml(safeLanguage)}"` : '';
-  return `<div class="code-wrap code-block" data-language="${escapeHtml(safeLanguage)}" data-extension="${escapeHtml(extension)}"><div class="code-label"><span>${label}</span><button class="code-download" type="button" title="下载代码" aria-label="下载代码"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0 5-5m-5 5-5-5M5 21h14"></path></svg></button></div><pre><code${languageClass}>${escapeHtml(String(code).replace(/\n$/, ''))}</code></pre></div>`;
+  return `<div class="code-wrap code-block" data-language="${escapeHtml(safeLanguage)}" data-extension="${escapeHtml(extension)}"><div class="code-label"><span>${label}</span><span class="code-actions"><button class="code-tool code-copy" type="button" title="复制代码" aria-label="复制代码"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3"></path></svg></button><button class="code-tool code-download" type="button" title="下载代码" aria-label="下载代码"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 18v2h14v-2"></path></svg></button></span></div><pre><code${languageClass}>${escapeHtml(String(code).replace(/\n$/, ''))}</code></pre></div>`;
 }
 
 function renderCallout(lines) {
@@ -333,11 +333,15 @@ function wireMessageActions(items) {
     $$('.code-download', node).forEach(button => button.onclick = () => {
       const wrap = button.closest('.code-wrap');
       const codeNode = $('pre code', wrap);
-      const langNode = $('span', button.parentElement);
       const code = codeNode ? codeNode.textContent : '';
-      const lang = wrap && wrap.dataset.extension ? wrap.dataset.extension : (langNode ? langNode.textContent : 'txt');
+      const lang = wrap && wrap.dataset.extension ? wrap.dataset.extension : 'txt';
       const blob = new Blob([code], {type:'text/plain;charset=utf-8'}), a=document.createElement('a');
       a.href=URL.createObjectURL(blob); a.download=`code.${lang === 'code' ? 'txt' : lang}`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 0);
+    });
+    $$('.code-copy', node).forEach(button => button.onclick = async () => {
+      const codeNode = $('pre code', button.closest('.code-wrap'));
+      await navigator.clipboard.writeText(codeNode ? codeNode.textContent : '');
+      toast('代码已复制');
     });
   });
 }
@@ -409,6 +413,7 @@ function startPolling(id){stopPolling();setRunning(true);const tick=async()=>{tr
 
 function normalizeProviderType(value){return value==='mimo'?'custom':(value||'deepseek')}
 function isMimoModel(value){return String(value||'').toLowerCase().startsWith('mimo-')}
+function isNvidiaDeepSeekV4(provider=selectedProvider(),model=selectedModel()){try{const host=new URL(provider&&provider.base_url||'').hostname.toLowerCase();const name=String(model||'').toLowerCase().split('/').pop();return host==='integrate.api.nvidia.com'&&['deepseek-v4-flash','deepseek-v4-pro'].includes(name)}catch{return false}}
 function providerLabel(provider){return normalizeProviderType(provider.provider_type)==='custom'?'Custom':'DeepSeek'}
 function providerModels(provider){const models=Array.isArray(provider&&provider.models)&&provider.models.length?provider.models:[provider&&provider.model];return [...new Set(models.filter(Boolean).map(String))]}
 function selectedOption(){return $('#providerSelect').selectedOptions[0]||null}
@@ -447,10 +452,10 @@ function restoreProviderForConversation(data) {
   if(target) selectProvider(target.id,true,target.model);
 }
 function updateProviderUi(){
-  const provider=selectedProvider(), custom=provider&&normalizeProviderType(provider.provider_type)==='custom';
+  const provider=selectedProvider(), custom=provider&&normalizeProviderType(provider.provider_type)==='custom', nvidiaDeepSeek=custom&&isNvidiaDeepSeekV4(provider,selectedModel());
   $('#customSettingsButton').classList.toggle('hidden',!custom);
-  $('#effort').disabled=!!custom;
-  $('#effort').title=custom?'Custom 使用接口自身参数；本地联网工具由后端控制':'控制 DeepSeek 模型推理投入';
+  $('#effort').disabled=!!custom&&!nvidiaDeepSeek;
+  $('#effort').title=nvidiaDeepSeek?'控制 NVIDIA DeepSeek V4 的 reasoning_effort':custom?'Custom 使用接口自身参数；本地联网工具由后端控制':'控制 DeepSeek 模型推理投入';
   $('#nativePill').textContent=custom?'● DDG + Jina':'● Native Web';
   $('#welcomeOrbitMark').textContent=custom?'CU':'DS';
   $('#welcomeEyebrow').textContent=custom?'CUSTOM · OPENAI CHAT': 'DEEPSEEK V4 FLASH';
@@ -515,7 +520,7 @@ function fillCustomSettings(){
   $('#customThinking').value=config.thinking;$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
   syncCustomThinkingFields();syncCustomToolFields();
 }
-function syncCustomThinkingFields(){const mimo=isMimoModel(selectedModel());const thinking=$('#customThinking').value==='enabled';const disabled=mimo&&thinking;$('#customThinking').disabled=!mimo;$('#customTemperature').disabled=disabled;$('#customTopP').disabled=disabled;$('#customSamplingNote').textContent=mimo?(thinking?'当前是 MiMo：开启思考时按小米协议固定采样参数。':'当前是 MiMo：关闭思考后可自定义 temperature/top_p。'):'当前是普通 Custom 模型：不发送 MiMo 专用 thinking 参数，temperature/top_p 始终可配置。'}
+function syncCustomThinkingFields(){const mimo=isMimoModel(selectedModel()),nvidiaDeepSeek=isNvidiaDeepSeekV4();const supported=mimo||nvidiaDeepSeek,thinking=$('#customThinking').value==='enabled';const disabled=mimo&&thinking;$('#customThinking').disabled=!supported;$('#customTemperature').disabled=disabled;$('#customTopP').disabled=disabled;$('#customSamplingNote').textContent=mimo?(thinking?'当前是 MiMo：开启思考时按小米协议固定采样参数。':'当前是 MiMo：关闭思考后可自定义 temperature/top_p。'):nvidiaDeepSeek?(thinking?'当前是 NVIDIA DeepSeek V4：已启用思考，High/Max 由顶部推理选择器控制。':'当前是 NVIDIA DeepSeek V4：已关闭思考。'):'当前是普通 Custom 模型：不发送模型专用 thinking 参数，temperature/top_p 始终可配置。'}
 function syncCustomToolFields(){const parallel=$('#customWebToolBackend').value==='parallel';$('#customToolNote').textContent=parallel?'默认方案：后端匿名调用 Parallel Search MCP 的 web_search / web_fetch，不需要 Parallel API Key；查询词和待读取 URL 会发送给 Parallel，搜索结果自带相关摘录，只有证据不足时才读取网页。':'备用方案：使用本机 DuckDuckGo Lite/HTML 搜索和 Jina Reader 读取网页；适合 Parallel 暂时不可用时手动切换。'}
 function openCustomSettings(){if(!selectedProvider()||normalizeProviderType(selectedProvider().provider_type)!=='custom'){toast('请先选择 Custom API');return}fillCustomSettings();$('#customModal').showModal()}
 async function saveCustomSettings(event){
