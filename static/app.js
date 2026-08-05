@@ -492,17 +492,18 @@ async function testProvider(){
 function checkedCustomModels(){return $$('#customModelList input[type="checkbox"]:checked').map(input=>input.value)}
 function providerFormData(){const custom=providerType()==='custom';const manual=custom?manualModelList():[];const selected=custom?[...new Set([...checkedCustomModels(),...manual])]:['deepseek-v4-flash'];return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:selected[0]||$('#providerModel').value||'deepseek-v4-flash',selected_models:selected,manual_models:manual}}
 
-function customSettings(provider){return {...{thinking:'enabled',max_completion_tokens:8192,temperature:1,top_p:.95},...(provider&&provider.settings||{})}}
+function customSettings(provider){return {...{thinking:'enabled',max_completion_tokens:65536,temperature:1,top_p:.95,web_tool_backend:'parallel'},...(provider&&provider.settings||{})}}
 function fillCustomSettings(){
   const config=customSettings(selectedProvider());
-  $('#customThinking').value=config.thinking;$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;
-  syncCustomThinkingFields();
+  $('#customThinking').value=config.thinking;$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
+  syncCustomThinkingFields();syncCustomToolFields();
 }
 function syncCustomThinkingFields(){const mimo=isMimoModel(selectedModel());const thinking=$('#customThinking').value==='enabled';const disabled=mimo&&thinking;$('#customThinking').disabled=!mimo;$('#customTemperature').disabled=disabled;$('#customTopP').disabled=disabled;$('#customSamplingNote').textContent=mimo?(thinking?'当前是 MiMo：开启思考时按小米协议固定采样参数。':'当前是 MiMo：关闭思考后可自定义 temperature/top_p。'):'当前是普通 Custom 模型：不发送 MiMo 专用 thinking 参数，temperature/top_p 始终可配置。'}
+function syncCustomToolFields(){const parallel=$('#customWebToolBackend').value==='parallel';$('#customToolNote').textContent=parallel?'默认方案：后端匿名调用 Parallel Search MCP 的 web_search / web_fetch，不需要 Parallel API Key；查询词和待读取 URL 会发送给 Parallel，搜索结果自带相关摘录，只有证据不足时才读取网页。':'备用方案：使用本机 DuckDuckGo Lite/HTML 搜索和 Jina Reader 读取网页；适合 Parallel 暂时不可用时手动切换。'}
 function openCustomSettings(){if(!selectedProvider()||normalizeProviderType(selectedProvider().provider_type)!=='custom'){toast('请先选择 Custom API');return}fillCustomSettings();$('#customModal').showModal()}
 async function saveCustomSettings(event){
   event.preventDefault(); const provider=selectedProvider(); if(!provider)return;
-  const body={thinking:$('#customThinking').value,max_completion_tokens:Number($('#customMaxCompletion').value),temperature:Number($('#customTemperature').value),top_p:Number($('#customTopP').value)};
+  const body={thinking:$('#customThinking').value,max_completion_tokens:Number($('#customMaxCompletion').value),temperature:Number($('#customTemperature').value),top_p:Number($('#customTopP').value),web_tool_backend:$('#customWebToolBackend').value};
   try{const updated=await api(`/api/providers/${provider.id}/settings`,{method:'PUT',body});const index=state.providers.findIndex(x=>x.id===provider.id);if(index>=0)state.providers[index]=updated;$('#customModal').close();updateProviderUi();toast('Custom 参数已保存')}catch(err){$('#customStatus').textContent=err.message}
 }
 
@@ -520,7 +521,7 @@ $('#newChat').onclick=()=>{newConversation();closeSidebar()};$('#composer').onsu
 $('#prompt').oninput=resizePrompt;
 $('#stopButton').onclick=async()=>{if(state.job&&state.job.id){await api(`/api/jobs/${state.job.id}/stop`,{method:'POST'});toast('正在停止')}};
 $('#providerButton').onclick=()=>{$('#providerModal').showModal();renderProviderList()};$('#usersButton').onclick=()=>{loadUsers();$('#usersModal').showModal()};
-$('#customSettingsButton').onclick=openCustomSettings;$('#providerSelect').onchange=()=>{const provider=selectedProvider();if(provider){storeValue('active-provider',provider.id);storeValue('active-model',selectedModel())}updateProviderUi()};$('#providerType').onchange=syncProviderForm;$('#customThinking').onchange=syncCustomThinkingFields;$('#customModelFilter').oninput=e=>{const value=e.target.value.trim().toLowerCase();$$('.custom-model-option',$('#customModelList')).forEach(item=>item.dataset.hidden=value&&!item.dataset.model.includes(value)?'1':'0')};
+$('#customSettingsButton').onclick=openCustomSettings;$('#providerSelect').onchange=()=>{const provider=selectedProvider();if(provider){storeValue('active-provider',provider.id);storeValue('active-model',selectedModel())}updateProviderUi()};$('#providerType').onchange=syncProviderForm;$('#customThinking').onchange=syncCustomThinkingFields;$('#customWebToolBackend').onchange=syncCustomToolFields;$('#customModelFilter').oninput=e=>{const value=e.target.value.trim().toLowerCase();$$('.custom-model-option',$('#customModelList')).forEach(item=>item.dataset.hidden=value&&!item.dataset.model.includes(value)?'1':'0')};
 $$('.close-modal').forEach(b=>b.onclick=()=>b.closest('dialog').close());$$('dialog').forEach(d=>d.onclick=e=>{if(e.target===d)d.close()});
 $('#testProvider').onclick=testProvider;$('#providerForm').onsubmit=async e=>{e.preventDefault();try{const body=providerFormData();await api('/api/providers',{method:'POST',body});e.target.reset();$('#providerType').value='deepseek';syncProviderForm();$('#providerKey').value='';$('#manualModel').value='';renderCustomModels([],[]);$('#providerStatus').textContent='';await loadProviders();toast('API 已保存')}catch(err){$('#providerStatus').textContent=err.message}};
 $('#customForm').onsubmit=saveCustomSettings;

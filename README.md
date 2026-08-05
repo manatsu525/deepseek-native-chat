@@ -1,6 +1,6 @@
 # DeepSeek Native Chat
 
-一个面向低配置 VPS 的私人 DeepSeek / Custom 聊天站。DeepSeek 使用服务端原生联网；Custom 使用标准 OpenAI Chat Completions，并可调用本地 DuckDuckGo 搜索和 Jina Reader，不安装 SearXNG 或浏览器。
+一个面向低配置 VPS 的私人 DeepSeek / Custom 聊天站。DeepSeek 使用服务端原生联网；Custom 使用标准 OpenAI Chat Completions，默认由本机后端适配免费的 Parallel Search MCP，也可切换到备用的 DuckDuckGo + Jina Reader，不安装 SearXNG 或浏览器。
 
 ## 功能
 
@@ -16,8 +16,8 @@
 - 最多 3 个账号，管理员可在前端新增或删除账号
 - 各账号的对话和 API 配置相互隔离
 - 前端测试 API、读取 `/models` 全部模型并勾选、手动填写模型名、删除 API
-- Custom 参数：MiMo 专用 thinking 开关、普通 Custom 采样参数和生成上限；搜索预算由后端固定保护
-- Custom 按需网页读取：模型可自动调用免费 Jina Reader 读取公开网页、文档页或 PDF，无需额外 API Key
+- Custom 参数：MiMo 专用 thinking 开关、普通 Custom 采样参数、默认 65,536 的生成上限，以及 Parallel / 备用联网方案切换；搜索预算由后端固定保护
+- Custom 按需网页读取：默认调用免费的 Parallel Search MCP 搜索/提取，也可切换到 Jina Reader 备用方案，均无需额外 API Key
 - SQLite 单文件数据库、自签 HTTPS、systemd 守护
 - 手机和桌面端响应式界面
 
@@ -67,13 +67,13 @@ sudo ./uninstall.sh --yes
 
 ## 设计说明
 
-DeepSeek 使用官方 `/responses` 路由，当前原生 `web_search` 适配 `deepseek-v4-flash`。Custom 使用标准 `/chat/completions`，不依赖供应商原生搜索；后端注册一个模型可见的 `web_search` Function Tool，直接请求 DuckDuckGo Lite，失败时再尝试 DuckDuckGo HTML 页面。这样任何兼容 Chat Completions 的模型都可以复用同一套本地联网工具，搜索结果 URL 也由后端统一登记，再交给读取器使用。两种协议由后端分别解析，不能共用 DeepSeek 的 Responses SSE 事件处理器。
+DeepSeek 使用官方 `/responses` 路由，当前原生 `web_search` 适配 `deepseek-v4-flash`。Custom 使用标准 `/chat/completions`，不依赖模型供应商的原生搜索；后端把联网能力适配成模型可见的 `web_search` 与 `fetch_webpage` Function Tools。默认方案匿名连接 Parallel 官方 Streamable HTTP MCP 端点 `https://search.parallel.ai/mcp`，调用其 `web_search` / `web_fetch`，无需 Parallel API Key；备用方案直接请求 DuckDuckGo Lite/HTML，再使用 Jina Reader。查询词和待读取 URL 会发送给当前选择的搜索/读取服务。两种模型协议由后端分别解析，不能共用 DeepSeek 的 Responses SSE 事件处理器。
 
-Custom 每个工具轮最多执行 1 个工具，最多 6 个工具轮；每个回答最多搜索 3 次、最多读取 3 个网页，每次搜索最多返回 10 条结果。模型可以在资料足够时直接停止工具调用。搜索查询按标准化文本去重，不会重复请求同一个查询。`fetch_webpage` 只能读取用户提供或 DuckDuckGo 返回的 URL，搜索引擎结果页、编造 URL、本机和内网地址都会被拒绝；同一个 URL 也不会重复注入正文。
+Custom 每个工具轮最多执行 1 个工具，最多 6 个工具轮；每个回答最多搜索 3 次、最多读取 3 个网页，每次搜索最多向模型返回 10 条结果。模型可以在资料足够时直接停止工具调用。搜索查询按标准化文本去重，不会重复请求同一组查询。`fetch_webpage` 只能读取用户提供或当前搜索方案返回的 URL，搜索引擎结果页、编造 URL、本机和内网地址都会被拒绝；同一个 URL 也不会重复注入正文。Parallel 搜索每条摘录最多保留约 1,200 字符，读取默认使用相关摘录而非完整页面，每页最多约 8,000 字符，以限制上下文增长。
 
 MiMo 模型使用小米接口的 `thinking` 与 `max_completion_tokens` 字段；普通 Custom 模型使用标准 `max_tokens`、`temperature` 和 `top_p`，不会收到 MiMo 专用字段。工具额度结束后，后端会强制进入最终作答阶段；模型若把工具请求伪装成 `<tool_call>` 文本，该输出不会被保存为答案，而会进行一次受限纠正。
 
-`fetch_webpage` 把公开 URL 交给 `https://r.jina.ai/`，得到干净 Markdown 后作为 `tool` 结果回传给 Custom。Jina Reader 不需要 API Key；后端按约 20 次/分钟做进程级节流，每个回答最多读取 3 页，每页最多保留约 8,000 字符，并设置 `X-Respond-With: markdown`、`X-Timeout: 30` 和 `X-Remove-Selector`，自动移除常见 header、nav、aside、footer、sidebar、菜单、广告和 cookie 弹窗元素。Jina 官方支持通过 `X-Remove-Selector` 排除这些 CSS 选择器；如果目标站点有明确的文章容器，后续还可以针对该站点增加 `X-Target-Selector`。
+备用方案的 `fetch_webpage` 把公开 URL 交给 `https://r.jina.ai/`，得到干净 Markdown 后作为 `tool` 结果回传给 Custom。Jina Reader 不需要 API Key；后端按约 20 次/分钟做进程级节流，每个回答最多读取 3 页，每页最多保留约 8,000 字符，并设置 `X-Respond-With: markdown`、`X-Timeout: 30` 和 `X-Remove-Selector`，自动移除常见 header、nav、aside、footer、sidebar、菜单、广告和 cookie 弹窗元素。Jina 官方支持通过 `X-Remove-Selector` 排除这些 CSS 选择器；如果目标站点有明确的文章容器，后续还可以针对该站点增加 `X-Target-Selector`。
 
 DeepSeek 当前会忽略 Responses API 的 `max_tool_calls`。项目在系统提示中要求单次回答最多搜索五次，但无法像客户端工具循环一样做强制的逐次拦截；实际搜索次数以 DeepSeek 服务端执行结果为准。
 

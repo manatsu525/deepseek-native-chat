@@ -69,9 +69,10 @@ class ProviderBody(BaseModel):
 
 class CustomSettingsBody(BaseModel):
     thinking: Literal["enabled", "disabled"] = "enabled"
-    max_completion_tokens: int = Field(default=8192, ge=256, le=MIMO_MAX_COMPLETION_TOKENS)
+    max_completion_tokens: int = Field(default=65536, ge=256, le=MIMO_MAX_COMPLETION_TOKENS)
     temperature: float = Field(default=1.0, ge=0, le=1.5)
     top_p: float = Field(default=0.95, ge=0.01, le=1)
+    web_tool_backend: Literal["parallel", "legacy"] = "parallel"
 
 
 class ChatBody(BaseModel):
@@ -254,6 +255,7 @@ async def run_job(job_id: str) -> None:
                 stopped=stopped,
                 update=update,
                 settings=provider_settings,
+                conversation_id=job["conversation_id"],
             )
         else:
             result = await deepseek_stream_response(
