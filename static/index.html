@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="/assets/style.css">
   <style>
     .item-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+    .history-title-actions{display:flex;align-items:center;gap:7px}.history-title-actions button{border:0;background:transparent;color:#7f8ca5;padding:1px 3px;font-size:10px;font-weight:700}.history-title-actions button:hover{color:#e48b8b}.history-title-actions button:disabled{visibility:hidden}
     @media (prefers-color-scheme:dark){.message-content table{background:#192130;color:#e8edf6}.message-content th{background:#28354a;color:#fff}.message-content td{color:#e8edf6;border-color:#3a4658}}
     /* Keep the conversation readable like the previous chat view: compact bubbles, a bounded line length, and stable scrolling. */
     .chat-scroll{overflow-anchor:none}
@@ -72,7 +73,7 @@
         <button id="closeSidebar" class="icon-btn mobile-only" aria-label="关闭">×</button>
       </div>
       <button id="newChat" class="new-chat"><span>＋</span> 新对话</button>
-      <div class="history-title"><span>对话历史</span><span id="historyCount">0</span></div>
+      <div class="history-title"><span>对话历史</span><span class="history-title-actions"><span id="historyCount">0</span><button id="clearHistory" type="button" title="清空当前账号的全部聊天记录">清空</button></span></div>
       <nav id="history" class="history"></nav>
       <div id="pagination" class="pagination"></div>
       <div class="account-card">

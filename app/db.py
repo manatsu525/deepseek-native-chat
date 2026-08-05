@@ -129,6 +129,22 @@ class Database:
         fields = ", ".join(f"{key}=?" for key in values)
         self.run(f"UPDATE jobs SET {fields} WHERE id=?", (*values.values(), job_id))
 
+    def clear_user_chats(self, user_id: int) -> tuple[int, bool]:
+        """Delete one user's chat graph and compact SQLite when it is safe."""
+        with self.lock:
+            with self.connect() as db:
+                active = db.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running') LIMIT 1").fetchone()
+                if active:
+                    return 0, False
+                count = int(db.execute("SELECT COUNT(*) FROM conversations WHERE user_id=?", (user_id,)).fetchone()[0])
+                db.execute("DELETE FROM conversations WHERE user_id=?", (user_id,))
+            # DELETE alone does not shrink a SQLite file. Keep application
+            # writes paused while reclaiming both WAL and database space.
+            with self.connect() as db:
+                db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                db.execute("VACUUM")
+            return count, True
+
     @staticmethod
     def decode(value: str, fallback: Any) -> Any:
         try:

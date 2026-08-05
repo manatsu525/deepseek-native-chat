@@ -346,6 +346,7 @@ async function loadHistory(page=1) {
   const data = await api(`/api/conversations?page=${page}`); state.page=data.page; state.pages=data.pages;
   if(page===1) state.latestConversationId=data.items[0] ? data.items[0].id : null;
   $('#historyCount').textContent=data.total;
+  $('#clearHistory').disabled=!data.total;
   $('#history').innerHTML=data.items.map(c=>`<button class="history-item ${state.conversation&&state.conversation.id===c.id?'active':''}" data-id="${c.id}"><span>${escapeHtml(c.title)}</span><b class="history-delete" title="删除">×</b></button>`).join('') || '<p class="muted" style="padding:10px;font-size:12px">还没有对话</p>';
   $$('.history-item').forEach(button => {
     button.onclick=e=>{if(e.target.classList.contains('history-delete'))return;openConversation(button.dataset.id);closeSidebar()};
@@ -353,6 +354,19 @@ async function loadHistory(page=1) {
   });
   $('#pagination').innerHTML = state.pages>1 ? `<button id="prevPage" ${state.page<=1?'disabled':''}>‹</button><button>${state.page}/${state.pages}</button><button id="nextPage" ${state.page>=state.pages?'disabled':''}>›</button>` : '';
   if($('#prevPage'))$('#prevPage').onclick=()=>loadHistory(state.page-1); if($('#nextPage'))$('#nextPage').onclick=()=>loadHistory(state.page+1);
+}
+
+async function clearAllHistory() {
+  if(state.job && ['queued','running'].includes(state.job.status)){toast('请先停止当前回答');return}
+  if(!confirm('永久删除当前账号的全部聊天记录？\n\n对话、消息、思考、搜索记录和任务统计都会删除，并立即压缩数据库。此操作不可恢复。'))return;
+  const button=$('#clearHistory');button.disabled=true;
+  try{
+    const result=await api('/api/conversations',{method:'DELETE'});
+    stopPolling();state.conversation=null;state.messages=[];state.job=null;state.latestConversationId=null;state.page=1;state.pages=1;
+    detailState.clear();nestedScrollState.clear();storeValue('active-conversation',null);
+    $('#conversationTitle').textContent='新对话';renderMessages();await loadHistory(1);closeSidebar();
+    toast(`已删除 ${result.deleted} 个对话并释放本地空间`);
+  }catch(err){toast(err.message);await loadHistory(state.page)}
 }
 
 async function openConversation(id) {
@@ -520,6 +534,7 @@ async function boot(){try{state.me=await api('/api/me');$('#loginView').classLis
 $('#loginForm').onsubmit=async e=>{e.preventDefault();$('#loginError').textContent='';try{await api('/api/login',{method:'POST',body:{username:$('#loginUser').value,password:$('#loginPass').value}});await boot()}catch(err){$('#loginError').textContent=err.message}};
 $('#logout').onclick=async()=>{await api('/api/logout',{method:'POST'});location.reload()};
 $('#newChat').onclick=()=>{newConversation();closeSidebar()};$('#composer').onsubmit=e=>{e.preventDefault();submitPrompt()};
+$('#clearHistory').onclick=clearAllHistory;
 // Enter always inserts a newline. Sending is explicit via the send button.
 $('#prompt').oninput=resizePrompt;
 $('#stopButton').onclick=async()=>{if(state.job&&state.job.id){await api(`/api/jobs/${state.job.id}/stop`,{method:'POST'});toast('正在停止')}};

@@ -571,6 +571,14 @@ def conversation(conversation_id: str, user: dict[str, Any] = Depends(current_us
     return {"conversation": conv, "messages": rows, "active_job": public_job(active) if active else None}
 
 
+@app.delete("/api/conversations")
+def delete_all_conversations(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    deleted, compacted = db.clear_user_chats(user["id"])
+    if not compacted:
+        raise HTTPException(409, "请先等待或停止所有正在生成的回答")
+    return {"ok": True, "deleted": deleted, "compacted": True}
+
+
 @app.delete("/api/conversations/{conversation_id}")
 def delete_conversation(conversation_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, bool]:
     active = db.one("SELECT id FROM jobs WHERE conversation_id=? AND user_id=? AND status IN ('queued','running')", (conversation_id, user["id"]))
