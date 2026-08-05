@@ -209,7 +209,7 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
     if (!/^https?:\/\//i.test(url) || seenSources.has(url)) return;
     seenSources.add(url); sources.push(source);
   });
-  if (!reasoning && !searches.length && !active && !Object.keys(meta.usage || {}).length) return '';
+  if (!reasoning && !searches.length && !active) return '';
   const status = active ? '进行中' : (meta.stopped ? '已停止' : '已完成');
   const searchHtml = searches.map((s,i) => {
     const label=s.action==='open_page'?'读取网页':'联网搜索';
@@ -231,7 +231,7 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
   const searchCount=searches.filter(item=>item.action!=='open_page').length;
   const readCount=searches.filter(item=>item.action==='open_page'&&item.status==='completed').length;
   const activity=`${searchCount ? ` · ${searchCount} 次搜索` : ''}${readCount ? ` · ${readCount} 次读取` : ''}`;
-  return `<details class="trace" data-detail-key="${escapeHtml(detailKey)}"${traceOpen}><summary>思考与联网 · ${status}${activity}</summary><div class="trace-body">${reasoning ? `<div class="reasoning-text" data-scroll-key="${escapeHtml(detailKey)}-reasoning">${escapeHtml(reasoning)}</div>` : active ? '<div class="typing"><i></i><i></i><i></i></div>' : ''}${searchHtml}${sourceHtml}${usageHtml(meta.usage || {})}</div></details>`;
+  return `<details class="trace" data-detail-key="${escapeHtml(detailKey)}"${traceOpen}><summary>思考与联网 · ${status}${activity}</summary><div class="trace-body">${reasoning ? `<div class="reasoning-text" data-scroll-key="${escapeHtml(detailKey)}-reasoning">${escapeHtml(reasoning)}</div>` : active ? '<div class="typing"><i></i><i></i><i></i></div>' : ''}${searchHtml}${sourceHtml}</div></details>`;
 }
 
 function messageHtml(message, index, live=false) {
@@ -244,7 +244,7 @@ function messageHtml(message, index, live=false) {
   return `<article class="message ${assistant ? 'assistant' : 'user'}${live ? ' live-message' : ''}" data-index="${index}">
     <div class="message-icon">${assistant ? (custom ? 'CU' : 'DS') : escapeHtml(((state.me && state.me.username) || 'U')[0].toUpperCase())}</div>
     <div class="message-body"><div class="message-head"><strong>${assistant ? assistantName : escapeHtml((state.me && state.me.username) || '你')}</strong></div>
-    ${assistant ? traceHtml(meta, live, detailKey) : ''}<div class="message-content">${assistant ? (content ? markdown(content, detailKey) : live ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div><div class="message-actions"><button type="button" data-action="copy">复制</button><button type="button" data-action="retry">重新回答</button></div>
+    ${assistant ? traceHtml(meta, live, detailKey) : ''}<div class="message-content">${assistant ? (content ? markdown(content, detailKey) : live ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div>${assistant && !live ? usageHtml(meta.usage || {}) : ''}<div class="message-actions"><button type="button" data-action="copy">复制</button><button type="button" data-action="retry">重新回答</button></div>
     ${meta.error ? `<p class="job-error">${escapeHtml(meta.error)}</p>` : ''}</div></article>`;
 }
 
