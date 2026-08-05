@@ -133,10 +133,11 @@ function renderCallout(lines) {
   return `<aside class="md-callout md-callout-${info.type}"><div class="md-callout-title"><span aria-hidden="true">${info.icon}</span>${info.label}</div><div class="md-callout-body">${body || '<span class="muted"> </span>'}</div></aside>`;
 }
 
-function markdown(raw='') {
+function markdown(raw='', scrollKeyPrefix='message') {
   const lines = String(raw || '').replace(/\r\n?/g, '\n').split('\n');
   const out = [], paragraph = [];
   let listType = '';
+  let tableIndex = 0;
   const flushParagraph = () => {
     if (!paragraph.length) return;
     out.push(`<p>${paragraph.map(line => inline(line)).join('<br>')}</p>`);
@@ -159,7 +160,8 @@ function markdown(raw='') {
       i += 2; const rows = [];
       while (i < lines.length && lines[i].includes('|') && lines[i].trim()) { rows.push(splitTableRow(lines[i])); i++; }
       i--;
-      let table = '<div class="table-wrap"><table><thead><tr>';
+      const tableScrollKey = `${scrollKeyPrefix}-table-${tableIndex++}`;
+      let table = `<div class="table-wrap" data-scroll-key="${escapeHtml(tableScrollKey)}"><table><thead><tr>`;
       table += headers.map((cell, index) => `<th${align[index] ? ` style="text-align:${align[index]}"` : ''}>${inline(cell)}</th>`).join('');
       table += '</tr></thead><tbody>';
       rows.forEach(row => { table += `<tr>${headers.map((_, index) => `<td${align[index] ? ` style="text-align:${align[index]}"` : ''}>${inline(row[index] || '')}</td>`).join('')}</tr>`; });
@@ -242,7 +244,7 @@ function messageHtml(message, index, live=false) {
   return `<article class="message ${assistant ? 'assistant' : 'user'}${live ? ' live-message' : ''}" data-index="${index}">
     <div class="message-icon">${assistant ? (custom ? 'CU' : 'DS') : escapeHtml(((state.me && state.me.username) || 'U')[0].toUpperCase())}</div>
     <div class="message-body"><div class="message-head"><strong>${assistant ? assistantName : escapeHtml((state.me && state.me.username) || '你')}</strong></div>
-    ${assistant ? traceHtml(meta, live, detailKey) : ''}<div class="message-content">${assistant ? (content ? markdown(content) : live ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div><div class="message-actions"><button type="button" data-action="copy">复制</button><button type="button" data-action="retry">重新回答</button></div>
+    ${assistant ? traceHtml(meta, live, detailKey) : ''}<div class="message-content">${assistant ? (content ? markdown(content, detailKey) : live ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div><div class="message-actions"><button type="button" data-action="copy">复制</button><button type="button" data-action="retry">重新回答</button></div>
     ${meta.error ? `<p class="job-error">${escapeHtml(meta.error)}</p>` : ''}</div></article>`;
 }
 
