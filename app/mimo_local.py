@@ -49,6 +49,10 @@ class UnapprovedSourceError(ValueError):
     pass
 
 
+class ToolQuotaExceeded(RuntimeError):
+    pass
+
+
 FINAL_ANSWER_ATTEMPTS = 2
 PARALLEL_MAX_SEARCH_EXCERPT_CHARS = 1200
 FINAL_ANSWER_PROMPT = (
@@ -384,14 +388,22 @@ async def stream_response(
             result_text = ""
             target_url = ""
             try:
+                # Quota errors must take precedence over argument validation. If
+                # the model calls an exhausted tool with malformed arguments,
+                # tell it to stop using that tool instead of inviting a retry.
+                if is_search and search_count >= MIMO_MAX_SEARCHES:
+                    raise ToolQuotaExceeded(
+                        f"搜索次数已达到上限（最多 {MIMO_MAX_SEARCHES} 次），禁止再次搜索或重试；请立即根据已有资料回答"
+                    )
+                if name == "fetch_webpage" and fetch_count >= JINA_MAX_FETCHES_PER_RESPONSE:
+                    reader_enabled = False
+                    raise ToolQuotaExceeded(
+                        f"网页读取次数已达到上限（最多 {JINA_MAX_FETCHES_PER_RESPONSE} 次），禁止再次读取或重试；请立即根据已有资料回答"
+                    )
                 arguments = json.loads(str(function.get("arguments") or "{}"))
                 if not isinstance(arguments, dict):
                     raise ValueError("工具参数必须是 JSON 对象")
                 if is_search:
-                    if search_count >= MIMO_MAX_SEARCHES:
-                        raise RuntimeError(
-                            f"搜索次数已达到上限（最多 {MIMO_MAX_SEARCHES} 次），禁止再次搜索或重试；请立即根据已有资料回答"
-                        )
                     if parallel_mode:
                         objective = " ".join(str(arguments.get("objective") or "").split())[:1000]
                         raw_queries = arguments.get("search_queries") or []
@@ -484,9 +496,6 @@ async def stream_response(
                         step["status"] = "skipped"
                         result_text = f"该网页本回答已经尝试过，不重复请求：{target_url}。请使用已有结果或选择其他来源。"
                     else:
-                        if fetch_count >= JINA_MAX_FETCHES_PER_RESPONSE:
-                            reader_enabled = False
-                            raise RuntimeError(f"本回答最多读取 {JINA_MAX_FETCHES_PER_RESPONSE} 个网页")
                         attempted_urls.add(canonical)
                         fetch_count += 1
                         if parallel_mode:
@@ -536,6 +545,8 @@ async def stream_response(
                 step["error"] = str(exc)[:1000]
                 if isinstance(exc, UnapprovedSourceError):
                     result_text = f"网页读取工具未执行：{str(exc)[:1000]}。请先使用 web_search 获取真实内容页 URL。"
+                elif isinstance(exc, ToolQuotaExceeded):
+                    result_text = str(exc)[:1000]
                 elif is_search:
                     engine = "Parallel Search MCP" if parallel_mode else "DuckDuckGo"
                     result_text = f"{engine} 搜索失败：{str(exc)[:1000]}。可以改写查询继续，或根据已有资料回答。"
