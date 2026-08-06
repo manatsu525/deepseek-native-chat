@@ -57,13 +57,44 @@ const CODE_EXTENSIONS = {
   swift:'swift', markdown:'md', md:'md', dockerfile:'Dockerfile'
 };
 
+function renderMathMarkup(tex, displayMode=false) {
+  const source = String(tex || '').trim();
+  if (!source) return '';
+  if (!window.katex || typeof window.katex.renderToString !== 'function') {
+    return `<code class="math-error">${escapeHtml(source)}</code>`;
+  }
+  try {
+    return window.katex.renderToString(source, {
+      displayMode,
+      throwOnError: false,
+      strict: false,
+      trust: false,
+      maxExpand: 1000,
+      maxSize: 20,
+      output: 'htmlAndMathml',
+    });
+  } catch {
+    return `<code class="math-error">${escapeHtml(source)}</code>`;
+  }
+}
+
 function inline(value='') {
-  const codeTokens = [], linkTokens = [];
-  let text = escapeHtml(value).replace(/`([^`\n]+)`/g, (_, code) => {
+  const codeTokens = [], mathTokens = [], linkTokens = [];
+  let source = String(value).replace(/`([^`\n]+)`/g, (_, code) => {
     const token = `\u0000CODE${codeTokens.length}\u0000`;
-    codeTokens.push(`<code>${code}</code>`);
+    codeTokens.push(`<code>${escapeHtml(code)}</code>`);
     return token;
   });
+  const keepInlineMath = tex => {
+    const token = `\u0000MATH${mathTokens.length}\u0000`;
+    mathTokens.push(`<span class="math-inline">${renderMathMarkup(tex, false)}</span>`);
+    return token;
+  };
+  source = source.replace(/\\\((.+?)\\\)/g, (_, tex) => keepInlineMath(tex));
+  source = source.replace(/\$(?!\$)([^$\n]+?)\$/g, (match, tex) => (
+    /^\s|\s$/.test(tex) ? match : keepInlineMath(tex)
+  ));
+  let text = escapeHtml(source);
   text = text.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, label, url) => {
     const decoded = url.replace(/&amp;/g, '&');
     if (!/^https?:\/\//i.test(decoded)) return `${label} (${url})`;
@@ -86,6 +117,7 @@ function inline(value='') {
     .replace(/~~([^~\n]+)~~/g, '<del>$1</del>')
     .replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>');
   text = text.replace(/\u0000LINK(\d+)\u0000/g, (_, index) => linkTokens[Number(index)] || '');
+  text = text.replace(/\u0000MATH(\d+)\u0000/g, (_, index) => mathTokens[Number(index)] || '');
   return text.replace(/\u0000CODE(\d+)\u0000/g, (_, index) => codeTokens[Number(index)] || '');
 }
 
@@ -140,7 +172,7 @@ function markdown(raw='', scrollKeyPrefix='message') {
   const lines = String(raw || '').replace(/\r\n?/g, '\n').split('\n');
   const out = [], paragraph = [];
   let listType = '';
-  let tableIndex = 0;
+  let tableIndex = 0, mathIndex = 0;
   const flushParagraph = () => {
     if (!paragraph.length) return;
     out.push(`<p>${paragraph.map(line => inline(line)).join('<br>')}</p>`);
@@ -155,6 +187,28 @@ function markdown(raw='', scrollKeyPrefix='message') {
       const code = []; i++;
       while (i < lines.length && !/^```/.test(lines[i].trim())) { code.push(lines[i]); i++; }
       out.push(renderCodeBlock(language, code.join('\n'))); continue;
+    }
+    const mathOpen = trimmed.startsWith('$$') ? '$$' : trimmed.startsWith('\\[') ? '\\[' : '';
+    if (mathOpen) {
+      const mathClose = mathOpen === '$$' ? '$$' : '\\]';
+      let end = -1;
+      const first = trimmed.slice(mathOpen.length);
+      if (first.endsWith(mathClose)) end = i;
+      else {
+        for (let cursor = i + 1; cursor < lines.length; cursor++) {
+          if (lines[cursor].trim().endsWith(mathClose)) { end = cursor; break; }
+        }
+      }
+      if (end >= 0) {
+        flushParagraph(); closeList();
+        const expressionLines = lines.slice(i, end + 1);
+        expressionLines[0] = expressionLines[0].trim().slice(mathOpen.length);
+        expressionLines[expressionLines.length - 1] = expressionLines[expressionLines.length - 1].trim().slice(0, -mathClose.length);
+        const mathScrollKey = `${scrollKeyPrefix}-math-${mathIndex++}`;
+        out.push(`<div class="math-display" data-scroll-key="${escapeHtml(mathScrollKey)}">${renderMathMarkup(expressionLines.join('\n'), true)}</div>`);
+        i = end;
+        continue;
+      }
     }
     if (line.includes('|') && i + 1 < lines.length && isTableDivider(lines[i + 1])) {
       flushParagraph(); closeList();

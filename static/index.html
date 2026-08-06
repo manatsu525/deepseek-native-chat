@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#0b1220">
   <title>Native Web Chat</title>
+  <link rel="stylesheet" href="/assets/vendor/katex/katex.min.css">
   <link rel="stylesheet" href="/assets/style.css">
   <style>
     .item-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
@@ -24,11 +25,15 @@
     .message-content p{margin:.45rem 0}
     .message-content p:first-child{margin-top:0}
     .message-content p:last-child{margin-bottom:0}
-    .table-wrap{max-width:100%;margin:.65rem 0;overflow-x:auto}
-    .message-content table{white-space:nowrap;font-size:.88rem}
-    .message-content th,.message-content td{padding:.55rem .7rem;border-right:1px solid var(--line);vertical-align:top}
+    .table-wrap{max-width:100%;margin:.65rem 0;overflow-x:auto;overscroll-behavior-inline:contain;-webkit-overflow-scrolling:touch}
+    .message-content table{width:max-content;min-width:100%;white-space:normal;font-size:.88rem;table-layout:auto}
+    .message-content th,.message-content td{min-width:6rem;max-width:22rem;padding:.48rem .58rem;border-right:1px solid var(--line);vertical-align:top;white-space:normal;overflow-wrap:break-word;word-break:normal;hyphens:auto}
     .message-content tr:last-child td{border-bottom:0}
     .message-content th:last-child,.message-content td:last-child{border-right:0}
+    .math-display{max-width:100%;margin:.7rem 0;padding:.3rem .15rem;overflow-x:auto;overflow-y:hidden;overscroll-behavior-inline:contain;-webkit-overflow-scrolling:touch;text-align:center}
+    .math-display>.katex-display{width:max-content;min-width:100%;margin:.25rem 0;text-align:center}
+    .math-inline{display:inline-block;max-width:100%;overflow-x:auto;overflow-y:hidden;vertical-align:-.25em;overscroll-behavior-inline:contain;-webkit-overflow-scrolling:touch}
+    .math-error{color:var(--danger);white-space:pre-wrap}
     .message-content h1,.message-content h2,.message-content h3,.message-content h4,.message-content h5,.message-content h6{line-height:1.35;margin:1.15em 0 .5em}
     .message-content h1{font-size:1.55em}.message-content h2{font-size:1.32em}.message-content h3{font-size:1.15em}.message-content h4{font-size:1.05em}.message-content h5{font-size:1em}.message-content h6{font-size:.95em;color:var(--muted)}
     .message-content ul,.message-content ol{padding-left:1.5em}.message-content li{margin:.2em 0}.message-content hr{margin:.8rem 0;border:0;border-top:1px solid var(--line)}
@@ -48,7 +53,7 @@
     @media (prefers-color-scheme:dark){.message.user{background:#1d2a46}.message.assistant{background:#192130}.user .message-content{background:transparent}}
     @media (prefers-color-scheme:dark){.message-content a,.search-detail a{color:#83a9ff}.message-content a:hover,.search-detail a:hover{color:#b1c8ff}.message-content blockquote{color:#b4bfd1;background:#202b3d;border-left-color:#718ab9}.md-callout-note{color:#a9ceff;border-color:#4d87c5;background:#172b43}.md-callout-note .md-callout-title{background:#1d3b5e}.md-callout-tip{color:#a8e1b8;border-color:#4f9a68;background:#172d22}.md-callout-tip .md-callout-title{background:#1d4930}.md-callout-important{color:#d2bfff;border-color:#8363be;background:#281d3d}.md-callout-important .md-callout-title{background:#3a2a59}.md-callout-warning{color:#f4cf78;border-color:#ae7e26;background:#3b2e12}.md-callout-warning .md-callout-title{background:#574316}.md-callout-danger{color:#ffb0b0;border-color:#b96464;background:#3c2023}.md-callout-danger .md-callout-title{background:#572b30}}
     @media (prefers-color-scheme:dark){.location-grid input,.custom-model-filter{background:#121925;color:var(--ink)}}
-    @media (max-width:760px){.message{max-width:100%;padding:11px 12px;margin-bottom:14px}.message.user{max-width:92%;margin-left:auto}.message.assistant{margin-right:0}.location-grid{grid-template-columns:1fr}.custom-model-list{grid-template-columns:1fr}.top-actions{flex-wrap:wrap;justify-content:flex-end}}
+    @media (max-width:760px){.message{max-width:100%;padding:11px 12px;margin-bottom:14px}.message.user{max-width:92%;margin-left:auto}.message.assistant{margin-right:0}.message-content th,.message-content td{min-width:6.25rem;max-width:min(19rem,76vw);padding:.44rem .5rem}.location-grid{grid-template-columns:1fr}.custom-model-list{grid-template-columns:1fr}.top-actions{flex-wrap:wrap;justify-content:flex-end}}
   </style>
 </head>
 <body>
@@ -191,6 +196,7 @@
   </dialog>
 
   <div id="toast" class="toast"></div>
+  <script src="/assets/vendor/katex/katex.min.js" defer></script>
   <script src="/assets/app.js" defer></script>
 </body>
 </html>
