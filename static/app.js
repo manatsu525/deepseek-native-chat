@@ -98,7 +98,10 @@ function splitTableRow(line) {
 
 function isTableDivider(line) {
   const cells = splitTableRow(line);
-  return cells.length > 0 && cells.every(cell => /^:?-{3,}:?$/.test(cell));
+  // Models occasionally emit two dashes for a narrow/blank header column.
+  // Accept that common near-GFM form while still requiring every cell to be
+  // made exclusively from an optional alignment marker and 2+ dashes.
+  return cells.length > 0 && cells.every(cell => /^:?-{2,}:?$/.test(cell));
 }
 
 function calloutInfo(lines) {
