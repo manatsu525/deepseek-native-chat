@@ -388,6 +388,10 @@ async def stream_response(
                 if not isinstance(arguments, dict):
                     raise ValueError("工具参数必须是 JSON 对象")
                 if is_search:
+                    if search_count >= MIMO_MAX_SEARCHES:
+                        raise RuntimeError(
+                            f"搜索次数已达到上限（最多 {MIMO_MAX_SEARCHES} 次），禁止再次搜索或重试；请立即根据已有资料回答"
+                        )
                     if parallel_mode:
                         objective = " ".join(str(arguments.get("objective") or "").split())[:1000]
                         raw_queries = arguments.get("search_queries") or []
@@ -405,8 +409,6 @@ async def stream_response(
                         query_key = query.casefold()
                         if not query:
                             raise ValueError("搜索词不能为空")
-                    if search_count >= MIMO_MAX_SEARCHES:
-                        raise RuntimeError(f"本回答最多搜索 {MIMO_MAX_SEARCHES} 次")
                     if query_key in searched_queries:
                         step["status"] = "skipped"
                         result_text = "该查询已经搜索过，不重复请求。请改写查询或根据已有结果回答。"
