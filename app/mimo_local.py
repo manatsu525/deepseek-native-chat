@@ -52,10 +52,12 @@ class UnapprovedSourceError(ValueError):
 FINAL_ANSWER_ATTEMPTS = 2
 PARALLEL_MAX_SEARCH_EXCERPT_CHARS = 1200
 FINAL_ANSWER_PROMPT = (
-    "The local web-tool phase has ended. You cannot call any more tools in this response. "
-    "Do not emit tool_calls, XML such as <tool_call>, function-call JSON, or a request to read another URL. "
-    "Use only the evidence already present in the conversation and answer the user's original question now "
-    "in natural language. Clearly state uncertainty when the available evidence is insufficient."
+    "CRITICAL FINALIZATION INSTRUCTION: The tool-call budget is completely exhausted. No search or webpage-reading "
+    "tool is available now, and requesting another tool cannot succeed. You MUST stop researching and answer the "
+    "user's original question immediately using only the evidence already present above. Do not emit tool_calls, "
+    "XML such as <tool_call>, function-call JSON, a search query, or prose saying that you will search/read next. "
+    "Even if the evidence is incomplete or a previous tool failed, provide the best supported answer now and state "
+    "the uncertainty explicitly. 工具调用额度已经全部耗尽；禁止继续搜索或读取网页，必须立即根据已有资料回答原问题。"
 )
 
 
