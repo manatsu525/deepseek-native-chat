@@ -107,6 +107,40 @@ def _is_nvidia_deepseek_v4(base_url: str, model: str) -> bool:
     return host == "integrate.api.nvidia.com" and model_name in {"deepseek-v4-flash", "deepseek-v4-pro"}
 
 
+def _apply_thinking_options(
+    payload: dict[str, Any],
+    base_url: str,
+    model: str,
+    thinking: str,
+    effort: str,
+    effort_enabled: bool,
+    max_tokens: int,
+) -> None:
+    """Send optional reasoning controls using known or generic dialects."""
+    host = (urlsplit(base_url).hostname or "").casefold()
+    model_name = str(model or "").casefold().rsplit("/", 1)[-1]
+    thinking_enabled = thinking == "enabled"
+    selected_effort = effort if effort in {"high", "max"} else "high"
+    if is_mimo_model(model):
+        payload["thinking"] = {"type": thinking}
+    elif _is_nvidia_deepseek_v4(base_url, model):
+        payload["chat_template_kwargs"] = {"thinking": thinking_enabled}
+        if effort_enabled:
+            payload["chat_template_kwargs"]["reasoning_effort"] = selected_effort
+    elif host == "integrate.api.nvidia.com" and model_name == "nemotron-3-ultra-550b-a55b":
+        payload["chat_template_kwargs"] = {"enable_thinking": thinking_enabled}
+        if thinking_enabled:
+            payload["chat_template_kwargs"]["force_nonempty_content"] = True
+            payload["reasoning_budget"] = min(16384, max(1, max_tokens - 1))
+    else:
+        # There is no universal OpenAI reasoning extension. This widely used
+        # shape is intentionally user-controlled: incompatible providers may
+        # reject it, after which it can be disabled in Custom settings.
+        payload["thinking"] = {"type": thinking}
+    if effort_enabled and not _is_nvidia_deepseek_v4(base_url, model):
+        payload["reasoning_effort"] = selected_effort
+
+
 async def stream_response(
     *,
     base_url: str,
@@ -205,13 +239,15 @@ async def stream_response(
                 "max_completion_tokens" if mimo_model else "max_tokens": int(config["max_completion_tokens"]),
                 "stream": True,
             }
-            if mimo_model:
-                payload["thinking"] = {"type": config["thinking"]}
-            elif _is_nvidia_deepseek_v4(base_url, model):
-                nvidia_thinking = config["thinking"] == "enabled"
-                payload["chat_template_kwargs"] = {"thinking": nvidia_thinking}
-                if nvidia_thinking:
-                    payload["chat_template_kwargs"]["reasoning_effort"] = effort if effort in {"high", "max"} else "high"
+            _apply_thinking_options(
+                payload,
+                base_url,
+                model,
+                config["thinking"],
+                effort,
+                bool(config.get("reasoning_effort_enabled", True)),
+                int(config["max_completion_tokens"]),
+            )
             if round_tools:
                 payload["tools"] = round_tools
                 payload["tool_choice"] = "auto"

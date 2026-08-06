@@ -154,7 +154,8 @@
   <dialog id="customModal" class="modal small-modal">
     <div class="modal-head"><div><p class="eyebrow">CUSTOM WEB TOOLS</p><h3>Custom 参数</h3></div><button class="icon-btn close-modal">×</button></div>
     <form id="customForm" class="form-grid">
-      <label>兼容思考<select id="customThinking"><option value="enabled">开启（兼容模型生效）</option><option value="disabled">关闭</option></select></label>
+      <label>思考模式<select id="customThinking"><option value="enabled">开启</option><option value="disabled">关闭</option></select></label>
+      <label class="check"><input id="customReasoningEffortEnabled" type="checkbox" checked> 发送 reasoning_effort</label>
       <label>最大生成 Token<input id="customMaxCompletion" type="number" min="256" max="131072" step="256" value="65536"></label>
       <label>temperature<input id="customTemperature" type="number" min="0" max="1.5" step="0.05" value="1"></label>
       <label>top_p<input id="customTopP" type="number" min="0.01" max="1" step="0.01" value="0.95"></label>

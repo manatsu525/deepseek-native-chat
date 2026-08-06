@@ -86,6 +86,7 @@ Use web_search when current, niche, or externally verifiable information is need
 CUSTOM_SYSTEM_PROMPT = PARALLEL_CUSTOM_SYSTEM_PROMPT
 DEFAULT_SETTINGS = {
     "thinking": "enabled",
+    "reasoning_effort_enabled": True,
     "max_completion_tokens": 65536,
     "temperature": 1.0,
     "top_p": 0.95,
