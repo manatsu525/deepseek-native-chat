@@ -64,10 +64,6 @@ FINAL_ANSWER_PROMPT = (
     "the uncertainty explicitly. 工具调用额度已经全部耗尽；禁止继续搜索或读取网页，必须立即根据已有资料回答原问题。"
 )
 
-OPENCODE_DEEPSEEK_V4_FLASH_TOOL_PROMPT = """OpenCode DeepSeek tool-protocol compatibility rules:
-When tools are available, invoke them only through the OpenAI Chat Completions tool_calls field supplied by the API. Never print, imitate, or expose DSML tokens, <|DSML|> / <｜DSML｜> markup, XML tool tags, function-call JSON, or partial tool arguments in normal answer content or reasoning. Normal content must contain only user-facing prose.
-For web_search, send exactly one valid JSON object matching the provided schema. In particular, search_queries MUST be a JSON array of 1-3 complete strings, never a single string, partial string, or incrementally repeated draft. Example shape: {"objective":"查明具体问题","search_queries":["查询一","query two"]}. If a tool call cannot be formed correctly, do not emit a malformed attempt; answer from existing evidence instead."""
-
 
 class _AsyncNullContext:
     """Python 3.9-compatible async equivalent of contextlib.nullcontext."""
@@ -109,15 +105,6 @@ def _dated_system_prompt(base_prompt: str, user_timezone: str) -> str:
         "For time-sensitive web searches, include the relevant absolute date in the objective or queries and compare source publication/event dates before answering. "
         "Never assume that the newest result returned by a search is from today. If evidence for the requested date is unavailable, say so explicitly instead of presenting older information as current."
     )
-
-
-def _model_system_prompt(base_prompt: str, base_url: str, model: str) -> str:
-    """Apply narrowly scoped protocol guidance for known gateway/model quirks."""
-    host = (urlsplit(base_url).hostname or "").casefold()
-    model_name = str(model or "").strip().casefold().rsplit("/", 1)[-1]
-    if host == "opencode.ai" and model_name == "deepseek-v4-flash-free":
-        return f"{base_prompt}\n\n{OPENCODE_DEEPSEEK_V4_FLASH_TOOL_PROMPT}"
-    return base_prompt
 
 
 def _is_nvidia_deepseek_v4(base_url: str, model: str) -> bool:
@@ -184,7 +171,6 @@ async def stream_response(
     parallel_mode = config.get("web_tool_backend") == "parallel"
     headers = custom_auth_headers(api_key, stream=True)
     base_prompt = PARALLEL_CUSTOM_SYSTEM_PROMPT if parallel_mode else LEGACY_CUSTOM_SYSTEM_PROMPT
-    base_prompt = _model_system_prompt(base_prompt, base_url, model)
     system_prompt = _dated_system_prompt(base_prompt, user_timezone)
     conversation: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}, *[dict(message) for message in messages]]
     answer = ""
