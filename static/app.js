@@ -259,13 +259,6 @@ function usageHtml(usage={}) {
 function traceHtml(meta={}, active=false, detailKey='trace') {
   const reasoning = meta.reasoning || '';
   const searches = meta.searches || [];
-  const sources = [];
-  const seenSources = new Set();
-  [...(meta.sources || []), ...searches.filter(item => item.action === 'open_page' && item.status === 'completed' && item.url).map(item => ({url:item.url,title:item.url}))].forEach(source => {
-    const url = String(source.url || '');
-    if (!/^https?:\/\//i.test(url) || seenSources.has(url)) return;
-    seenSources.add(url); sources.push(source);
-  });
   if (!reasoning && !searches.length && !active) return '';
   const status = active ? '进行中' : (meta.stopped ? '已停止' : '已完成');
   const searchHtml = searches.map((s,i) => {
@@ -277,31 +270,42 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
     const statusLabels={running:'进行中',searching:'搜索中',completed:'已完成',failed:'失败',rejected:'已拒绝',skipped:'已跳过'};
     return `<details class="search-step" data-detail-key="${escapeHtml(searchKey)}"${searchOpen}><summary>${label} ${i+1} · ${escapeHtml(statusLabels[s.status] || s.status || '已完成')}</summary><div class="search-detail">${detail}${error}</div></details>`;
   }).join('');
-  const sourceChips = sources.map(s => { const logo=s.logo_url&&safeUrl(s.logo_url)!=='#'?`<img src="${safeUrl(s.logo_url)}" alt="" loading="lazy">`:''; return `<a class="source-chip" href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(s.summary || s.url)}">${logo}<span>${escapeHtml(s.title || s.url)}</span></a>`; }).join('');
-  const sourceKey = `${detailKey}-sources`;
-  const sourceOpen = detailState.get(sourceKey) ? ' open' : '';
-  const sourceHtml = sources.length ? (sources.length > 5
-    ? `<details class="source-list" data-detail-key="${escapeHtml(sourceKey)}"${sourceOpen}><summary>来源 · ${sources.length} 条</summary><div class="sources">${sourceChips}</div></details>`
-    : `<div class="sources"><span class="sources-label">来源</span>${sourceChips}</div>`)
-    : '';
   const traceOpen=detailState.get(detailKey) ? ' open' : '';
   const searchCount=searches.filter(item=>item.action!=='open_page').length;
   const readCount=searches.filter(item=>item.action==='open_page'&&item.status==='completed').length;
   const activity=`${searchCount ? ` · ${searchCount} 次搜索` : ''}${readCount ? ` · ${readCount} 次读取` : ''}`;
-  return `<details class="trace" data-detail-key="${escapeHtml(detailKey)}"${traceOpen}><summary>思考与联网 · ${status}${activity}</summary><div class="trace-body">${reasoning ? `<div class="reasoning-text" data-scroll-key="${escapeHtml(detailKey)}-reasoning">${escapeHtml(reasoning)}</div>` : active ? '<div class="typing"><i></i><i></i><i></i></div>' : ''}${searchHtml}${sourceHtml}</div></details>`;
+  return `<details class="trace" data-detail-key="${escapeHtml(detailKey)}"${traceOpen}><summary>思考与联网 · ${status}${activity}</summary><div class="trace-body">${reasoning ? `<div class="reasoning-text" data-scroll-key="${escapeHtml(detailKey)}-reasoning">${escapeHtml(reasoning)}</div>` : active ? '<div class="typing"><i></i><i></i><i></i></div>' : ''}${searchHtml}</div></details>`;
+}
+
+function sourcesHtml(meta={}, detailKey='trace') {
+  const searches = meta.searches || [];
+  const sources = [];
+  const seenSources = new Set();
+  [...(meta.sources || []), ...searches.filter(item => item.action === 'open_page' && item.status === 'completed' && item.url).map(item => ({url:item.url,title:item.url}))].forEach(source => {
+    const url = String(source.url || '');
+    if (!/^https?:\/\//i.test(url) || seenSources.has(url)) return;
+    seenSources.add(url); sources.push(source);
+  });
+  if (!sources.length) return '';
+  const sourceChips = sources.map(s => { const logo=s.logo_url&&safeUrl(s.logo_url)!=='#'?`<img src="${safeUrl(s.logo_url)}" alt="" loading="lazy">`:''; return `<a class="source-chip" href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(s.summary || s.url)}">${logo}<span>${escapeHtml(s.title || s.url)}</span></a>`; }).join('');
+  const sourceKey = `${detailKey}-sources`;
+  const sourceOpen = detailState.get(sourceKey) ? ' open' : '';
+  return sources.length > 5
+    ? `<details class="source-list" data-detail-key="${escapeHtml(sourceKey)}"${sourceOpen}><summary>来源 · ${sources.length} 条</summary><div class="sources">${sourceChips}</div></details>`
+    : `<div class="sources"><span class="sources-label">来源</span>${sourceChips}</div>`;
 }
 
 function messageHtml(message, index, live=false) {
   const assistant = message.role === 'assistant';
   const meta = message.meta || {};
   const content = message.content || '';
-  const detailKey = `trace-${meta.job_id || `message-${index}`}`;
+  const detailKey = meta.trace_key || `trace-${meta.job_id || `message-${index}`}`;
   const custom = normalizeProviderType(meta.provider_type)==='custom';
   const assistantName = custom ? 'Custom' : 'DeepSeek';
   return `<article class="message ${assistant ? 'assistant' : 'user'}${live ? ' live-message' : ''}" data-index="${index}">
     <div class="message-icon">${assistant ? (custom ? 'CU' : 'DS') : escapeHtml(((state.me && state.me.username) || 'U')[0].toUpperCase())}</div>
     <div class="message-body"><div class="message-head"><strong>${assistant ? assistantName : escapeHtml((state.me && state.me.username) || '你')}</strong></div>
-    ${assistant ? traceHtml(meta, live, detailKey) : ''}<div class="message-content">${assistant ? (content ? markdown(content, detailKey) : live ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div>${assistant && !live ? usageHtml(meta.usage || {}) : ''}<div class="message-actions"><button type="button" data-action="copy">复制</button><button type="button" data-action="retry">重新回答</button></div>
+    ${assistant ? traceHtml(meta, live, detailKey) : ''}<div class="message-content">${assistant ? (content ? markdown(content, detailKey) : live ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div>${assistant ? sourcesHtml(meta,detailKey) : ''}${assistant && !live ? usageHtml(meta.usage || {}) : ''}<div class="message-actions"><button type="button" data-action="copy">复制</button><button type="button" data-action="retry">重新回答</button></div>
     ${meta.error ? `<p class="job-error">${escapeHtml(meta.error)}</p>` : ''}</div></article>`;
 }
 
@@ -311,7 +315,7 @@ function renderMessages() {
   rememberNestedScroll($('#messages'));
   const items = [...state.messages];
   if (state.job && ['queued','running','failed','stopped'].includes(state.job.status)) {
-    items.push({role:'assistant', content:state.job.answer || '', meta:{job_id:state.job.id,provider_id:state.job.provider_id,provider_type:state.job.provider_type,model:state.job.model,reasoning:state.job.reasoning,searches:state.job.searches,sources:state.job.sources,usage:state.job.usage,error:state.job.error,stopped:state.job.status==='stopped'}, live:['queued','running'].includes(state.job.status)});
+    items.push({role:'assistant', content:state.job.answer || '', meta:{job_id:state.job.id,trace_key:state.job.trace_key,provider_id:state.job.provider_id,provider_type:state.job.provider_type,model:state.job.model,reasoning:state.job.reasoning,searches:state.job.searches,sources:state.job.sources,usage:state.job.usage,error:state.job.error,stopped:state.job.status==='stopped'}, live:['queued','running'].includes(state.job.status)});
   }
   $('#welcome').classList.toggle('hidden', items.length > 0);
   $('#messages').innerHTML = items.map((m,i)=>messageHtml(m,i,!!m.live)).join('');
@@ -328,6 +332,7 @@ function replaceJobMessage(job, liveState) {
     content: job.answer || '',
     meta: {
       job_id: job.id,
+      trace_key: job.trace_key,
       provider_id: job.provider_id,
       provider_type: job.provider_type || (selectedProvider() && selectedProvider().provider_type),
       model: job.model,
@@ -454,7 +459,8 @@ async function submitPrompt(value) {
   const model=selectedModel(); if(!model){$('#providerModal').showModal();toast('请先选择模型');return}
   if(state.job && ['queued','running'].includes(state.job.status)){toast('请先停止当前回答');return}
   $('#prompt').value='';resizePrompt();
-  state.messages.push({role:'user',content,meta:{}});state.job={status:'queued',provider_type:provider.provider_type,provider_id:provider.id,model,answer:'',reasoning:'',searches:[],sources:[],usage:{}};renderMessages();
+  const traceKey=`trace-live-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+  state.messages.push({role:'user',content,meta:{}});state.job={status:'queued',trace_key:traceKey,provider_type:provider.provider_type,provider_id:provider.id,model,answer:'',reasoning:'',searches:[],sources:[],usage:{}};renderMessages();
   $('#chatScroll').scrollTop=$('#chatScroll').scrollHeight;setRunning(true);
   try{
     const data=await api('/api/chat',{method:'POST',body:{conversation_id:(state.conversation&&state.conversation.id)||null,content,provider_id:provider.id,model,effort:$('#effort').value,timezone:browserTimezone()}});
@@ -466,7 +472,7 @@ async function submitPrompt(value) {
 
 function setRunning(on){$('#stopButton').classList.toggle('hidden',!on);$('#sendButton').disabled=on;$('#providerSelect').disabled=on}
 function stopPolling(){if(state.poll)clearTimeout(state.poll);state.poll=null}
-function startPolling(id){stopPolling();setRunning(true);const tick=async()=>{try{const job=await api(`/api/jobs/${id}`);if(job.provider_id)selectProvider(job.provider_id,false,job.model);state.job=job;if(job.status==='completed'){stopPolling();setRunning(false);finalizeLiveMessage(job);await loadHistory(1);return}if(['failed','stopped'].includes(job.status)){stopPolling();setRunning(false);renderMessages();return}updateLiveMessage()}catch(err){toast(err.message);setRunning(false);return}state.poll=setTimeout(tick,700)};tick()}
+function startPolling(id){stopPolling();setRunning(true);const traceKey=(state.job&&state.job.trace_key)||`trace-${id}`;const tick=async()=>{try{const job=await api(`/api/jobs/${id}`);job.trace_key=traceKey;if(job.provider_id)selectProvider(job.provider_id,false,job.model);state.job=job;if(job.status==='completed'){stopPolling();setRunning(false);finalizeLiveMessage(job);await loadHistory(1);return}if(['failed','stopped'].includes(job.status)){stopPolling();setRunning(false);renderMessages();return}updateLiveMessage()}catch(err){toast(err.message);setRunning(false);return}state.poll=setTimeout(tick,700)};tick()}
 
 function normalizeProviderType(value){return value==='mimo'?'custom':(value||'deepseek')}
 function isMimoModel(value){return String(value||'').toLowerCase().startsWith('mimo-')}
