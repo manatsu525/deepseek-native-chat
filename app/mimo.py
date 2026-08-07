@@ -378,9 +378,20 @@ def _canonical_url(value: Any) -> str:
 def _user_urls(messages: list[dict[str, Any]]) -> dict[str, str]:
     found: dict[str, str] = {}
     for message in messages:
-        if message.get("role") != "user" or not isinstance(message.get("content"), str):
+        if message.get("role") != "user":
             continue
-        for match in URL_PATTERN.finditer(message["content"]):
+        content = message.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = "\n".join(
+                str(item.get("text") or "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        else:
+            continue
+        for match in URL_PATTERN.finditer(text):
             raw = match.group(0).rstrip(".,!?;:，。！？；：)]}》」』")
             try:
                 found[_canonical_url(raw)] = _safe_fetch_url(raw)

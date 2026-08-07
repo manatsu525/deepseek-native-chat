@@ -27,7 +27,7 @@ if [[ ${#ADMIN_PASS} -lt 8 || $ADMIN_PASS == *$'\n'* ]]; then
 fi
 
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 python3-venv openssl ca-certificates >/dev/null
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 python3-venv openssl ca-certificates poppler-utils util-linux >/dev/null
 
 mkdir -p "$INSTALL_DIR" "$DATA_DIR/tls"
 find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name data -exec rm -rf -- {} +

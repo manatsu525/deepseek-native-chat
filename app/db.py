@@ -89,6 +89,22 @@ class Database:
                     updated_at INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS attachments (
+                    id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,
+                    job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE,
+                    draft_id TEXT NOT NULL,
+                    original_name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    media_type TEXT NOT NULL,
+                    stored_path TEXT NOT NULL,
+                    original_size INTEGER NOT NULL,
+                    processed_size INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_attachments_user_pending ON attachments(user_id, draft_id, job_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_attachments_job ON attachments(job_id);
                 """
             )
             provider_columns = {row["name"] for row in db.execute("PRAGMA table_info(providers)").fetchall()}
@@ -129,6 +145,117 @@ class Database:
         fields = ", ".join(f"{key}=?" for key in values)
         self.run(f"UPDATE jobs SET {fields} WHERE id=?", (*values.values(), job_id))
 
+    def create_attachment(
+        self,
+        attachment_id: str,
+        user_id: int,
+        draft_id: str,
+        original_name: str,
+        kind: str,
+        media_type: str,
+        stored_path: str,
+        original_size: int,
+        processed_size: int,
+        created_at: int,
+    ) -> dict[str, Any]:
+        self.run(
+            """INSERT INTO attachments(
+                   id,user_id,draft_id,original_name,kind,media_type,stored_path,
+                   original_size,processed_size,created_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (
+                attachment_id, user_id, draft_id, original_name, kind, media_type,
+                stored_path, original_size, processed_size, created_at,
+            ),
+        )
+        return self.one("SELECT * FROM attachments WHERE id=? AND user_id=?", (attachment_id, user_id)) or {}
+
+    def attachment_usage(self, user_id: int, draft_id: str) -> dict[str, int]:
+        row = self.one(
+            "SELECT COUNT(*) AS count,COALESCE(SUM(original_size),0) AS bytes FROM attachments WHERE user_id=? AND draft_id=? AND job_id IS NULL",
+            (user_id, draft_id),
+        ) or {}
+        return {"count": int(row.get("count", 0)), "bytes": int(row.get("bytes", 0))}
+
+    def pending_attachments(self, user_id: int, draft_id: str) -> list[dict[str, Any]]:
+        return self.all(
+            "SELECT * FROM attachments WHERE user_id=? AND draft_id=? AND job_id IS NULL ORDER BY created_at,id",
+            (user_id, draft_id),
+        )
+
+    def get_attachments(self, user_id: int, attachment_ids: Optional[list[str]] = None) -> list[dict[str, Any]]:
+        if attachment_ids is None:
+            return self.all("SELECT * FROM attachments WHERE user_id=? ORDER BY created_at,id", (user_id,))
+        unique_ids = list(dict.fromkeys(str(item) for item in attachment_ids))
+        if not unique_ids:
+            return []
+        placeholders = ",".join("?" for _ in unique_ids)
+        rows = self.all(
+            f"SELECT * FROM attachments WHERE user_id=? AND id IN ({placeholders}) ORDER BY created_at,id",
+            (user_id, *unique_ids),
+        )
+        by_id = {row["id"]: row for row in rows}
+        return [by_id[item] for item in unique_ids if item in by_id]
+
+    def claim_attachments(self, user_id: int, attachment_ids: list[str], conversation_id: str, job_id: str) -> bool:
+        unique_ids = list(dict.fromkeys(attachment_ids))
+        if not unique_ids:
+            return True
+        placeholders = ",".join("?" for _ in unique_ids)
+        with self.lock, self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT id FROM attachments WHERE user_id=? AND job_id IS NULL AND id IN ({placeholders})",
+                (user_id, *unique_ids),
+            ).fetchall()
+            if len(rows) != len(unique_ids):
+                return False
+            connection.execute(
+                f"UPDATE attachments SET conversation_id=?,job_id=? WHERE user_id=? AND job_id IS NULL AND id IN ({placeholders})",
+                (conversation_id, job_id, user_id, *unique_ids),
+            )
+            return True
+
+    def attachments_for_job(self, user_id: int, job_id: str) -> list[dict[str, Any]]:
+        return self.all(
+            "SELECT * FROM attachments WHERE user_id=? AND job_id=? ORDER BY created_at,id",
+            (user_id, job_id),
+        )
+
+    def delete_attachments(self, user_id: int, attachment_ids: Optional[list[str]] = None) -> list[dict[str, Any]]:
+        with self.lock, self.connect() as connection:
+            if attachment_ids is None:
+                rows = connection.execute("SELECT * FROM attachments WHERE user_id=?", (user_id,)).fetchall()
+                connection.execute("DELETE FROM attachments WHERE user_id=?", (user_id,))
+            else:
+                unique_ids = list(dict.fromkeys(str(item) for item in attachment_ids))
+                if not unique_ids:
+                    return []
+                placeholders = ",".join("?" for _ in unique_ids)
+                rows = connection.execute(
+                    f"SELECT * FROM attachments WHERE user_id=? AND id IN ({placeholders})",
+                    (user_id, *unique_ids),
+                ).fetchall()
+                connection.execute(
+                    f"DELETE FROM attachments WHERE user_id=? AND id IN ({placeholders})",
+                    (user_id, *unique_ids),
+                )
+            return [dict(row) for row in rows]
+
+    def cleanup_expired_attachments(self, cutoff: int) -> list[dict[str, Any]]:
+        with self.lock, self.connect() as connection:
+            rows = connection.execute(
+                """SELECT a.* FROM attachments a
+                   LEFT JOIN jobs j ON j.id=a.job_id
+                   WHERE a.created_at<? AND (a.job_id IS NULL OR j.status NOT IN ('queued','running'))""",
+                (cutoff,),
+            ).fetchall()
+            if rows:
+                connection.executemany("DELETE FROM attachments WHERE id=?", [(row["id"],) for row in rows])
+            return [dict(row) for row in rows]
+
+    def all_attachment_paths(self) -> set[str]:
+        return {row["stored_path"] for row in self.all("SELECT stored_path FROM attachments")}
+
     def clear_user_chats(self, user_id: int) -> tuple[int, bool]:
         """Delete one user's chat graph and compact SQLite when it is safe."""
         with self.lock:
@@ -137,6 +264,7 @@ class Database:
                 if active:
                     return 0, False
                 count = int(db.execute("SELECT COUNT(*) FROM conversations WHERE user_id=?", (user_id,)).fetchone()[0])
+                db.execute("DELETE FROM attachments WHERE user_id=?", (user_id,))
                 db.execute("DELETE FROM conversations WHERE user_id=?", (user_id,))
             # DELETE alone does not shrink a SQLite file. Keep application
             # writes paused while reclaiming both WAL and database space.

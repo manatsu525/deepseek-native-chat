@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -17,6 +18,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from . import attachments
 from .config import settings
 from .db import Database
 from .deepseek import list_models as deepseek_list_models
@@ -30,6 +32,10 @@ from .security import load_secret, make_token, password_hash, password_ok, read_
 db = Database(settings.db_path)
 secret = b""
 tasks: dict[str, asyncio.Task[Any]] = {}
+attachment_cleanup_task: Optional[asyncio.Task[Any]] = None
+attachment_upload_locks: dict[int, asyncio.Lock] = {}
+attachment_processing_lock = asyncio.Lock()
+attachment_job_lock = asyncio.Lock()
 SUPPORTED_MODELS = {
     "deepseek": {"deepseek-v4-flash"},
     # Custom providers advertise their own model IDs through /models or a
@@ -85,7 +91,8 @@ class CustomSettingsBody(BaseModel):
 
 class ChatBody(BaseModel):
     conversation_id: Optional[str] = None
-    content: str = Field(min_length=1, max_length=100_000)
+    content: str = Field(default="", max_length=100_000)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=attachments.MAX_ATTACHMENTS)
     provider_id: int
     model: str = ""
     effort: str = "high"
@@ -208,6 +215,35 @@ def public_job(row: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def public_attachment(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "name": row["original_name"],
+        "kind": row["kind"],
+        "media_type": row["media_type"],
+        "size": int(row["original_size"]),
+        "processed_size": int(row["processed_size"]),
+    }
+
+
+async def periodic_attachment_cleanup() -> None:
+    while True:
+        try:
+            expired = await asyncio.to_thread(
+                db.cleanup_expired_attachments,
+                now() - attachments.ATTACHMENT_TTL_SECONDS,
+            )
+            await asyncio.to_thread(attachments.delete_files, expired)
+            active_paths = await asyncio.to_thread(db.all_attachment_paths)
+            await asyncio.to_thread(attachments.cleanup_orphan_files, active_paths)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Cleanup is best-effort and must never take the chat service down.
+            pass
+        await asyncio.sleep(6 * 60 * 60)
+
+
 def title_for(text: str) -> str:
     compact = " ".join(text.split())
     return compact[:36] + ("…" if len(compact) > 36 else "")
@@ -217,9 +253,13 @@ async def run_job(job_id: str) -> None:
     job = db.one("SELECT * FROM jobs WHERE id=?", (job_id,))
     if not job:
         return
+    attachment_records = db.attachments_for_job(job["user_id"], job_id)
     provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (job["provider_id"], job["user_id"]))
     if not provider:
         db.update_job(job_id, status="failed", error="API 配置不存在")
+        if attachment_records:
+            deleted = db.delete_attachments(job["user_id"], [item["id"] for item in attachment_records])
+            await asyncio.to_thread(attachments.delete_files, deleted)
         return
     kind = provider_type(provider)
     history_rows = db.all(
@@ -241,6 +281,7 @@ async def run_job(job_id: str) -> None:
         history.append(message)
     db.update_job(job_id, status="running", error="", stop_requested=0)
     last_write = 0.0
+    attachment_lock_acquired = False
 
     def stopped() -> bool:
         state = db.one("SELECT stop_requested FROM jobs WHERE id=?", (job_id,))
@@ -262,6 +303,15 @@ async def run_job(job_id: str) -> None:
         )
 
     try:
+        if attachment_records:
+            await attachment_job_lock.acquire()
+            attachment_lock_acquired = True
+            history = await asyncio.to_thread(
+                attachments.build_model_messages,
+                history,
+                attachment_records,
+                kind == "custom",
+            )
         provider_settings = db.decode(provider.get("settings_json", "{}"), {})
         if kind == "custom":
             result = await custom_stream_response(
@@ -327,6 +377,11 @@ async def run_job(job_id: str) -> None:
     except Exception as exc:
         db.update_job(job_id, status="failed", error=str(exc)[:3000])
     finally:
+        if attachment_lock_acquired:
+            attachment_job_lock.release()
+        if attachment_records:
+            deleted = db.delete_attachments(job["user_id"], [item["id"] for item in attachment_records])
+            await asyncio.to_thread(attachments.delete_files, deleted)
         tasks.pop(job_id, None)
 
 
@@ -337,7 +392,7 @@ def launch(job_id: str) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global secret
+    global secret, attachment_cleanup_task
     db.init()
     secret = load_secret(settings.secret_path)
     if not db.one("SELECT id FROM users LIMIT 1"):
@@ -350,7 +405,11 @@ async def lifespan(_: FastAPI):
     for item in stale:
         db.update_job(item["id"], status="queued", stop_requested=0)
         launch(item["id"])
+    attachment_cleanup_task = asyncio.create_task(periodic_attachment_cleanup())
     yield
+    if attachment_cleanup_task:
+        attachment_cleanup_task.cancel()
+        attachment_cleanup_task = None
     for task in list(tasks.values()):
         task.cancel()
 
@@ -416,7 +475,11 @@ def delete_user(user_id: int, admin: dict[str, Any] = Depends(admin_user)) -> di
         raise HTTPException(404, "账号不存在")
     if target["is_admin"] and db.one("SELECT COUNT(*) AS n FROM users WHERE is_admin=1")["n"] <= 1:
         raise HTTPException(400, "必须保留一个管理员")
+    if db.one("SELECT id FROM jobs WHERE user_id=? AND status IN ('queued','running')", (user_id,)):
+        raise HTTPException(409, "该账号正在生成回答，请先停止后再删除")
+    attachment_records = db.get_attachments(user_id)
     db.run("DELETE FROM users WHERE id=?", (user_id,))
+    attachments.delete_files(attachment_records)
     return {"ok": True}
 
 
@@ -425,6 +488,111 @@ def change_password(user_id: int, body: PasswordBody, _: dict[str, Any] = Depend
     if not db.one("SELECT id FROM users WHERE id=?", (user_id,)):
         raise HTTPException(404, "账号不存在")
     db.run("UPDATE users SET password_hash=? WHERE id=?", (password_hash(body.password), user_id))
+    return {"ok": True}
+
+
+@app.get("/api/attachments")
+def list_pending_attachments(draft_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    if not re.fullmatch(r"[a-f0-9]{32}", draft_id):
+        raise HTTPException(400, "无效的附件草稿标识")
+    records = db.pending_attachments(user["id"], draft_id)
+    return {
+        "data": [public_attachment(record) for record in records],
+        "max_files": attachments.MAX_ATTACHMENTS,
+        "max_total_bytes": attachments.MAX_UPLOAD_BYTES,
+    }
+
+
+@app.post("/api/attachments")
+async def upload_attachment(
+    request: Request,
+    draft_id: str,
+    filename: str = "attachment",
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    if not re.fullmatch(r"[a-f0-9]{32}", draft_id):
+        raise HTTPException(400, "无效的附件草稿标识")
+    name = attachments.safe_filename(filename)
+    try:
+        declared_size = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        declared_size = 0
+    if declared_size > attachments.MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "一次消息的附件总量不能超过 50MB")
+
+    lock = attachment_upload_locks.setdefault(user["id"], asyncio.Lock())
+    async with lock:
+        usage = db.attachment_usage(user["id"], draft_id)
+        if usage["count"] >= attachments.MAX_ATTACHMENTS:
+            raise HTTPException(400, "一次消息最多上传 10 个附件")
+        remaining = attachments.MAX_UPLOAD_BYTES - usage["bytes"]
+        if remaining <= 0 or (declared_size and declared_size > remaining):
+            raise HTTPException(413, "一次消息的附件总量不能超过 50MB")
+
+        attachment_id = uuid.uuid4().hex
+        incoming = attachments.attachment_path(user["id"], f".incoming-{attachment_id}", ".upload")
+        written = 0
+        processed_record: Optional[dict[str, Any]] = None
+        try:
+            with incoming.open("wb") as output:
+                async for chunk in request.stream():
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > remaining or written > attachments.MAX_UPLOAD_BYTES:
+                        raise HTTPException(413, "一次消息的附件总量不能超过 50MB")
+                    output.write(chunk)
+            if written <= 0:
+                raise HTTPException(400, "附件内容为空")
+            os.chmod(incoming, 0o600)
+            async with attachment_processing_lock:
+                result = await asyncio.to_thread(
+                    attachments.process_upload,
+                    incoming,
+                    user["id"],
+                    attachment_id,
+                    name,
+                    request.headers.get("content-type", "application/octet-stream"),
+                )
+            processed_record = {"stored_path": str(result["stored_path"])}
+            record = db.create_attachment(
+                attachment_id,
+                user["id"],
+                draft_id,
+                name,
+                str(result["kind"]),
+                str(result["media_type"]),
+                str(result["stored_path"]),
+                written,
+                int(result["processed_size"]),
+                now(),
+            )
+            return public_attachment(record)
+        except attachments.AttachmentError as exc:
+            raise HTTPException(415, str(exc)) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            if processed_record:
+                attachments.delete_files([processed_record])
+            raise HTTPException(500, "附件保存失败") from exc
+        finally:
+            incoming.unlink(missing_ok=True)
+
+
+@app.delete("/api/attachments/{attachment_id}")
+def delete_attachment(attachment_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, bool]:
+    if not re.fullmatch(r"[a-f0-9]{32}", attachment_id):
+        raise HTTPException(400, "无效的附件标识")
+    record = db.one("SELECT * FROM attachments WHERE id=? AND user_id=?", (attachment_id, user["id"]))
+    if not record:
+        return {"ok": True}
+    if record.get("job_id"):
+        job = db.one("SELECT status FROM jobs WHERE id=? AND user_id=?", (record["job_id"], user["id"]))
+        if job and job["status"] in {"queued", "running"}:
+            raise HTTPException(409, "附件正在用于生成回答，暂时不能删除")
+    deleted = db.delete_attachments(user["id"], [attachment_id])
+    attachments.delete_files(deleted)
     return {"ok": True}
 
 
@@ -490,7 +658,7 @@ async def test_provider_credentials(kind: str, base: str, api_key: str, manual_v
         advertised = set(models)
         for model_id in manual_models:
             if model_id not in advertised:
-                await test_custom_model(base, body.api_key, model_id)
+                await test_custom_model(base, api_key, model_id)
                 manual_tested.append(model_id)
         models = list(dict.fromkeys([*models, *manual_models]))
         supported = models
@@ -624,9 +792,11 @@ def conversation(conversation_id: str, user: dict[str, Any] = Depends(current_us
 
 @app.delete("/api/conversations")
 def delete_all_conversations(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    attachment_records = db.get_attachments(user["id"])
     deleted, compacted = db.clear_user_chats(user["id"])
     if not compacted:
         raise HTTPException(409, "请先等待或停止所有正在生成的回答")
+    attachments.delete_files(attachment_records)
     return {"ok": True, "deleted": deleted, "compacted": True}
 
 
@@ -635,7 +805,14 @@ def delete_conversation(conversation_id: str, user: dict[str, Any] = Depends(cur
     active = db.one("SELECT id FROM jobs WHERE conversation_id=? AND user_id=? AND status IN ('queued','running')", (conversation_id, user["id"]))
     if active:
         raise HTTPException(409, "请先停止正在生成的回答")
+    attachment_records = db.all(
+        "SELECT * FROM attachments WHERE user_id=? AND (conversation_id=? OR (job_id IS NULL AND draft_id=?))",
+        (user["id"], conversation_id, conversation_id),
+    )
+    if attachment_records:
+        db.delete_attachments(user["id"], [item["id"] for item in attachment_records])
     db.run("DELETE FROM conversations WHERE id=? AND user_id=?", (conversation_id, user["id"]))
+    attachments.delete_files(attachment_records)
     return {"ok": True}
 
 
@@ -651,8 +828,20 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
     validate_provider_selection(kind, model, provider)
     if body.effort not in {"high", "max"}:
         raise HTTPException(400, "无效的思考深度")
+    content = body.content.strip()
+    attachment_ids = list(dict.fromkeys(body.attachment_ids))
+    if any(not re.fullmatch(r"[a-f0-9]{32}", item) for item in attachment_ids):
+        raise HTTPException(400, "无效的附件标识")
+    if not content and not attachment_ids:
+        raise HTTPException(400, "消息和附件不能同时为空")
+    attachment_records = db.get_attachments(user["id"], attachment_ids)
+    if len(attachment_records) != len(attachment_ids) or any(item.get("job_id") for item in attachment_records):
+        raise HTTPException(400, "部分附件不存在、已过期或已经发送")
+    if kind != "custom" and any(item["kind"] == "image" for item in attachment_records):
+        raise HTTPException(400, "当前 DeepSeek Responses 路由不接受图片，请改用支持视觉输入的 Custom 模型")
     timezone_name = clean_timezone(body.timezone)
     conversation_id = body.conversation_id
+    created_conversation = False
     if conversation_id:
         if not db.one("SELECT id FROM conversations WHERE id=? AND user_id=?", (conversation_id, user["id"])):
             raise HTTPException(404, "对话不存在")
@@ -660,17 +849,30 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
             raise HTTPException(409, "当前对话仍在生成回答")
     else:
         conversation_id = uuid.uuid4().hex
-        db.run("INSERT INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?)", (conversation_id, user["id"], title_for(body.content), now(), now()))
+        created_conversation = True
+        title_source = content or "、".join(item["original_name"] for item in attachment_records) or "附件对话"
+        db.run("INSERT INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?)", (conversation_id, user["id"], title_for(title_source), now(), now()))
         surplus = db.all("SELECT id FROM conversations WHERE user_id=? ORDER BY updated_at DESC LIMIT -1 OFFSET 100", (user["id"],))
         for item in surplus:
             db.run("DELETE FROM conversations WHERE id=?", (item["id"],))
-    db.run("INSERT INTO messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)", (conversation_id, "user", body.content.strip(), now()))
+    attachment_meta = [public_attachment(item) for item in attachment_records]
+    message_content = content or "请分析这些附件。"
+    message_id = db.run(
+        "INSERT INTO messages(conversation_id,role,content,meta_json,created_at) VALUES(?,?,?,?,?)",
+        (conversation_id, "user", message_content, json.dumps({"attachments": attachment_meta}, ensure_ascii=False), now()),
+    )
     db.run("UPDATE conversations SET updated_at=? WHERE id=?", (now(), conversation_id))
     job_id = uuid.uuid4().hex
     db.run(
         "INSERT INTO jobs(id,user_id,conversation_id,provider_id,provider_type,model,effort,timezone,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         (job_id, user["id"], conversation_id, body.provider_id, kind, model, body.effort, timezone_name, "queued", now(), now()),
     )
+    if attachment_ids and not db.claim_attachments(user["id"], attachment_ids, conversation_id, job_id):
+        db.run("DELETE FROM jobs WHERE id=? AND user_id=?", (job_id, user["id"]))
+        db.run("DELETE FROM messages WHERE id=? AND conversation_id=?", (message_id, conversation_id))
+        if created_conversation:
+            db.run("DELETE FROM conversations WHERE id=? AND user_id=?", (conversation_id, user["id"]))
+        raise HTTPException(409, "附件状态已变化，请重新选择后发送")
     launch(job_id)
     return {"job_id": job_id, "conversation_id": conversation_id}
 

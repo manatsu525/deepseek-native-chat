@@ -1,8 +1,10 @@
 const $ = (s, root=document) => root.querySelector(s);
 const $$ = (s, root=document) => [...root.querySelectorAll(s)];
-const state = {me:null, providers:[], conversation:null, messages:[], job:null, page:1, pages:1, poll:null, latestConversationId:null, editingProviderId:null};
+const state = {me:null, providers:[], conversation:null, messages:[], job:null, page:1, pages:1, poll:null, latestConversationId:null, editingProviderId:null, pendingAttachments:[], attachmentDraftId:null, uploadingAttachments:false};
 const detailState = new Map();
 const nestedScrollState = new Map();
+const MAX_ATTACHMENT_FILES = 10;
+const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 
 function rememberNestedScroll(root=document) {
   $$('[data-scroll-key]', root).forEach(node => nestedScrollState.set(node.dataset.scrollKey, {top:node.scrollTop, left:node.scrollLeft}));
@@ -28,6 +30,16 @@ function storeValue(name, value) {
   } catch {}
 }
 function browserTimezone(){try{return Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC'}catch{return 'UTC'}}
+function newAttachmentDraftId(){return globalThis.crypto&&globalThis.crypto.randomUUID?globalThis.crypto.randomUUID().replace(/-/g,''):`${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`.padEnd(32,'0').slice(0,32)}
+function currentAttachmentDraftId(){
+  if(state.conversation&&state.conversation.id)return state.conversation.id;
+  if(state.attachmentDraftId)return state.attachmentDraftId;
+  const saved=storedValue('attachment-draft');
+  state.attachmentDraftId=/^[a-f0-9]{32}$/.test(saved||'')?saved:newAttachmentDraftId();
+  storeValue('attachment-draft',state.attachmentDraftId);
+  return state.attachmentDraftId;
+}
+function formatBytes(value){const bytes=Number(value)||0;if(bytes<1024)return `${bytes}B`;if(bytes<1024*1024)return `${(bytes/1024).toFixed(1)}KB`;return `${(bytes/1024/1024).toFixed(1)}MB`}
 
 async function api(path, options={}) {
   const headers = {...(options.headers || {})};
@@ -44,6 +56,49 @@ async function api(path, options={}) {
 function toast(message) {
   const node = $('#toast'); node.textContent = message; node.classList.add('show');
   clearTimeout(node.timer); node.timer = setTimeout(() => node.classList.remove('show'), 2300);
+}
+
+function setAttachmentStatus(message='', bad=false){const node=$('#attachmentStatus');node.textContent=message;node.classList.toggle('bad',bad)}
+function attachmentIcon(item){return item&&item.kind==='image'?'▧':'▤'}
+function attachmentChips(items=[], removable=false){
+  return items.map(item=>`<span class="attachment-chip" title="${escapeHtml(item.name)}"><span aria-hidden="true">${attachmentIcon(item)}</span><span class="attachment-name">${escapeHtml(item.name)}</span><span>${escapeHtml(formatBytes(item.size))}</span>${removable?`<button class="attachment-remove" type="button" data-attachment-remove="${escapeHtml(item.id)}" title="移除附件" aria-label="移除附件">×</button>`:''}</span>`).join('');
+}
+function renderPendingAttachments(){
+  const tray=$('#attachmentTray');tray.innerHTML=attachmentChips(state.pendingAttachments,true);
+  $$('[data-attachment-remove]',tray).forEach(button=>button.onclick=async()=>{
+    if(state.uploadingAttachments||state.job&&['queued','running'].includes(state.job.status))return;
+    const id=button.dataset.attachmentRemove;
+    try{await api(`/api/attachments/${id}`,{method:'DELETE'})}catch(err){toast(err.message);return}
+    state.pendingAttachments=state.pendingAttachments.filter(item=>item.id!==id);renderPendingAttachments();setAttachmentStatus('');
+  });
+}
+async function loadPendingAttachments(){
+  const draftId=currentAttachmentDraftId();state.pendingAttachments=[];renderPendingAttachments();setAttachmentStatus('');
+  try{const result=await api(`/api/attachments?draft_id=${encodeURIComponent(draftId)}`);state.pendingAttachments=result.data||[];renderPendingAttachments()}catch(err){setAttachmentStatus(err.message,true)}
+}
+async function discardPendingAttachments(){
+  const items=[...state.pendingAttachments];state.pendingAttachments=[];renderPendingAttachments();setAttachmentStatus('');
+  await Promise.allSettled(items.map(item=>api(`/api/attachments/${item.id}`,{method:'DELETE'})));
+}
+async function uploadOneAttachment(file){
+  const query=new URLSearchParams({draft_id:currentAttachmentDraftId(),filename:file.name||'attachment'});
+  const response=await fetch(`/api/attachments?${query}`,{method:'POST',headers:{'Content-Type':file.type||'application/octet-stream'},body:file});
+  const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.detail||`附件上传失败 (${response.status})`);return data;
+}
+async function selectAttachments(files){
+  const list=[...files];if(!list.length)return;
+  if(state.pendingAttachments.length+list.length>MAX_ATTACHMENT_FILES){setAttachmentStatus('一次消息最多上传 10 个附件。',true);return}
+  const currentBytes=state.pendingAttachments.reduce((sum,item)=>sum+(Number(item.size)||0),0);
+  const newBytes=list.reduce((sum,item)=>sum+(Number(item.size)||0),0);
+  if(list.some(file=>file.size>MAX_ATTACHMENT_BYTES)||currentBytes+newBytes>MAX_ATTACHMENT_BYTES){setAttachmentStatus('一次消息的附件总量不能超过 50MB。',true);return}
+  state.uploadingAttachments=true;setRunning(Boolean(state.job&&['queued','running'].includes(state.job.status)));
+  try{
+    for(let index=0;index<list.length;index++){
+      setAttachmentStatus(`正在处理 ${index+1}/${list.length}：${list[index].name}`);
+      const uploaded=await uploadOneAttachment(list[index]);state.pendingAttachments.push(uploaded);renderPendingAttachments();
+    }
+    setAttachmentStatus('附件已就绪：图片会压缩发送，文档只提取有限文字。');
+  }catch(err){setAttachmentStatus(err.message,true)}finally{state.uploadingAttachments=false;setRunning(Boolean(state.job&&['queued','running'].includes(state.job.status)))}
 }
 
 function escapeHtml(value='') { return String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
@@ -300,12 +355,13 @@ function messageHtml(message, index, live=false) {
   const meta = message.meta || {};
   const content = message.content || '';
   const detailKey = meta.trace_key || `trace-${meta.job_id || `message-${index}`}`;
+  const messageAttachments = Array.isArray(meta.attachments) && meta.attachments.length ? `<div class="message-attachments">${attachmentChips(meta.attachments)}</div>` : '';
   const custom = normalizeProviderType(meta.provider_type)==='custom';
   const assistantName = custom ? 'Custom' : 'DeepSeek';
   return `<article class="message ${assistant ? 'assistant' : 'user'}${live ? ' live-message' : ''}" data-index="${index}">
     <div class="message-icon">${assistant ? (custom ? 'CU' : 'DS') : escapeHtml(((state.me && state.me.username) || 'U')[0].toUpperCase())}</div>
     <div class="message-body"><div class="message-head"><strong>${assistant ? assistantName : escapeHtml((state.me && state.me.username) || '你')}</strong></div>
-    ${assistant ? traceHtml(meta, live, detailKey) : ''}<div class="message-content">${assistant ? (content ? markdown(content, detailKey) : live ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div>${assistant ? sourcesHtml(meta,detailKey) : ''}${assistant && !live ? usageHtml(meta.usage || {}) : ''}<div class="message-actions"><button type="button" data-action="copy">复制</button><button type="button" data-action="retry">重新回答</button></div>
+    ${assistant ? traceHtml(meta, live, detailKey) : ''}${messageAttachments}<div class="message-content">${assistant ? (content ? markdown(content, detailKey) : live ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div>${assistant ? sourcesHtml(meta,detailKey) : ''}${assistant && !live ? usageHtml(meta.usage || {}) : ''}<div class="message-actions"><button type="button" data-action="copy">复制</button><button type="button" data-action="retry">重新回答</button></div>
     ${meta.error ? `<p class="job-error">${escapeHtml(meta.error)}</p>` : ''}</div></article>`;
 }
 
@@ -390,7 +446,10 @@ function wireMessageActions(items) {
     $('[data-action="retry"]', node).onclick = () => {
       let prompt = msg.role === 'user' ? msg.content : '';
       if (!prompt) for (let i=index-1;i>=0;i--) if(items[i].role==='user'){prompt=items[i].content;break}
-      if (prompt) submitPrompt(prompt);
+      if (prompt) {
+        if(Array.isArray(msg.meta&&msg.meta.attachments)&&msg.meta.attachments.length)toast('历史附件本体已清理；重新回答只会发送文字，请按需重新上传');
+        submitPrompt(prompt);
+      }
     };
     $$('.code-download', node).forEach(button => button.onclick = () => {
       const wrap = button.closest('.code-wrap');
@@ -429,7 +488,7 @@ async function clearAllHistory() {
   try{
     const result=await api('/api/conversations',{method:'DELETE'});
     stopPolling();state.conversation=null;state.messages=[];state.job=null;state.latestConversationId=null;state.page=1;state.pages=1;
-    detailState.clear();nestedScrollState.clear();storeValue('active-conversation',null);
+    state.pendingAttachments=[];state.attachmentDraftId=newAttachmentDraftId();detailState.clear();nestedScrollState.clear();storeValue('active-conversation',null);storeValue('attachment-draft',state.attachmentDraftId);renderPendingAttachments();setAttachmentStatus('');
     $('#conversationTitle').textContent='新对话';renderMessages();await loadHistory(1);closeSidebar();
     toast(`已删除 ${result.deleted} 个对话并释放本地空间`);
   }catch(err){toast(err.message);await loadHistory(state.page)}
@@ -438,10 +497,12 @@ async function clearAllHistory() {
 async function openConversation(id) {
   stopPolling();
   try {
+    if(!state.conversation&&state.pendingAttachments.length)await discardPendingAttachments();
     const data=await api(`/api/conversations/${id}`); state.conversation=data.conversation; state.messages=data.messages; state.job=data.active_job;
+    state.attachmentDraftId=null;state.pendingAttachments=[];renderPendingAttachments();setAttachmentStatus('');
     restoreProviderForConversation(data);
     storeValue('active-conversation', state.conversation.id);
-    $('#conversationTitle').textContent=state.conversation.title; renderMessages(); await loadHistory(state.page);
+    $('#conversationTitle').textContent=state.conversation.title; renderMessages(); await Promise.all([loadHistory(state.page),loadPendingAttachments()]);
     if(state.job)startPolling(state.job.id);
     return true;
   } catch(err){
@@ -451,26 +512,36 @@ async function openConversation(id) {
   return false;
 }
 
-function newConversation(){stopPolling();state.conversation=null;state.messages=[];state.job=null;storeValue('active-conversation', '__new__');$('#conversationTitle').textContent='新对话';renderMessages();loadHistory(1)}
+async function newConversation(){
+  if(!state.conversation&&state.pendingAttachments.length)await discardPendingAttachments();
+  stopPolling();state.conversation=null;state.messages=[];state.job=null;state.pendingAttachments=[];state.attachmentDraftId=newAttachmentDraftId();
+  storeValue('active-conversation','__new__');storeValue('attachment-draft',state.attachmentDraftId);$('#conversationTitle').textContent='新对话';renderPendingAttachments();setAttachmentStatus('');renderMessages();loadHistory(1);
+}
 
 async function submitPrompt(value) {
-  const content=(value == null ? $('#prompt').value : value).trim(); if(!content)return;
+  const rawContent=(value == null ? $('#prompt').value : value).trim();
+  if(!rawContent&&!state.pendingAttachments.length)return;
+  if(state.uploadingAttachments){toast('请等待附件处理完成');return}
+  const content=rawContent||'请分析这些附件。';
   const provider=selectedProvider(); if(!provider){$('#providerModal').showModal();toast('请先添加 API 配置');return}
   const model=selectedModel(); if(!model){$('#providerModal').showModal();toast('请先选择模型');return}
   if(state.job && ['queued','running'].includes(state.job.status)){toast('请先停止当前回答');return}
+  const pendingSnapshot=state.pendingAttachments.map(item=>({...item}));
+  const attachmentIds=pendingSnapshot.map(item=>item.id);
   $('#prompt').value='';resizePrompt();
   const traceKey=`trace-live-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
-  state.messages.push({role:'user',content,meta:{}});state.job={status:'queued',trace_key:traceKey,provider_type:provider.provider_type,provider_id:provider.id,model,answer:'',reasoning:'',searches:[],sources:[],usage:{}};renderMessages();
+  state.messages.push({role:'user',content,meta:{attachments:pendingSnapshot}});state.job={status:'queued',trace_key:traceKey,provider_type:provider.provider_type,provider_id:provider.id,model,answer:'',reasoning:'',searches:[],sources:[],usage:{}};renderMessages();
   $('#chatScroll').scrollTop=$('#chatScroll').scrollHeight;setRunning(true);
   try{
-    const data=await api('/api/chat',{method:'POST',body:{conversation_id:(state.conversation&&state.conversation.id)||null,content,provider_id:provider.id,model,effort:$('#effort').value,timezone:browserTimezone()}});
+    const data=await api('/api/chat',{method:'POST',body:{conversation_id:(state.conversation&&state.conversation.id)||null,content,attachment_ids:attachmentIds,provider_id:provider.id,model,effort:$('#effort').value,timezone:browserTimezone()}});
     if(!state.conversation)state.conversation={id:data.conversation_id,title:content.slice(0,36)};
+    state.pendingAttachments=[];state.attachmentDraftId=null;storeValue('attachment-draft',null);renderPendingAttachments();setAttachmentStatus('');
     storeValue('active-conversation', state.conversation.id);
     state.job.id=data.job_id;$('#conversationTitle').textContent=state.conversation.title;loadHistory(1);startPolling(data.job_id);
-  }catch(err){state.messages.pop();state.job=null;setRunning(false);renderMessages();toast(err.message)}
+  }catch(err){state.messages.pop();state.job=null;$('#prompt').value=rawContent;resizePrompt();setRunning(false);renderMessages();toast(err.message)}
 }
 
-function setRunning(on){$('#stopButton').classList.toggle('hidden',!on);$('#sendButton').disabled=on;$('#providerSelect').disabled=on}
+function setRunning(on){$('#stopButton').classList.toggle('hidden',!on);$('#sendButton').disabled=on||state.uploadingAttachments;$('#attachButton').disabled=on||state.uploadingAttachments;$('#providerSelect').disabled=on}
 function stopPolling(){if(state.poll)clearTimeout(state.poll);state.poll=null}
 function startPolling(id){stopPolling();setRunning(true);const traceKey=(state.job&&state.job.trace_key)||`trace-${id}`;const tick=async()=>{try{const job=await api(`/api/jobs/${id}`);job.trace_key=traceKey;if(job.provider_id)selectProvider(job.provider_id,false,job.model);state.job=job;if(job.status==='completed'){stopPolling();setRunning(false);finalizeLiveMessage(job);await loadHistory(1);return}if(['failed','stopped'].includes(job.status)){stopPolling();setRunning(false);renderMessages();return}updateLiveMessage()}catch(err){toast(err.message);setRunning(false);return}state.poll=setTimeout(tick,700)};tick()}
 
@@ -625,7 +696,7 @@ async function loadUsers(){const users=await api('/api/users');$('#userList').in
 function resizePrompt(){const p=$('#prompt');p.style.height='auto';p.style.height=Math.min(p.scrollHeight,180)+'px'}
 function openSidebar(){$('#sidebar').classList.add('open')}function closeSidebar(){$('#sidebar').classList.remove('open')}
 
-async function boot(){try{state.me=await api('/api/me');$('#loginView').classList.add('hidden');$('#appView').classList.remove('hidden');$('#accountName').textContent=state.me.username;$('#accountRole').textContent=state.me.is_admin?'管理员':'用户';$('#avatar').textContent=state.me.username[0].toUpperCase();$('#usersButton').classList.toggle('hidden',!state.me.is_admin);await Promise.all([loadProviders(),loadHistory(1)]);const stored=storedValue('active-conversation');const activeId=stored==='__new__'?null:(stored||state.latestConversationId);const restored=activeId?await openConversation(activeId):false;if(!restored)renderMessages()}catch{$('#loginView').classList.remove('hidden');$('#appView').classList.add('hidden')}}
+async function boot(){try{state.me=await api('/api/me');$('#loginView').classList.add('hidden');$('#appView').classList.remove('hidden');$('#accountName').textContent=state.me.username;$('#accountRole').textContent=state.me.is_admin?'管理员':'用户';$('#avatar').textContent=state.me.username[0].toUpperCase();$('#usersButton').classList.toggle('hidden',!state.me.is_admin);await Promise.all([loadProviders(),loadHistory(1)]);const stored=storedValue('active-conversation');const activeId=stored==='__new__'?null:(stored||state.latestConversationId);const restored=activeId?await openConversation(activeId):false;if(!restored){renderMessages();await loadPendingAttachments()}}catch{$('#loginView').classList.remove('hidden');$('#appView').classList.add('hidden')}}
 
 $('#loginForm').onsubmit=async e=>{e.preventDefault();$('#loginError').textContent='';try{await api('/api/login',{method:'POST',body:{username:$('#loginUser').value,password:$('#loginPass').value}});await boot()}catch(err){$('#loginError').textContent=err.message}};
 $('#logout').onclick=async()=>{await api('/api/logout',{method:'POST'});location.reload()};
@@ -633,6 +704,8 @@ $('#newChat').onclick=()=>{newConversation();closeSidebar()};$('#composer').onsu
 $('#clearHistory').onclick=clearAllHistory;
 // Enter always inserts a newline. Sending is explicit via the send button.
 $('#prompt').oninput=resizePrompt;
+$('#attachButton').onclick=()=>{if(!state.uploadingAttachments&&!(state.job&&['queued','running'].includes(state.job.status)))$('#fileInput').click()};
+$('#fileInput').onchange=async event=>{const files=[...(event.target.files||[])];event.target.value='';await selectAttachments(files)};
 $('#stopButton').onclick=async()=>{if(state.job&&state.job.id){await api(`/api/jobs/${state.job.id}/stop`,{method:'POST'});toast('正在停止')}};
 $('#providerButton').onclick=()=>{resetProviderEditor();$('#providerModal').showModal();renderProviderList()};$('#usersButton').onclick=()=>{loadUsers();$('#usersModal').showModal()};
 $('#customSettingsButton').onclick=openCustomSettings;$('#providerSelect').onchange=()=>{const provider=selectedProvider();if(provider){storeValue('active-provider',provider.id);storeValue('active-model',selectedModel())}updateProviderUi()};$('#providerType').onchange=syncProviderForm;$('#customThinking').onchange=syncCustomThinkingFields;$('#customReasoningEffortEnabled').onchange=syncCustomThinkingFields;$('#customWebToolBackend').onchange=syncCustomToolFields;$('#customModelFilter').oninput=e=>{const value=e.target.value.trim().toLowerCase();$$('.custom-model-option',$('#customModelList')).forEach(item=>item.dataset.hidden=value&&!item.dataset.model.includes(value)?'1':'0')};

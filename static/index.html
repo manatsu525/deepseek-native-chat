@@ -120,9 +120,17 @@
 
       <footer class="composer-wrap">
         <form id="composer" class="composer">
-          <textarea id="prompt" rows="1" maxlength="100000" placeholder="输入问题，Enter 发送，Shift + Enter 换行"></textarea>
+          <div id="attachmentTray" class="attachment-tray"></div>
+          <textarea id="prompt" rows="1" maxlength="100000" placeholder="输入问题，回车换行，点击箭头发送"></textarea>
+          <div id="attachmentStatus" class="attachment-status"></div>
           <div class="composer-foot">
-            <div class="model-line"><span id="nativePill" class="native-pill">● Native Web</span><select id="providerSelect"><option value="">请先添加 API</option></select></div>
+            <div class="model-line">
+              <button id="attachButton" class="attach-button" type="button" title="上传图片或文件" aria-label="上传图片或文件">
+                <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.4 11.6 12 21a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 1 1 5.7 5.7l-9.2 9.2a2 2 0 1 1-2.9-2.8l8.6-8.6"></path></svg>
+              </button>
+              <input id="fileInput" class="hidden" type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,image/bmp,.pdf,.docx,.xlsx,.txt,.md,.markdown,.csv,.tsv,.json,.jsonl,.xml,.yaml,.yml,.log,.ini,.cfg,.conf,.py,.js,.ts,.jsx,.tsx,.html,.htm,.css,.scss,.sql,.sh,.java,.kt,.c,.h,.cpp,.hpp,.cs,.go,.rs,.rb,.php,.swift,.vue,.svelte">
+              <span id="nativePill" class="native-pill">● Native Web</span><select id="providerSelect"><option value="">请先添加 API</option></select>
+            </div>
             <div class="send-actions">
               <button id="stopButton" class="stop hidden" type="button">■ 停止</button>
               <button id="sendButton" class="send" type="submit" aria-label="发送">↑</button>
