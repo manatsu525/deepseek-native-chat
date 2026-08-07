@@ -68,6 +68,12 @@ class ProviderBody(BaseModel):
     custom_settings: Optional[dict[str, Any]] = None
 
 
+class ProviderModelsBody(BaseModel):
+    model: str = ""
+    selected_models: list[str] = Field(default_factory=list, max_length=500)
+    manual_models: Optional[list[str]] = Field(default=None, max_length=500)
+
+
 class CustomSettingsBody(BaseModel):
     thinking: Literal["enabled", "disabled"] = "enabled"
     reasoning_effort_enabled: bool = True
@@ -464,16 +470,13 @@ async def test_custom_model(base_url: str, api_key: str, model: str) -> None:
         raise HTTPException(400, detail)
 
 
-@app.post("/api/providers/test")
-async def test_provider(body: ProviderBody, _: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    kind = body.provider_type
-    base = clean_base_url(body.base_url or DEFAULT_BASE_URLS[kind])
+async def test_provider_credentials(kind: str, base: str, api_key: str, manual_values: Any) -> dict[str, Any]:
     # The current UI sends checkbox selections separately from manually typed
     # names. Fall back to selected_models for older clients.
-    manual_models = _clean_model_ids(body.manual_models if body.manual_models is not None else body.selected_models)
+    manual_models = _clean_model_ids(manual_values)
     manual_tested: list[str] = []
     try:
-        models = await (custom_list_models(base, body.api_key) if kind == "custom" else deepseek_list_models(base, body.api_key))
+        models = await (custom_list_models(base, api_key) if kind == "custom" else deepseek_list_models(base, api_key))
     except Exception as exc:
         if kind != "custom" or not manual_models:
             raise HTTPException(400, f"API 测试失败：{exc}") from exc
@@ -504,6 +507,14 @@ async def test_provider(body: ProviderBody, _: dict[str, Any] = Depends(current_
     }
 
 
+@app.post("/api/providers/test")
+async def test_provider(body: ProviderBody, _: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    kind = body.provider_type
+    base = clean_base_url(body.base_url or DEFAULT_BASE_URLS[kind])
+    manual_values = body.manual_models if body.manual_models is not None else body.selected_models
+    return await test_provider_credentials(kind, base, body.api_key, manual_values)
+
+
 @app.post("/api/providers")
 def add_provider(body: ProviderBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     kind = body.provider_type
@@ -527,6 +538,44 @@ def add_provider(body: ProviderBody, user: dict[str, Any] = Depends(current_user
         (user["id"], body.name.strip(), body.api_key.strip(), base, model, kind, settings_json, now()),
     )
     return public_provider(db.one("SELECT * FROM providers WHERE id=?", (provider_id,)))
+
+
+@app.post("/api/providers/{provider_id}/test")
+async def test_saved_provider(provider_id: int, body: ProviderModelsBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"]))
+    if not provider:
+        raise HTTPException(404, "API 配置不存在")
+    kind = provider_type(provider)
+    manual_values = body.manual_models if body.manual_models is not None else body.selected_models
+    return await test_provider_credentials(kind, provider["base_url"], provider["api_key"], manual_values)
+
+
+@app.put("/api/providers/{provider_id}/models")
+def update_provider_models(provider_id: int, body: ProviderModelsBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"]))
+    if not provider:
+        raise HTTPException(404, "API 配置不存在")
+    kind = provider_type(provider)
+    selected_models = _clean_model_ids(body.selected_models)
+    if kind == "custom":
+        model = body.model.strip() or (selected_models[0] if selected_models else "")
+        if model and model not in selected_models:
+            selected_models.insert(0, model)
+        if not selected_models:
+            raise HTTPException(400, "请至少选择或填写一个 custom 模型")
+    else:
+        model = body.model.strip() or "deepseek-v4-flash"
+        selected_models = [model]
+    validate_provider_selection(kind, model)
+    settings_value = db.decode(provider.get("settings_json", "{}"), {})
+    if not isinstance(settings_value, dict):
+        settings_value = {}
+    settings_value["models"] = selected_models
+    db.run(
+        "UPDATE providers SET model=?,settings_json=? WHERE id=? AND user_id=?",
+        (model, json.dumps(settings_value, ensure_ascii=False), provider_id, user["id"]),
+    )
+    return public_provider(db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"])))
 
 
 @app.delete("/api/providers/{provider_id}")

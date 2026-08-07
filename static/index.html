@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="/assets/vendor/katex/katex.min.css">
   <link rel="stylesheet" href="/assets/style.css">
   <style>
-    .item-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+    .item-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.item-actions .soft-btn{min-height:0;padding:7px 9px;font-size:12px}
     .code-actions{display:flex;align-items:center;gap:5px}.code-tool{display:grid;place-items:center;width:28px;height:26px;padding:4px;border:0;border-radius:7px;background:#ffffff10;color:#d5ddeb}.code-tool:hover{background:#ffffff20;color:#fff}.code-tool svg{width:16px;height:16px;stroke-linecap:round;stroke-linejoin:round}
     .history-title-actions{display:flex;align-items:center;gap:7px}.history-title-actions button{border:0;background:transparent;color:#7f8ca5;padding:1px 3px;font-size:10px;font-weight:700}.history-title-actions button:hover{color:#e48b8b}.history-title-actions button:disabled{visibility:hidden}
     @media (prefers-color-scheme:dark){.message-content table{background:#192130;color:#e8edf6}.message-content th{background:#28354a;color:#fff}.message-content td{color:#e8edf6;border-color:#3a4658}}
@@ -135,7 +135,7 @@
   </div>
 
   <dialog id="providerModal" class="modal">
-    <div class="modal-head"><div><p class="eyebrow">CONNECTIONS</p><h3>模型 API</h3></div><button class="icon-btn close-modal">×</button></div>
+    <div class="modal-head"><div><p class="eyebrow">CONNECTIONS</p><h3 id="providerModalTitle">模型 API</h3></div><button class="icon-btn close-modal">×</button></div>
     <div id="providerList" class="item-list"></div>
     <form id="providerForm" class="form-grid">
       <label>配置名称<input id="providerName" placeholder="例如：我的 DeepSeek" required></label>
@@ -151,7 +151,7 @@
         <input id="customModelFilter" class="custom-model-filter" placeholder="筛选模型名称…">
         <div id="customModelList" class="custom-model-list"><p class="custom-model-empty">测试 API 后显示可勾选模型。</p></div>
       </div>
-      <div class="wide form-actions"><button id="testProvider" class="soft-btn" type="button">测试并读取模型</button><button class="primary" type="submit">保存 API</button></div>
+      <div class="wide form-actions"><button id="cancelProviderEdit" class="soft-btn hidden" type="button">取消编辑</button><button id="testProvider" class="soft-btn" type="button">测试并读取模型</button><button id="providerSubmit" class="primary" type="submit">保存 API</button></div>
       <p id="providerStatus" class="wide muted"></p>
     </form>
   </dialog>

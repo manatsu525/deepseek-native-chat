@@ -1,6 +1,6 @@
 const $ = (s, root=document) => root.querySelector(s);
 const $$ = (s, root=document) => [...root.querySelectorAll(s)];
-const state = {me:null, providers:[], conversation:null, messages:[], job:null, page:1, pages:1, poll:null, latestConversationId:null};
+const state = {me:null, providers:[], conversation:null, messages:[], job:null, page:1, pages:1, poll:null, latestConversationId:null, editingProviderId:null};
 const detailState = new Map();
 const nestedScrollState = new Map();
 
@@ -529,8 +529,9 @@ async function loadProviders(){
   renderProviderList(); updateProviderUi();
 }
 function renderProviderList(){
-  $('#providerList').innerHTML=state.providers.map(p=>`<div class="list-item"><div class="list-item-main"><strong>${escapeHtml(p.name)} <span class="provider-kind">${providerLabel(p)}</span></strong><small>${escapeHtml(p.api_key_masked)} · ${escapeHtml(providerModels(p).join('、'))}</small></div><button class="danger-btn" data-id="${p.id}">删除</button></div>`).join('')||'<p class="muted">尚未添加 API。</p>';
-  $$('.danger-btn',$('#providerList')).forEach(b=>b.onclick=async()=>{if(!confirm('删除这个 API 配置？'))return;try{await api(`/api/providers/${b.dataset.id}`,{method:'DELETE'});await loadProviders()}catch(err){toast(err.message)}})
+  $('#providerList').innerHTML=state.providers.map(p=>`<div class="list-item"><div class="list-item-main"><strong>${escapeHtml(p.name)} <span class="provider-kind">${providerLabel(p)}</span></strong><small>${escapeHtml(p.api_key_masked)} · ${escapeHtml(providerModels(p).join('、'))}</small></div><div class="item-actions"><button class="soft-btn" data-provider-edit="${p.id}">编辑模型</button><button class="danger-btn" data-provider-delete="${p.id}">删除</button></div></div>`).join('')||'<p class="muted">尚未添加 API。</p>';
+  $$('[data-provider-edit]',$('#providerList')).forEach(b=>b.onclick=()=>editProviderModels(b.dataset.providerEdit));
+  $$('[data-provider-delete]',$('#providerList')).forEach(b=>b.onclick=async()=>{if(!confirm('删除这个 API 配置？'))return;try{await api(`/api/providers/${b.dataset.providerDelete}`,{method:'DELETE'});if(String(state.editingProviderId)===String(b.dataset.providerDelete))resetProviderEditor();await loadProviders()}catch(err){toast(err.message)}})
 }
 
 function providerType(){return $('#providerType').value||'deepseek'}
@@ -553,13 +554,41 @@ function syncProviderForm(){
   if(!custom)renderCustomModels([],[]);
   $('#providerStatus').textContent='';
 }
+function resetProviderEditor(){
+  state.editingProviderId=null;
+  $('#providerForm').reset();
+  $('#providerName').disabled=false;$('#providerType').disabled=false;$('#providerKey').disabled=false;$('#providerKey').required=true;$('#providerBase').disabled=false;
+  $('#providerKey').placeholder='输入对应服务商 API Key';
+  $('#providerModalTitle').textContent='模型 API';$('#providerSubmit').textContent='保存 API';$('#cancelProviderEdit').classList.add('hidden');
+  $('#providerType').value='deepseek';syncProviderForm();$('#providerKey').value='';$('#manualModel').value='';renderCustomModels([],[]);$('#providerStatus').textContent='';
+}
+function editProviderModels(providerId){
+  const provider=state.providers.find(item=>String(item.id)===String(providerId));if(!provider)return;
+  resetProviderEditor();state.editingProviderId=provider.id;
+  $('#providerType').value=normalizeProviderType(provider.provider_type);syncProviderForm();
+  $('#providerName').value=provider.name;$('#providerBase').value=provider.base_url;$('#providerKey').value='';
+  $('#providerName').disabled=true;$('#providerType').disabled=true;$('#providerKey').disabled=true;$('#providerKey').required=false;$('#providerBase').disabled=true;
+  $('#providerKey').placeholder=`沿用已保存密钥 ${provider.api_key_masked}`;
+  $('#providerModalTitle').textContent='编辑 API 模型';$('#providerSubmit').textContent='保存模型';$('#cancelProviderEdit').classList.remove('hidden');
+  if(normalizeProviderType(provider.provider_type)==='custom'){
+    const models=providerModels(provider);renderCustomModels(models,models);$('#manualModel').value='';
+  }else{$('#providerModel').value=provider.model||'deepseek-v4-flash'}
+  $('#providerStatus').textContent='连接信息和密钥保持不变；可重新测试模型列表、调整勾选或补充手填模型。';
+  $('#providerForm').scrollIntoView({behavior:'smooth',block:'start'});
+}
 async function testProvider(){
   const button=$('#testProvider');button.disabled=true;$('#providerStatus').textContent=`正在连接 ${providerType()==='custom'?'Custom':'DeepSeek'}…`;
   try{
-    const body=providerFormData();const result=await api('/api/providers/test',{method:'POST',body});
+    const editing=state.providers.find(item=>String(item.id)===String(state.editingProviderId));
+    const before=checkedCustomModels();
+    const body=providerFormData();
+    const result=editing
+      ? await api(`/api/providers/${editing.id}/test`,{method:'POST',body:{manual_models:manualModelList()}})
+      : await api('/api/providers/test',{method:'POST',body});
     if(providerType()==='custom'){
-      const selected=[...new Set([...checkedCustomModels(),...manualModelList()])];
-      renderCustomModels(result.models||[],selected.length?selected:(result.models||[]).slice(0,1));
+      const selected=[...new Set([...before,...manualModelList()])];
+      const available=[...new Set([...(result.models||[]),...(editing?providerModels(editing):[]),...manualModelList()])];
+      renderCustomModels(available,selected.length?selected:(editing?providerModels(editing):available.slice(0,1)));
       $('#providerStatus').textContent=`连接成功，读取 ${(result.models||[]).length} 个模型${(result.manual_tested||[]).length?`，手填模型验证 ${result.manual_tested.length} 个`:''}${result.models_warning?'（/models 不可用，已使用手填模型验证）':''}。请勾选后保存。`;
     }else{
       $('#providerModel').value='deepseek-v4-flash';
@@ -599,10 +628,10 @@ $('#clearHistory').onclick=clearAllHistory;
 // Enter always inserts a newline. Sending is explicit via the send button.
 $('#prompt').oninput=resizePrompt;
 $('#stopButton').onclick=async()=>{if(state.job&&state.job.id){await api(`/api/jobs/${state.job.id}/stop`,{method:'POST'});toast('正在停止')}};
-$('#providerButton').onclick=()=>{$('#providerModal').showModal();renderProviderList()};$('#usersButton').onclick=()=>{loadUsers();$('#usersModal').showModal()};
+$('#providerButton').onclick=()=>{resetProviderEditor();$('#providerModal').showModal();renderProviderList()};$('#usersButton').onclick=()=>{loadUsers();$('#usersModal').showModal()};
 $('#customSettingsButton').onclick=openCustomSettings;$('#providerSelect').onchange=()=>{const provider=selectedProvider();if(provider){storeValue('active-provider',provider.id);storeValue('active-model',selectedModel())}updateProviderUi()};$('#providerType').onchange=syncProviderForm;$('#customThinking').onchange=syncCustomThinkingFields;$('#customReasoningEffortEnabled').onchange=syncCustomThinkingFields;$('#customWebToolBackend').onchange=syncCustomToolFields;$('#customModelFilter').oninput=e=>{const value=e.target.value.trim().toLowerCase();$$('.custom-model-option',$('#customModelList')).forEach(item=>item.dataset.hidden=value&&!item.dataset.model.includes(value)?'1':'0')};
 $$('.close-modal').forEach(b=>b.onclick=()=>b.closest('dialog').close());$$('dialog').forEach(d=>d.onclick=e=>{if(e.target===d)d.close()});
-$('#testProvider').onclick=testProvider;$('#providerForm').onsubmit=async e=>{e.preventDefault();try{const body=providerFormData();await api('/api/providers',{method:'POST',body});e.target.reset();$('#providerType').value='deepseek';syncProviderForm();$('#providerKey').value='';$('#manualModel').value='';renderCustomModels([],[]);$('#providerStatus').textContent='';await loadProviders();toast('API 已保存')}catch(err){$('#providerStatus').textContent=err.message}};
+$('#testProvider').onclick=testProvider;$('#cancelProviderEdit').onclick=resetProviderEditor;$('#providerForm').onsubmit=async e=>{e.preventDefault();try{const body=providerFormData();if(state.editingProviderId){await api(`/api/providers/${state.editingProviderId}/models`,{method:'PUT',body:{model:body.model,selected_models:body.selected_models,manual_models:body.manual_models}});resetProviderEditor();await loadProviders();toast('模型列表已更新')}else{await api('/api/providers',{method:'POST',body});resetProviderEditor();await loadProviders();toast('API 已保存')}}catch(err){$('#providerStatus').textContent=err.message}};
 $('#customForm').onsubmit=saveCustomSettings;
 $('#userForm').onsubmit=async e=>{e.preventDefault();try{await api('/api/users',{method:'POST',body:{username:$('#newUsername').value,password:$('#newPassword').value,is_admin:$('#newAdmin').checked}});e.target.reset();await loadUsers();toast('账号已新增')}catch(err){toast(err.message)}};
 $('#passwordForm').onsubmit=async e=>{e.preventDefault();const password=$('#changePassword').value;if(password!==$('#changePasswordAgain').value){$('#passwordError').textContent='两次输入的密码不一致';return}try{await api(`/api/users/${$('#passwordUserId').value}/password`,{method:'PUT',body:{password}});$('#passwordModal').close();toast('密码已修改')}catch(err){$('#passwordError').textContent=err.message}};

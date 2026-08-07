@@ -15,7 +15,7 @@
 - 每账号最多保留 100 个对话，历史每页显示 10 个
 - 最多 3 个账号，管理员可在前端新增或删除账号
 - 各账号的对话和 API 配置相互隔离
-- 前端测试 API、读取 `/models` 全部模型并勾选、手动填写模型名、删除 API
+- 前端测试 API、读取 `/models` 全部模型并勾选、手动填写模型名、重新编辑已保存 API 的模型列表、删除 API
 - Custom 参数：所有模型均可开关 `thinking`，可独立开关 `reasoning_effort` 并使用顶部 High/Max，另有普通采样参数、默认 65,536 的生成上限和联网方案切换
 - Custom 按需网页读取：默认调用免费的 Parallel Search MCP 搜索/提取，也可切换到 Jina Reader 备用方案，均无需额外 API Key
 - SQLite 单文件数据库、自签 HTTPS、systemd 守护
