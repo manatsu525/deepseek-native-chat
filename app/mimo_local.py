@@ -45,10 +45,6 @@ from .mimo import (
 from .parallel_mcp import ParallelMCPClient
 
 
-class UnapprovedSourceError(ValueError):
-    pass
-
-
 class ToolQuotaExceeded(RuntimeError):
     pass
 
@@ -71,7 +67,7 @@ def _tool_quota_message(
     tool_rounds_used: int,
     search_count: int,
     fetch_count: int,
-    fetch_has_eligible_url: bool,
+    fetch_available: bool,
 ) -> str:
     """Explain a per-tool limit without implying that every tool is exhausted."""
     total_left = max(0, MIMO_MAX_TOOL_ROUNDS - tool_rounds_used)
@@ -89,7 +85,7 @@ def _tool_quota_message(
         )
 
     if exhausted_tool == "web_search":
-        if fetch_left > 0 and fetch_has_eligible_url:
+        if fetch_left > 0 and fetch_available:
             return (
                 f"web_search 已达到上限（最多 {MIMO_MAX_SEARCHES} 次），本回答中禁止再次搜索或重试搜索。"
                 "fetch_webpage 仍然可用；如果已有搜索结果中的真实内容页需要进一步核实，可继续读取，"
@@ -212,8 +208,9 @@ async def stream_response(
     """Run a custom OpenAI-compatible model with local web tools.
 
     Provider-native search is deliberately not sent here. Keeping search as a
-    normal function tool makes it visible to any compatible model and lets the
-    backend enforce the search -> source URL -> reader provenance chain.
+    normal function tool makes it visible to any compatible model. URL scheme
+    and private-network safety remain enforced, while source selection is left
+    to the model instead of requiring an exact search-result URL match.
     """
     config = _settings(settings)
     parallel_mode = config.get("web_tool_backend") == "parallel"
@@ -233,9 +230,9 @@ async def stream_response(
     fetch_count = 0
     tool_rounds_used = 0
     searched_queries: set[str] = set()
-    allowed_urls = _user_urls(messages)
+    known_urls = _user_urls(messages)
     attempted_urls: set[str] = set()
-    reader_enabled = bool(allowed_urls)
+    reader_enabled = bool(known_urls)
     final_answer_attempts = 0
     force_final_answer = False
     parallel_session_id = (f"conversation_{conversation_id}" if conversation_id else f"response_{uuid.uuid4().hex}")[:100]
@@ -270,7 +267,7 @@ async def stream_response(
             if not force_final_answer:
                 if tool_rounds_used < MIMO_MAX_TOOL_ROUNDS and search_count < MIMO_MAX_SEARCHES:
                     round_tools.append(PARALLEL_SEARCH_WEB_TOOL if parallel_mode else SEARCH_WEB_TOOL)
-                if tool_rounds_used < MIMO_MAX_TOOL_ROUNDS and reader_enabled and allowed_urls:
+                if tool_rounds_used < MIMO_MAX_TOOL_ROUNDS and reader_enabled:
                     round_tools.append(PARALLEL_FETCH_WEBPAGE_TOOL if parallel_mode else FETCH_WEBPAGE_TOOL)
             final_answer_only = force_final_answer or not round_tools
             mimo_model = is_mimo_model(model)
@@ -446,7 +443,7 @@ async def stream_response(
                             tool_rounds_used=tool_rounds_used,
                             search_count=search_count,
                             fetch_count=fetch_count,
-                            fetch_has_eligible_url=reader_enabled and bool(allowed_urls),
+                            fetch_available=reader_enabled,
                         )
                     )
                 if name == "fetch_webpage" and fetch_count >= JINA_MAX_FETCHES_PER_RESPONSE:
@@ -457,7 +454,7 @@ async def stream_response(
                             tool_rounds_used=tool_rounds_used,
                             search_count=search_count,
                             fetch_count=fetch_count,
-                            fetch_has_eligible_url=False,
+                            fetch_available=False,
                         )
                     )
                 arguments = json.loads(str(function.get("arguments") or "{}"))
@@ -519,7 +516,7 @@ async def stream_response(
                                 canonical = _canonical_url(item["url"])
                             except (KeyError, ValueError):
                                 continue
-                            allowed_urls[canonical] = item["url"]
+                            known_urls[canonical] = item["url"]
                             sources.setdefault(
                                 item["url"],
                                 {
@@ -531,7 +528,7 @@ async def stream_response(
                                     "logo_url": "",
                                 },
                             )
-                        reader_enabled = bool(allowed_urls)
+                        reader_enabled = bool(known_urls)
                         result_text = json.dumps(
                             {
                                 "objective": objective if parallel_mode else query,
@@ -546,12 +543,6 @@ async def stream_response(
                     target_url = _safe_fetch_url(arguments.get("url"))
                     step["url"] = target_url
                     canonical = _canonical_url(target_url)
-                    if canonical not in allowed_urls:
-                        reader_enabled = False
-                        source_name = "Parallel 搜索结果" if parallel_mode else "DuckDuckGo 搜索结果"
-                        raise UnapprovedSourceError(f"该 URL 不在用户链接或{source_name}中；先调用 web_search，不能把搜索页交给读取器")
-                    target_url = allowed_urls[canonical]
-                    step["url"] = target_url
                     if canonical in attempted_urls:
                         step["status"] = "skipped"
                         result_text = f"该网页本回答已经尝试过，不重复请求：{target_url}。请使用已有结果或选择其他来源。"
@@ -601,11 +592,9 @@ async def stream_response(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                step["status"] = "rejected" if isinstance(exc, UnapprovedSourceError) else "failed"
+                step["status"] = "failed"
                 step["error"] = str(exc)[:1000]
-                if isinstance(exc, UnapprovedSourceError):
-                    result_text = f"网页读取工具未执行：{str(exc)[:1000]}。请先使用 web_search 获取真实内容页 URL。"
-                elif isinstance(exc, ToolQuotaExceeded):
+                if isinstance(exc, ToolQuotaExceeded):
                     result_text = str(exc)[:1000]
                 elif is_search:
                     engine = "Parallel Search MCP" if parallel_mode else "DuckDuckGo"
