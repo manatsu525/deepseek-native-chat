@@ -65,6 +65,54 @@ FINAL_ANSWER_PROMPT = (
 )
 
 
+def _tool_quota_message(
+    exhausted_tool: str,
+    *,
+    tool_rounds_used: int,
+    search_count: int,
+    fetch_count: int,
+    fetch_has_eligible_url: bool,
+) -> str:
+    """Explain a per-tool limit without implying that every tool is exhausted."""
+    total_left = max(0, MIMO_MAX_TOOL_ROUNDS - tool_rounds_used)
+    search_left = max(0, MIMO_MAX_SEARCHES - search_count)
+    fetch_left = max(0, JINA_MAX_FETCHES_PER_RESPONSE - fetch_count)
+    status = (
+        f"当前剩余额度：搜索 {search_left} 次，网页读取 {fetch_left} 次，"
+        f"总工具轮次 {total_left} 次。"
+    )
+
+    if total_left <= 0:
+        return (
+            f"总工具调用轮次已达到上限（最多 {MIMO_MAX_TOOL_ROUNDS} 次），搜索和网页读取均不可再调用；"
+            f"必须立即根据已有资料回答原问题。{status}"
+        )
+
+    if exhausted_tool == "web_search":
+        if fetch_left > 0 and fetch_has_eligible_url:
+            return (
+                f"web_search 已达到上限（最多 {MIMO_MAX_SEARCHES} 次），本回答中禁止再次搜索或重试搜索。"
+                "fetch_webpage 仍然可用；如果已有搜索结果中的真实内容页需要进一步核实，可继续读取，"
+                f"资料已经足够时也可以直接回答。{status}"
+            )
+        return (
+            f"web_search 已达到上限（最多 {MIMO_MAX_SEARCHES} 次），本回答中禁止再次搜索或重试搜索。"
+            "当前没有可供 fetch_webpage 读取的合法内容页，因此已经没有实际可用的联网工具；"
+            f"请根据已有资料回答原问题，并明确说明证据不足之处。{status}"
+        )
+
+    if search_left > 0:
+        return (
+            f"fetch_webpage 已达到上限（最多 {JINA_MAX_FETCHES_PER_RESPONSE} 次），本回答中禁止再次读取或重试读取。"
+            "web_search 仍然可用；如果还缺少资料，可换用搜索获取补充结果，"
+            f"资料已经足够时也可以直接回答。{status}"
+        )
+    return (
+        f"fetch_webpage 已达到上限（最多 {JINA_MAX_FETCHES_PER_RESPONSE} 次），且 web_search 也没有剩余额度；"
+        f"已经没有实际可用的联网工具，请立即根据已有资料回答原问题。{status}"
+    )
+
+
 class _AsyncNullContext:
     """Python 3.9-compatible async equivalent of contextlib.nullcontext."""
 
@@ -393,12 +441,24 @@ async def stream_response(
                 # tell it to stop using that tool instead of inviting a retry.
                 if is_search and search_count >= MIMO_MAX_SEARCHES:
                     raise ToolQuotaExceeded(
-                        f"搜索次数已达到上限（最多 {MIMO_MAX_SEARCHES} 次），禁止再次搜索或重试；请立即根据已有资料回答"
+                        _tool_quota_message(
+                            "web_search",
+                            tool_rounds_used=tool_rounds_used,
+                            search_count=search_count,
+                            fetch_count=fetch_count,
+                            fetch_has_eligible_url=reader_enabled and bool(allowed_urls),
+                        )
                     )
                 if name == "fetch_webpage" and fetch_count >= JINA_MAX_FETCHES_PER_RESPONSE:
                     reader_enabled = False
                     raise ToolQuotaExceeded(
-                        f"网页读取次数已达到上限（最多 {JINA_MAX_FETCHES_PER_RESPONSE} 次），禁止再次读取或重试；请立即根据已有资料回答"
+                        _tool_quota_message(
+                            "fetch_webpage",
+                            tool_rounds_used=tool_rounds_used,
+                            search_count=search_count,
+                            fetch_count=fetch_count,
+                            fetch_has_eligible_url=False,
+                        )
                     )
                 arguments = json.loads(str(function.get("arguments") or "{}"))
                 if not isinstance(arguments, dict):
