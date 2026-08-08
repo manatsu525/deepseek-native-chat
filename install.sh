@@ -14,15 +14,12 @@ ADMIN_USER=${1:-admin}
 ADMIN_PASS=${2:-admin123456}
 PUBLIC_IP=${PUBLIC_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}
 PORT=${PORT:-8000}
-OPENCODE_DEEPSEEK_COMPAT=${OPENCODE_DEEPSEEK_COMPAT:-1}
 
 if [[ -f $INSTALL_DIR/.env && -s $DATA_DIR/chat.db ]]; then
   existing_user=$(sed -n 's/^ADMIN_USERNAME=//p' "$INSTALL_DIR/.env" | head -n1)
   existing_pass=$(sed -n 's/^ADMIN_PASSWORD=//p' "$INSTALL_DIR/.env" | head -n1)
-  existing_opencode_compat=$(sed -n 's/^OPENCODE_DEEPSEEK_COMPAT=//p' "$INSTALL_DIR/.env" | head -n1)
   ADMIN_USER=${existing_user:-$ADMIN_USER}
   ADMIN_PASS=${existing_pass:-$ADMIN_PASS}
-  OPENCODE_DEEPSEEK_COMPAT=${existing_opencode_compat:-$OPENCODE_DEEPSEEK_COMPAT}
 fi
 if [[ ${#ADMIN_PASS} -lt 8 || $ADMIN_PASS == *$'\n'* ]]; then
   echo "管理员密码必须至少 8 位且不能包含换行。" >&2
@@ -54,7 +51,6 @@ PORT=$PORT
 DATA_DIR=$DATA_DIR
 SESSION_DAYS=60
 REQUEST_TIMEOUT=1200
-OPENCODE_DEEPSEEK_COMPAT=$OPENCODE_DEEPSEEK_COMPAT
 TLS_CERT_FILE=$DATA_DIR/tls/server.crt
 TLS_KEY_FILE=$DATA_DIR/tls/server.key
 ADMIN_USERNAME=$ADMIN_USER

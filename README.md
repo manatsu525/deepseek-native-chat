@@ -2,8 +2,6 @@
 
 一个面向低配置 VPS 的私人 DeepSeek / Custom 聊天站。DeepSeek 使用服务端原生联网；Custom 使用标准 OpenAI Chat Completions，默认由本机后端适配免费的 Parallel Search MCP，也可切换到备用的 DuckDuckGo + Jina Reader，不安装 SearXNG 或浏览器。
 
-针对 `opencode.ai` 的 DeepSeek V4，项目默认启用一个隔离的协议兼容补丁，用来过滤服务端流中泄漏的 DSML 工具标记，并把错误序列化为字符串的 `search_queries` 恢复成数组。它不会影响其他 Custom 模型；如需快速回退，在 `.env` 中设置 `OPENCODE_DEEPSEEK_COMPAT=0` 并重启服务即可。
-
 ## 功能
 
 - DeepSeek V4 Flash Responses API 原生多轮联网搜索
