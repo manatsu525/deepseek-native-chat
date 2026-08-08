@@ -43,6 +43,7 @@ from .mimo import (
     is_mimo_model,
 )
 from .parallel_mcp import ParallelMCPClient
+from .opencode_deepseek_compat import OpenCodeDeepSeekCompat
 
 
 class ToolQuotaExceeded(RuntimeError):
@@ -213,6 +214,9 @@ async def stream_response(
     to the model instead of requiring an exact search-result URL match.
     """
     config = _settings(settings)
+    # OpenCode DeepSeek V4 compatibility shim. This single request-scoped hook
+    # and the two marked hooks below can be removed together to revert it.
+    opencode_deepseek_compat = OpenCodeDeepSeekCompat.for_request(base_url, model)
     parallel_mode = config.get("web_tool_backend") == "parallel"
     headers = custom_auth_headers(api_key, stream=True)
     base_prompt = PARALLEL_CUSTOM_SYSTEM_PROMPT if parallel_mode else LEGACY_CUSTOM_SYSTEM_PROMPT
@@ -351,7 +355,11 @@ async def stream_response(
                     preview_usage = _merge_usage(usage, round_usage)
                     await update(
                         {
-                            "answer": answer + round_answer,
+                            # Buffer this one provider/model's tool-enabled
+                            # content so native DSML cannot flash in the UI.
+                            "answer": answer + opencode_deepseek_compat.preview_content(
+                                round_answer, bool(round_tools)
+                            ),
                             "reasoning": reasoning + round_reasoning,
                             "searches": steps,
                             "usage": preview_usage,
@@ -360,8 +368,18 @@ async def stream_response(
                     )
 
             usage = _merge_usage(usage, round_usage)
-            calls = _tool_calls(round_tools_by_index, round_number)
-            invalid_answer = not round_answer.strip() or _looks_like_text_tool_call(round_answer)
+            # OpenCode DeepSeek V4 compatibility shim: normalize its observed
+            # wire-format quirk, then remove DSML duplicated by structured calls.
+            calls = opencode_deepseek_compat.normalize_calls(
+                _tool_calls(round_tools_by_index, round_number)
+            )
+            leaked_dsml = opencode_deepseek_compat.contains_dsml(round_answer)
+            round_answer = opencode_deepseek_compat.final_content(round_answer, calls)
+            invalid_answer = (
+                not round_answer.strip()
+                or _looks_like_text_tool_call(round_answer)
+                or (leaked_dsml and not calls)
+            )
             if (final_answer_only and (calls or invalid_answer)) or (not calls and invalid_answer):
                 final_answer_attempts += 1
                 force_final_answer = True
