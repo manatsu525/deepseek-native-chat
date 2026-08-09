@@ -584,16 +584,26 @@ function restoreProviderForConversation(data) {
   const target=providerForConversation(data);
   if(target) selectProvider(target.id,true,target.model);
 }
+const customWebToolInfo={
+  parallel:{label:'Parallel',description:'Parallel Search MCP 负责搜索和网页抓取。'},
+  keenable:{label:'Keenable',description:'Keenable MCP 负责搜索，并以 live 模式抓取网页正文。'},
+  tavily:{label:'Tavily',description:'Tavily Keyless 负责 Search 和 Extract，请求会发送 X-Tavily-Access-Mode: keyless。'},
+  firecrawl:{label:'Firecrawl',description:'Firecrawl Keyless MCP 只使用 Search 和 Scrape。'},
+  you:{label:'You.com + Jina',description:'You.com Free MCP 负责搜索，现有 Jina Reader 负责网页正文抓取。'},
+  legacy:{label:'DDG + Jina',description:'本机 DuckDuckGo Lite/HTML 负责搜索，现有 Jina Reader 负责网页正文抓取。'}
+};
+function selectedWebToolInfo(provider=selectedProvider()){const key=customSettings(provider).web_tool_backend;return customWebToolInfo[key]||customWebToolInfo.parallel}
 function updateProviderUi(){
   const provider=selectedProvider(), custom=provider&&normalizeProviderType(provider.provider_type)==='custom', customEffort=custom&&customSettings(provider).reasoning_effort_enabled;
+  const webInfo=custom?selectedWebToolInfo(provider):null;
   $('#customSettingsButton').classList.toggle('hidden',!custom);
   $('#effort').disabled=!!custom&&!customEffort;
   $('#effort').title=custom?(customEffort?'控制发送给 Custom 模型的 reasoning_effort':'Custom 参数中已关闭 reasoning_effort'):'控制 DeepSeek 模型推理投入';
-  $('#nativePill').textContent=custom?'● DDG + Jina':'● Native Web';
+  $('#nativePill').textContent=custom?`● ${webInfo.label}`:'● Native Web';
   $('#welcomeOrbitMark').textContent=custom?'CU':'DS';
   $('#welcomeEyebrow').textContent=custom?'CUSTOM · OPENAI CHAT': 'DEEPSEEK V4 FLASH';
   $('#welcomeTitle').textContent=custom?'使用 Custom 本地联网':'问点需要查证的问题';
-  $('#welcomeDescription').textContent=custom?'模型通过标准 Chat Completions 调用本地 DuckDuckGo 搜索，再按需用 Jina 读取真实来源。':'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
+  $('#welcomeDescription').textContent=custom?`模型通过标准 Chat Completions 调用 ${webInfo.label} 搜索与读取真实来源。`:'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
 }
 
 async function loadProviders(){
@@ -683,7 +693,7 @@ function fillCustomSettings(){
   syncCustomThinkingFields();syncCustomToolFields();
 }
 function syncCustomThinkingFields(){const mimo=isMimoModel(selectedModel()),thinking=$('#customThinking').value==='enabled',effort=$('#customReasoningEffortEnabled').checked;$('#customTemperature').disabled=mimo&&thinking;$('#customTopP').disabled=mimo&&thinking;$('#customSamplingNote').textContent=`thinking 将${thinking?'开启':'关闭'}；reasoning_effort 将${effort?'按顶部 High/Max 发送':'不发送'}。已知模型使用官方字段，其他 Custom 使用通用顶层字段；接口不支持时可在这里关闭。`}
-function syncCustomToolFields(){const parallel=$('#customWebToolBackend').value==='parallel';$('#customToolNote').textContent=parallel?'默认方案：后端匿名调用 Parallel Search MCP 的 web_search / web_fetch，不需要 Parallel API Key；查询词和待读取 URL 会发送给 Parallel，搜索结果自带相关摘录，只有证据不足时才读取网页。':'备用方案：使用本机 DuckDuckGo Lite/HTML 搜索和 Jina Reader 读取网页；适合 Parallel 暂时不可用时手动切换。'}
+function syncCustomToolFields(){const info=customWebToolInfo[$('#customWebToolBackend').value]||customWebToolInfo.parallel;$('#customToolNote').textContent=`${info.description} 不需要 API Key；不会自动切换、并发调用或回退到其他方案。`}
 function openCustomSettings(){if(!selectedProvider()||normalizeProviderType(selectedProvider().provider_type)!=='custom'){toast('请先选择 Custom API');return}fillCustomSettings();$('#customModal').showModal()}
 async function saveCustomSettings(event){
   event.preventDefault(); const provider=selectedProvider(); if(!provider)return;

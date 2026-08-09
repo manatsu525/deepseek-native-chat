@@ -1,11 +1,11 @@
 # DeepSeek Native Chat
 
-一个面向低配置 VPS 的私人 DeepSeek / Custom 聊天站。DeepSeek 使用服务端原生联网；Custom 使用标准 OpenAI Chat Completions，默认由本机后端适配免费的 Parallel Search MCP，也可切换到备用的 DuckDuckGo + Jina Reader，不安装 SearXNG 或浏览器。
+一个面向低配置 VPS 的私人 DeepSeek / Custom 聊天站。DeepSeek 使用服务端原生联网；Custom 使用标准 OpenAI Chat Completions，可选择 Parallel、Keenable、Tavily、Firecrawl、You.com 或 DDG + Jina 匿名联网方案，不安装 SearXNG 或浏览器。
 
 ## 功能
 
 - DeepSeek V4 Flash Responses API 原生多轮联网搜索
-- Custom OpenAI 兼容 Chat Completions 外部 DuckDuckGo 多轮搜索
+- Custom OpenAI 兼容 Chat Completions 外部多轮搜索与网页读取
 - 流式回答、思考过程、搜索步骤和来源折叠展示
 - 输入、缓存命中、输出和推理 Token 统计
 - 后台生成：刷新页面、切换应用或锁屏后任务继续运行
@@ -19,7 +19,7 @@
 - 各账号的对话和 API 配置相互隔离
 - 前端测试 API、读取 `/models` 全部模型并勾选、手动填写模型名、重新编辑已保存 API 的模型列表、删除 API
 - Custom 参数：所有模型均可开关 `thinking`，可独立开关 `reasoning_effort` 并使用顶部 High/Max，另有普通采样参数、默认 65,536 的生成上限和联网方案切换
-- Custom 按需网页读取：默认调用免费的 Parallel Search MCP 搜索/提取，也可切换到 Jina Reader 备用方案，均无需额外 API Key
+- Custom 匿名联网方案：Parallel Search + Fetch、Keenable Search + Live Fetch、Tavily Keyless Search + Extract、Firecrawl Keyless Search + Scrape、You Search + Jina Fetch、DDG Search + Jina Fetch
 - SQLite 单文件数据库、自签 HTTPS、systemd 守护
 - 手机和桌面端响应式界面
 - 浏览器自动上报 IANA 时区；Custom/MiMo 每次回答都会获得对应的当前本地日期，并要求按绝对日期核对“今天/最新”等时效性问题
@@ -73,7 +73,9 @@ sudo ./uninstall.sh --yes
 
 ## 设计说明
 
-DeepSeek 使用官方 `/responses` 路由，当前原生 `web_search` 适配 `deepseek-v4-flash`。Custom 使用标准 `/chat/completions`，不依赖模型供应商的原生搜索；后端把联网能力适配成模型可见的 `web_search` 与 `fetch_webpage` Function Tools。默认方案匿名连接 Parallel 官方 Streamable HTTP MCP 端点 `https://search.parallel.ai/mcp`，调用其 `web_search` / `web_fetch`，无需 Parallel API Key；备用方案直接请求 DuckDuckGo Lite/HTML，再使用 Jina Reader。查询词和待读取 URL 会发送给当前选择的搜索/读取服务。两种模型协议由后端分别解析，不能共用 DeepSeek 的 Responses SSE 事件处理器。
+DeepSeek 使用官方 `/responses` 路由，当前原生 `web_search` 适配 `deepseek-v4-flash`。Custom 使用标准 `/chat/completions`，不依赖模型供应商的原生搜索；后端把联网能力适配成模型可见的 `web_search` 与 `fetch_webpage` Function Tools。默认方案匿名连接 Parallel 官方 Streamable HTTP MCP；也可以手动选择 Keenable、Tavily Keyless、Firecrawl Keyless、You.com Free 或 DDG + Jina。选择后，搜索与抓取固定使用对应的一组实现，不自动切换、不 fallback、不同 provider 之间不并发。You.com Free 只提供搜索，因此它是唯一复用现有 Jina Reader 抓取的新增方案。查询词和待读取 URL 会发送给当前选择的服务。两种模型协议由后端分别解析，不能共用 DeepSeek 的 Responses SSE 事件处理器。
+
+新增匿名 MCP 由独立的轻量客户端适配：Keenable 调用 `https://api.keenable.ai/mcp` 的 `search_web_pages` / `fetch_page_content`，抓取固定发送 `live=true`；Tavily 调用 `https://mcp.tavily.com/mcp/` 的 `tavily_search` / `tavily_extract`，每次请求固定发送 `X-Tavily-Access-Mode: keyless`；Firecrawl 调用 `https://mcp.firecrawl.dev/v2/mcp`，只使用 `firecrawl_search` / `firecrawl_scrape`；You.com 调用 `https://api.you.com/mcp?profile=free` 的 `you-search`，抓取则直接复用原来的 Jina Reader。四种服务的原始响应都会归一化为相同的标题、URL、摘要和正文格式，再作为 `tool` 消息回传给 LLM。
 
 Custom 每个工具轮最多执行 1 个工具，最多 6 个工具轮；每个回答最多搜索 3 次、最多读取 3 个网页，每次搜索最多向模型返回 10 条结果。模型可以在资料足够时直接停止工具调用。搜索查询按标准化文本去重，不会重复请求同一组查询。`fetch_webpage` 只能读取用户提供或当前搜索方案返回的 URL，搜索引擎结果页、编造 URL、本机和内网地址都会被拒绝；同一个 URL 也不会重复注入正文。Parallel 搜索每条摘录最多保留约 1,200 字符，读取默认使用相关摘录而非完整页面，每页最多约 8,000 字符，以限制上下文增长。
 

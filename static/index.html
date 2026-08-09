@@ -137,7 +137,7 @@
             </div>
           </div>
         </form>
-        <p class="footnote">Custom API 使用本地 DuckDuckGo 搜索与 Jina Reader；DeepSeek 使用服务端原生联网。重要信息仍建议核对原始来源。</p>
+        <p class="footnote">Custom API 使用你选择的匿名搜索与网页抓取方案；DeepSeek 使用服务端原生联网。重要信息仍建议核对原始来源。</p>
       </footer>
     </main>
   </div>
@@ -172,10 +172,10 @@
       <label>最大生成 Token<input id="customMaxCompletion" type="number" min="256" max="131072" step="256" value="65536"></label>
       <label>temperature<input id="customTemperature" type="number" min="0" max="1.5" step="0.05" value="1"></label>
       <label>top_p<input id="customTopP" type="number" min="0.01" max="1" step="0.01" value="0.95"></label>
-      <label class="wide">搜索/抓取工具方案<select id="customWebToolBackend"><option value="parallel">Parallel Search MCP（默认 · 免 API Key）</option><option value="legacy">DuckDuckGo + Jina Reader（备用）</option></select></label>
+      <label class="wide">搜索/抓取工具方案<select id="customWebToolBackend"><option value="parallel">Parallel（默认）</option><option value="keenable">Keenable</option><option value="tavily">Tavily</option><option value="firecrawl">Firecrawl</option><option value="you">You.com</option><option value="legacy">DDG + Jina</option></select></label>
       <p id="customSamplingNote" class="wide muted">普通 Custom 模型使用标准 temperature/top_p；兼容 thinking 参数的模型才会发送该字段。</p>
       <p id="customToolNote" class="wide muted custom-cost-note">默认通过免费的 Parallel Search MCP 搜索并提取相关网页内容，不需要 Parallel API Key。</p>
-      <p class="wide muted custom-cost-note">两种方案均由本机后端执行并强制限制：每个回答最多搜索 3 次、读取 3 个网页、执行 6 个工具轮次；资料足够时可以提前停止。每次搜索最多向模型返回 10 条结果。</p>
+      <p class="wide muted custom-cost-note">所有方案均由本机后端调用并强制限制：每个回答最多搜索 3 次、读取 3 个网页、执行 6 个工具轮次；资料足够时可以提前停止。每次搜索最多向模型返回 10 条结果。</p>
       <p id="customStatus" class="wide error"></p>
       <div class="wide form-actions"><button class="primary" type="submit">保存 Custom 参数</button></div>
     </form>

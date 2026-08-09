@@ -86,7 +86,7 @@ class CustomSettingsBody(BaseModel):
     max_completion_tokens: int = Field(default=65536, ge=256, le=MIMO_MAX_COMPLETION_TOKENS)
     temperature: float = Field(default=1.0, ge=0, le=1.5)
     top_p: float = Field(default=0.95, ge=0.01, le=1)
-    web_tool_backend: Literal["parallel", "legacy"] = "parallel"
+    web_tool_backend: Literal["parallel", "keenable", "tavily", "firecrawl", "you", "legacy"] = "parallel"
 
 
 class ChatBody(BaseModel):
