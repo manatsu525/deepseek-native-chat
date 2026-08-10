@@ -64,6 +64,28 @@ class OpenCodeDsmlFallbackTests(unittest.TestCase):
         _, final_calls = recover_tool_calls(DSML, [], id_prefix="final", tools_available=False)
         self.assertEqual(final_calls, [])
 
+    def test_recovered_search_queries_string_is_normalized_to_array(self):
+        leaked = """<｜DSML｜tool_calls>
+<｜DSML｜invoke name="web_search">
+<｜DSML｜parameter name="objective" string="true">查行情</｜DSML｜parameter>
+<｜DSML｜parameter name="search_queries" string="true">["兆易创新 今日走势", "603986 行情"]</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>"""
+        _, calls = recover_tool_calls(leaked, [], id_prefix="first", tools_available=True)
+        arguments = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(arguments["search_queries"], ["兆易创新 今日走势", "603986 行情"])
+
+    def test_plain_search_query_string_becomes_single_item_array(self):
+        leaked = """<|DSML|tool_calls>
+<|DSML|invoke name="web_search">
+<|DSML|parameter name="objective" string="true">查行情</|DSML|parameter>
+<|DSML|parameter name="search_queries" string="true">兆易创新 今日走势</|DSML|parameter>
+</|DSML|invoke>
+</|DSML|tool_calls>"""
+        _, calls = recover_tool_calls(leaked, [], id_prefix="first", tools_available=True)
+        arguments = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(arguments["search_queries"], ["兆易创新 今日走势"])
+
     def test_orphan_block_is_removed_without_inventing_a_call(self):
         clean, calls = parse_dsml("正文<｜DSML｜tool_calls><｜DSML｜invoke")
         self.assertEqual(clean, "正文")

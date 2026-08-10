@@ -91,6 +91,34 @@ def parse_dsml(content: str, id_prefix: str = "call") -> tuple[str, list[dict[st
     return _remove_dsml(content).strip(), tool_calls
 
 
+def _normalize_recovered_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Repair DSML argument types that disagree with the offered tool schema."""
+    for call in calls:
+        function = call.get("function") or {}
+        if not isinstance(function, dict) or function.get("name") != "web_search":
+            continue
+        try:
+            arguments = json.loads(str(function.get("arguments") or "{}"))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if not isinstance(arguments, dict) or not isinstance(arguments.get("search_queries"), str):
+            continue
+
+        raw_queries = arguments["search_queries"].strip()
+        try:
+            decoded_queries = json.loads(raw_queries)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            decoded_queries = raw_queries
+        if isinstance(decoded_queries, list):
+            queries = [str(item).strip() for item in decoded_queries if str(item).strip()]
+        else:
+            query = str(decoded_queries).strip()
+            queries = [query] if query else []
+        arguments["search_queries"] = queries
+        function["arguments"] = json.dumps(arguments, ensure_ascii=False)
+    return calls
+
+
 def recover_tool_calls(
     content: str,
     native_calls: list[dict[str, Any]],
@@ -104,7 +132,7 @@ def recover_tool_calls(
     clean, parsed_calls = parse_dsml(content, id_prefix=id_prefix)
     if native_calls:
         return clean, native_calls
-    return clean, parsed_calls if tools_available else []
+    return clean, _normalize_recovered_calls(parsed_calls) if tools_available else []
 
 
 class DsmlStreamBuffer:
