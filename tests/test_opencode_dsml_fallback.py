@@ -56,6 +56,26 @@ class OpenCodeDsmlFallbackTests(unittest.TestCase):
         self.assertEqual(clean, "先查一下。")
         self.assertIs(calls, native)
 
+    def test_native_search_query_string_is_also_normalized(self):
+        native = [
+            {
+                "id": "call_from_opencode",
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "arguments": json.dumps(
+                        {"objective": "查资料", "search_queries": '["玄凤鹦鹉 夜惊", "虎皮鹦鹉 夜惊"]'},
+                        ensure_ascii=False,
+                    ),
+                },
+            }
+        ]
+        content, calls = recover_tool_calls("", native, id_prefix="unused", tools_available=True)
+        self.assertEqual(content, "")
+        self.assertEqual(calls[0]["id"], "call_from_opencode")
+        arguments = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(arguments["search_queries"], ["玄凤鹦鹉 夜惊", "虎皮鹦鹉 夜惊"])
+
     def test_fallback_recovers_only_while_tools_are_available(self):
         clean, calls = recover_tool_calls(DSML, [], id_prefix="recovered", tools_available=True)
         self.assertEqual(clean, "先查一下。")

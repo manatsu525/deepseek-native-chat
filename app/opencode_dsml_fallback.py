@@ -91,8 +91,8 @@ def parse_dsml(content: str, id_prefix: str = "call") -> tuple[str, list[dict[st
     return _remove_dsml(content).strip(), tool_calls
 
 
-def _normalize_recovered_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Repair DSML argument types that disagree with the offered tool schema."""
+def normalize_tool_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Repair OpenCode tool argument types that disagree with the schema."""
     for call in calls:
         function = call.get("function") or {}
         if not isinstance(function, dict) or function.get("name") != "web_search":
@@ -128,11 +128,11 @@ def recover_tool_calls(
 ) -> tuple[str, list[dict[str, Any]]]:
     """Clean leaked DSML and recover calls only when native calls are absent."""
     if not looks_like_dsml(content):
-        return content, native_calls
+        return content, normalize_tool_calls(native_calls)
     clean, parsed_calls = parse_dsml(content, id_prefix=id_prefix)
     if native_calls:
-        return clean, native_calls
-    return clean, _normalize_recovered_calls(parsed_calls) if tools_available else []
+        return clean, normalize_tool_calls(native_calls)
+    return clean, normalize_tool_calls(parsed_calls) if tools_available else []
 
 
 class DsmlStreamBuffer:
