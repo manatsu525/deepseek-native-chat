@@ -1,6 +1,6 @@
 const $ = (s, root=document) => root.querySelector(s);
 const $$ = (s, root=document) => [...root.querySelectorAll(s)];
-const state = {me:null, providers:[], conversation:null, messages:[], job:null, page:1, pages:1, poll:null, pollSession:0, viewSession:0, latestConversationId:null, editingProviderId:null, pendingAttachments:[], attachmentDraftId:null, uploadingAttachments:false, retryingMessageId:null};
+const state = {me:null, providers:[], conversation:null, messages:[], job:null, page:1, pages:1, poll:null, latestConversationId:null, editingProviderId:null, pendingAttachments:[], attachmentDraftId:null, uploadingAttachments:false};
 const detailState = new Map();
 const nestedScrollState = new Map();
 const MAX_ATTACHMENT_FILES = 10;
@@ -87,7 +87,6 @@ async function uploadOneAttachment(file){
 }
 async function selectAttachments(files){
   const list=[...files];if(!list.length)return;
-  if(state.retryingMessageId){toast('正在创建重新回答');return}
   if(state.pendingAttachments.length+list.length>MAX_ATTACHMENT_FILES){setAttachmentStatus('一次消息最多上传 10 个附件。',true);return}
   const currentBytes=state.pendingAttachments.reduce((sum,item)=>sum+(Number(item.size)||0),0);
   const newBytes=list.reduce((sum,item)=>sum+(Number(item.size)||0),0);
@@ -353,7 +352,6 @@ function sourcesHtml(meta={}, detailKey='trace') {
 
 function messageHtml(message, index, live=false) {
   const assistant = message.role === 'assistant';
-  const canRetry = assistant && !live && Boolean(message.id);
   const meta = message.meta || {};
   const content = message.content || '';
   const detailKey = meta.trace_key || `trace-${meta.job_id || `message-${index}`}`;
@@ -363,7 +361,7 @@ function messageHtml(message, index, live=false) {
   return `<article class="message ${assistant ? 'assistant' : 'user'}${live ? ' live-message' : ''}" data-index="${index}">
     <div class="message-icon">${assistant ? (custom ? 'CU' : 'DS') : escapeHtml(((state.me && state.me.username) || 'U')[0].toUpperCase())}</div>
     <div class="message-body"><div class="message-head"><strong>${assistant ? assistantName : escapeHtml((state.me && state.me.username) || '你')}</strong></div>
-    ${assistant ? traceHtml(meta, live, detailKey) : ''}${messageAttachments}<div class="message-content">${assistant ? (content ? markdown(content, detailKey) : live ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div>${assistant ? sourcesHtml(meta,detailKey) : ''}${assistant && !live ? usageHtml(meta.usage || {}) : ''}<div class="message-actions"><button type="button" data-action="copy">复制</button>${canRetry ? `<button type="button" data-action="retry" ${state.retryingMessageId ? 'disabled' : ''}>重新回答</button>` : ''}</div>
+    ${assistant ? traceHtml(meta, live, detailKey) : ''}${messageAttachments}<div class="message-content">${assistant ? (content ? markdown(content, detailKey) : live ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div>${assistant ? sourcesHtml(meta,detailKey) : ''}${assistant && !live ? usageHtml(meta.usage || {}) : ''}<div class="message-actions"><button type="button" data-action="copy">复制</button><button type="button" data-action="retry">重新回答</button></div>
     ${meta.error ? `<p class="job-error">${escapeHtml(meta.error)}</p>` : ''}</div></article>`;
 }
 
@@ -445,8 +443,14 @@ function wireMessageActions(items) {
   $$('.message').forEach(node => {
     const index = Number(node.dataset.index), msg = items[index];
     $('[data-action="copy"]', node).onclick = async () => { await navigator.clipboard.writeText(msg.content || ''); toast('已复制'); };
-    const retryButton = $('[data-action="retry"]', node);
-    if (retryButton) retryButton.onclick = () => retryMessage(msg);
+    $('[data-action="retry"]', node).onclick = () => {
+      let prompt = msg.role === 'user' ? msg.content : '';
+      if (!prompt) for (let i=index-1;i>=0;i--) if(items[i].role==='user'){prompt=items[i].content;break}
+      if (prompt) {
+        if(Array.isArray(msg.meta&&msg.meta.attachments)&&msg.meta.attachments.length)toast('历史附件本体已清理；重新回答只会发送文字，请按需重新上传');
+        submitPrompt(prompt);
+      }
+    };
     $$('.code-download', node).forEach(button => button.onclick = () => {
       const wrap = button.closest('.code-wrap');
       const codeNode = $('pre code', wrap);
@@ -461,69 +465,6 @@ function wireMessageActions(items) {
       toast('代码已复制');
     });
   });
-}
-
-async function retryMessage(message) {
-  if (!message || message.role !== 'assistant' || !message.id || !state.conversation || !state.conversation.id) return;
-  if (state.retryingMessageId) return;
-  if (state.uploadingAttachments) { toast('请等待附件处理完成'); return; }
-  if (state.job && ['queued','running'].includes(state.job.status)) { toast('请先停止当前回答'); return; }
-  const provider = selectedProvider();
-  if (!provider) { $('#providerModal').showModal(); toast('请先添加 API 配置'); return; }
-  const model = selectedModel();
-  if (!model) { $('#providerModal').showModal(); toast('请先选择模型'); return; }
-
-  const sourceConversationId = state.conversation.id;
-  const retryViewSession = state.viewSession;
-  const retryingMessageId = String(message.id);
-  state.retryingMessageId = retryingMessageId;
-  renderMessages();
-  try {
-    const data = await api(`/api/conversations/${encodeURIComponent(sourceConversationId)}/retry`, {
-      method:'POST',
-      body:{message_id:message.id,provider_id:provider.id,model,effort:$('#effort').value,timezone:browserTimezone()},
-    });
-    if (!data.conversation || !Array.isArray(data.messages) || !data.active_job || !data.active_job.id) {
-      throw new Error('重新回答未返回有效的分支任务');
-    }
-
-    if (state.viewSession !== retryViewSession || !state.conversation || String(state.conversation.id) !== String(sourceConversationId)) {
-      if (state.retryingMessageId === retryingMessageId) {
-        state.retryingMessageId = null;
-        renderMessages();
-      }
-      try { await loadHistory(1); } catch (err) { toast(err.message); }
-      toast('重新回答分支已创建，可在历史记录中打开。');
-      return;
-    }
-
-    // The server creates the user-message branch. Do not add an optimistic user
-    // message here, otherwise the retried prompt would appear twice in the model history.
-    stopPolling();
-    state.viewSession += 1;
-    state.conversation = data.conversation;
-    state.messages = data.messages;
-    state.job = data.active_job;
-    state.pendingAttachments = [];
-    state.attachmentDraftId = null;
-    state.retryingMessageId = null;
-    renderPendingAttachments();
-    setAttachmentStatus('');
-    restoreProviderForConversation(data);
-    storeValue('active-conversation', state.conversation.id);
-    $('#conversationTitle').textContent = state.conversation.title;
-    renderMessages();
-    startPolling(state.job.id);
-    try { await loadHistory(1); } catch (err) { toast(err.message); }
-    if (data.attachments_omitted) toast('历史附件不会重传，请重新上传所需文件。');
-  } catch(err) {
-    toast(err.message);
-  } finally {
-    if (state.retryingMessageId === retryingMessageId) {
-      state.retryingMessageId = null;
-      renderMessages();
-    }
-  }
 }
 
 async function loadHistory(page=1) {
@@ -543,7 +484,6 @@ async function loadHistory(page=1) {
 async function clearAllHistory() {
   if(state.job && ['queued','running'].includes(state.job.status)){toast('请先停止当前回答');return}
   if(!confirm('永久删除当前账号的全部聊天记录？\n\n对话、消息、思考、搜索记录和任务统计都会删除，并立即压缩数据库。此操作不可恢复。'))return;
-  state.viewSession += 1;
   const button=$('#clearHistory');button.disabled=true;
   try{
     const result=await api('/api/conversations',{method:'DELETE'});
@@ -555,18 +495,14 @@ async function clearAllHistory() {
 }
 
 async function openConversation(id) {
-  const viewSession = ++state.viewSession;
   stopPolling();
   try {
     if(!state.conversation&&state.pendingAttachments.length)await discardPendingAttachments();
-    const data=await api(`/api/conversations/${id}`);
-    if(viewSession!==state.viewSession)return false;
-    state.conversation=data.conversation; state.messages=data.messages; state.job=data.active_job;
+    const data=await api(`/api/conversations/${id}`); state.conversation=data.conversation; state.messages=data.messages; state.job=data.active_job;
     state.attachmentDraftId=null;state.pendingAttachments=[];renderPendingAttachments();setAttachmentStatus('');
     restoreProviderForConversation(data);
     storeValue('active-conversation', state.conversation.id);
     $('#conversationTitle').textContent=state.conversation.title; renderMessages(); await Promise.all([loadHistory(state.page),loadPendingAttachments()]);
-    if(viewSession!==state.viewSession)return false;
     if(state.job)startPolling(state.job.id);
     return true;
   } catch(err){
@@ -577,7 +513,6 @@ async function openConversation(id) {
 }
 
 async function newConversation(){
-  state.viewSession += 1;
   if(!state.conversation&&state.pendingAttachments.length)await discardPendingAttachments();
   stopPolling();state.conversation=null;state.messages=[];state.job=null;state.pendingAttachments=[];state.attachmentDraftId=newAttachmentDraftId();
   storeValue('active-conversation','__new__');storeValue('attachment-draft',state.attachmentDraftId);$('#conversationTitle').textContent='新对话';renderPendingAttachments();setAttachmentStatus('');renderMessages();loadHistory(1);
@@ -586,7 +521,6 @@ async function newConversation(){
 async function submitPrompt(value) {
   const rawContent=(value == null ? $('#prompt').value : value).trim();
   if(!rawContent&&!state.pendingAttachments.length)return;
-  if(state.retryingMessageId){toast('正在创建重新回答');return}
   if(state.uploadingAttachments){toast('请等待附件处理完成');return}
   const content=rawContent||'请分析这些附件。';
   const provider=selectedProvider(); if(!provider){$('#providerModal').showModal();toast('请先添加 API 配置');return}
@@ -608,78 +542,8 @@ async function submitPrompt(value) {
 }
 
 function setRunning(on){$('#stopButton').classList.toggle('hidden',!on);$('#sendButton').disabled=on||state.uploadingAttachments;$('#attachButton').disabled=on||state.uploadingAttachments;$('#providerSelect').disabled=on}
-function stopPolling(){if(state.poll!=null)clearTimeout(state.poll);state.poll=null;state.pollSession+=1}
-function displayedJobMatches(jobId, conversationId, viewSession) {
-  return state.viewSession===viewSession && state.conversation && String(state.conversation.id)===String(conversationId) && state.job && String(state.job.id)===String(jobId);
-}
-async function refreshCurrentConversation(conversationId, jobId, viewSession) {
-  if (!displayedJobMatches(jobId, conversationId, viewSession)) return false;
-  const data = await api(`/api/conversations/${encodeURIComponent(conversationId)}`);
-  if (!displayedJobMatches(jobId, conversationId, viewSession)) return false;
-  state.conversation = data.conversation;
-  state.messages = data.messages;
-  state.job = data.active_job;
-  restoreProviderForConversation(data);
-  storeValue('active-conversation', state.conversation.id);
-  $('#conversationTitle').textContent = state.conversation.title;
-  renderMessages();
-  return true;
-}
-function startPolling(id) {
-  stopPolling();
-  const session=state.pollSession, traceKey=(state.job&&state.job.trace_key)||`trace-${id}`, conversationId=state.conversation&&state.conversation.id, viewSession=state.viewSession;
-  let retryDelay=700, pollingErrorShown=false;
-  const displayed=()=>displayedJobMatches(id,conversationId,viewSession);
-  const active=()=>state.pollSession===session&&displayed();
-  const schedule=delay=>{if(active())state.poll=setTimeout(tick,delay)};
-  const refreshHistory=async()=>{if(state.viewSession!==viewSession)return;try{await loadHistory(1)}catch(err){if(state.viewSession===viewSession)toast(err.message)}};
-  const tick=async()=>{
-    if(!active())return;
-    try{
-      const job=await api(`/api/jobs/${id}`);
-      if(!active())return;
-      pollingErrorShown=false;retryDelay=700;job.trace_key=traceKey;
-      if(job.provider_id)selectProvider(job.provider_id,false,job.model);
-      state.job=job;
-      if(job.status==='completed'){
-        stopPolling();
-        if(!displayed())return;
-        setRunning(false);
-        try{
-          const refreshed=await refreshCurrentConversation(conversationId,id,viewSession);
-          if(!refreshed&&displayed())finalizeLiveMessage(job);
-        }catch(err){if(displayed()){finalizeLiveMessage(job);toast(err.message)}}
-        await refreshHistory();
-        return;
-      }
-      if(job.status==='stopped'){
-        stopPolling();
-        if(!displayed())return;
-        setRunning(false);
-        if(job.answer){
-          try{
-            const refreshed=await refreshCurrentConversation(conversationId,id,viewSession);
-            if(!refreshed&&displayed())finalizeLiveMessage(job);
-          }catch(err){if(displayed()){finalizeLiveMessage(job);toast(err.message)}}
-          await refreshHistory();
-        }else renderMessages();
-        return;
-      }
-      if(job.status==='failed'){
-        stopPolling();
-        if(!displayed())return;
-        setRunning(false);renderMessages();
-        return;
-      }
-      updateLiveMessage();schedule(700);
-    }catch(err){
-      if(!active())return;
-      if(!pollingErrorShown){toast(`任务状态暂时不可用，正在重试：${err.message}`);pollingErrorShown=true}
-      const delay=retryDelay;retryDelay=Math.min(retryDelay*2,5000);schedule(delay);
-    }
-  };
-  setRunning(true);tick();
-}
+function stopPolling(){if(state.poll)clearTimeout(state.poll);state.poll=null}
+function startPolling(id){stopPolling();setRunning(true);const traceKey=(state.job&&state.job.trace_key)||`trace-${id}`;const tick=async()=>{try{const job=await api(`/api/jobs/${id}`);job.trace_key=traceKey;if(job.provider_id)selectProvider(job.provider_id,false,job.model);state.job=job;if(job.status==='completed'){stopPolling();setRunning(false);finalizeLiveMessage(job);await loadHistory(1);return}if(['failed','stopped'].includes(job.status)){stopPolling();setRunning(false);renderMessages();return}updateLiveMessage()}catch(err){toast(err.message);setRunning(false);return}state.poll=setTimeout(tick,700)};tick()}
 
 function normalizeProviderType(value){return value==='mimo'?'custom':(value||'deepseek')}
 function isMimoModel(value){return String(value||'').toLowerCase().startsWith('mimo-')}

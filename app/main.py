@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 from . import attachments
 from .config import settings
-from .db import Database, RetryBranchError
+from .db import Database
 from .deepseek import list_models as deepseek_list_models
 from .deepseek import stream_response as deepseek_stream_response
 from .mimo import DEFAULT_SETTINGS as CUSTOM_DEFAULT_SETTINGS
@@ -93,14 +93,6 @@ class ChatBody(BaseModel):
     conversation_id: Optional[str] = None
     content: str = Field(default="", max_length=100_000)
     attachment_ids: list[str] = Field(default_factory=list, max_length=attachments.MAX_ATTACHMENTS)
-    provider_id: int
-    model: str = ""
-    effort: str = "high"
-    timezone: str = Field(default="UTC", min_length=1, max_length=64)
-
-
-class RetryBody(BaseModel):
-    message_id: int = Field(gt=0)
     provider_id: int
     model: str = ""
     effort: str = "high"
@@ -798,62 +790,6 @@ def conversation(conversation_id: str, user: dict[str, Any] = Depends(current_us
     return {"conversation": conv, "messages": rows, "active_job": public_job(active) if active else None}
 
 
-@app.post("/api/conversations/{conversation_id}/retry")
-async def retry_conversation(
-    conversation_id: str,
-    body: RetryBody,
-    user: dict[str, Any] = Depends(current_user),
-) -> dict[str, Any]:
-    """Queue a new answer from a cloned prefix without appending the prompt twice."""
-    provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (body.provider_id, user["id"]))
-    if not provider:
-        raise HTTPException(404, "请选择有效的 API 配置")
-    kind = provider_type(provider)
-    model = body.model.strip() or provider["model"]
-    if kind == "deepseek" and model != provider["model"]:
-        raise HTTPException(400, "当前回答使用的模型与 API 配置不一致，请重新选择模型配置")
-    validate_provider_selection(kind, model, provider)
-    if body.effort not in {"high", "max"}:
-        raise HTTPException(400, "无效的思考深度")
-    timezone_name = clean_timezone(body.timezone)
-
-    try:
-        branch = db.create_retry_branch(
-            user_id=user["id"],
-            source_conversation_id=conversation_id,
-            assistant_message_id=body.message_id,
-            provider_id=body.provider_id,
-            provider_type=kind,
-            model=model,
-            effort=body.effort,
-            timezone=timezone_name,
-            conversation_id=uuid.uuid4().hex,
-            job_id=uuid.uuid4().hex,
-            created_at=now(),
-        )
-    except RetryBranchError as exc:
-        errors = {
-            "conversation_not_found": (404, "对话不存在"),
-            "provider_not_found": (404, "请选择有效的 API 配置"),
-            "message_not_found": (404, "消息不存在"),
-            "message_not_assistant": (400, "只能重新回答助手消息"),
-            "source_user_not_found": (400, "找不到这条回答对应的问题"),
-        }
-        status, detail = errors.get(exc.code, (400, "无法重新回答这条消息"))
-        raise HTTPException(status, detail) from exc
-
-    for message in branch["messages"]:
-        message["meta"] = db.decode(message.pop("meta_json"), {})
-    active_job = public_job(branch["job"])
-    launch(active_job["id"])
-    return {
-        "conversation": branch["conversation"],
-        "messages": branch["messages"],
-        "active_job": active_job,
-        "attachments_omitted": branch["attachments_omitted"],
-    }
-
-
 @app.delete("/api/conversations")
 def delete_all_conversations(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     attachment_records = db.get_attachments(user["id"])
@@ -916,7 +852,9 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
         created_conversation = True
         title_source = content or "、".join(item["original_name"] for item in attachment_records) or "附件对话"
         db.run("INSERT INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?)", (conversation_id, user["id"], title_for(title_source), now(), now()))
-        db.trim_conversations(user["id"], protected_conversation_ids=[conversation_id])
+        surplus = db.all("SELECT id FROM conversations WHERE user_id=? ORDER BY updated_at DESC LIMIT -1 OFFSET 100", (user["id"],))
+        for item in surplus:
+            db.run("DELETE FROM conversations WHERE id=?", (item["id"],))
     attachment_meta = [public_attachment(item) for item in attachment_records]
     message_content = content or "请分析这些附件。"
     message_id = db.run(
