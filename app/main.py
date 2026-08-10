@@ -99,6 +99,13 @@ class ChatBody(BaseModel):
     timezone: str = Field(default="UTC", min_length=1, max_length=64)
 
 
+class RetryBody(BaseModel):
+    provider_id: int
+    model: str = ""
+    effort: str = "high"
+    timezone: str = Field(default="UTC", min_length=1, max_length=64)
+
+
 def normalize_custom_settings(value: Any = None) -> dict[str, Any]:
     data = dict(CUSTOM_DEFAULT_SETTINGS)
     if isinstance(value, CustomSettingsBody):
@@ -788,6 +795,73 @@ def conversation(conversation_id: str, user: dict[str, Any] = Depends(current_us
         row["meta"] = db.decode(row.pop("meta_json"), {})
     active = db.one("SELECT * FROM jobs WHERE conversation_id=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1", (conversation_id,))
     return {"conversation": conv, "messages": rows, "active_job": public_job(active) if active else None}
+
+
+@app.post("/api/conversations/{conversation_id}/retry")
+async def retry_latest_answer(
+    conversation_id: str,
+    body: RetryBody,
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, str]:
+    """Delete the latest answer and regenerate it in the same conversation."""
+    provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (body.provider_id, user["id"]))
+    if not provider:
+        raise HTTPException(404, "请选择有效的 API 配置")
+    kind = provider_type(provider)
+    model = body.model.strip() or provider["model"]
+    if kind == "deepseek" and model != provider["model"]:
+        raise HTTPException(400, "当前回答使用的模型与 API 配置不一致，请重新选择模型配置")
+    validate_provider_selection(kind, model, provider)
+    if body.effort not in {"high", "max"}:
+        raise HTTPException(400, "无效的思考深度")
+    timezone_name = clean_timezone(body.timezone)
+    job_id = uuid.uuid4().hex
+    created_at = now()
+
+    with db.lock, db.connect() as connection:
+        conversation_row = connection.execute(
+            "SELECT id FROM conversations WHERE id=? AND user_id=?",
+            (conversation_id, user["id"]),
+        ).fetchone()
+        if not conversation_row:
+            raise HTTPException(404, "对话不存在")
+        active = connection.execute(
+            "SELECT id FROM jobs WHERE conversation_id=? AND status IN ('queued','running') LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+        if active:
+            raise HTTPException(409, "当前对话仍在生成回答")
+        latest = connection.execute(
+            "SELECT id,role FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+        if not latest or latest["role"] != "assistant":
+            raise HTTPException(409, "只能重新回答当前会话的最后一条回答")
+        prompt = connection.execute(
+            "SELECT id,meta_json FROM messages WHERE conversation_id=? AND role='user' AND id<? ORDER BY id DESC LIMIT 1",
+            (conversation_id, latest["id"]),
+        ).fetchone()
+        if not prompt:
+            raise HTTPException(409, "找不到这条回答对应的问题")
+        prompt_meta = db.decode(prompt["meta_json"], {})
+        if isinstance(prompt_meta, dict) and prompt_meta.get("attachments"):
+            raise HTTPException(409, "原问题包含已清理的附件，请重新上传后再提问")
+
+        connection.execute("DELETE FROM messages WHERE id=? AND conversation_id=?", (latest["id"], conversation_id))
+        connection.execute(
+            """INSERT INTO jobs(
+                   id,user_id,conversation_id,provider_id,provider_type,model,
+                   effort,timezone,status,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                job_id, user["id"], conversation_id, body.provider_id, kind,
+                model, body.effort, timezone_name, "queued", created_at, created_at,
+            ),
+        )
+        connection.execute("UPDATE conversations SET updated_at=? WHERE id=?", (created_at, conversation_id))
+
+    launch(job_id)
+    return {"job_id": job_id, "conversation_id": conversation_id}
 
 
 @app.delete("/api/conversations")
