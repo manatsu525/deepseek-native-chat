@@ -83,6 +83,7 @@ class ProviderModelsBody(BaseModel):
 class CustomSettingsBody(BaseModel):
     thinking: Literal["enabled", "disabled"] = "enabled"
     reasoning_effort_enabled: bool = True
+    dsml_fallback_enabled: bool = True
     max_completion_tokens: int = Field(default=65536, ge=256, le=MIMO_MAX_COMPLETION_TOKENS)
     temperature: float = Field(default=1.0, ge=0, le=1.5)
     top_p: float = Field(default=0.95, ge=0.01, le=1)

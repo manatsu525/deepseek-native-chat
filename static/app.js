@@ -725,10 +725,10 @@ async function testProvider(){
 function checkedCustomModels(){return $$('#customModelList input[type="checkbox"]:checked').map(input=>input.value)}
 function providerFormData(){const custom=providerType()==='custom';const manual=custom?manualModelList():[];const selected=custom?[...new Set([...checkedCustomModels(),...manual])]:['deepseek-v4-flash'];return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:selected[0]||$('#providerModel').value||'deepseek-v4-flash',selected_models:selected,manual_models:manual}}
 
-function customSettings(provider){return {...{thinking:'enabled',reasoning_effort_enabled:true,max_completion_tokens:65536,temperature:1,top_p:.95,web_tool_backend:'parallel'},...(provider&&provider.settings||{})}}
+function customSettings(provider){return {...{thinking:'enabled',reasoning_effort_enabled:true,dsml_fallback_enabled:true,max_completion_tokens:65536,temperature:1,top_p:.95,web_tool_backend:'parallel'},...(provider&&provider.settings||{})}}
 function fillCustomSettings(){
   const config=customSettings(selectedProvider());
-  $('#customThinking').value=config.thinking;$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
+  $('#customThinking').value=config.thinking;$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customDsmlFallbackEnabled').checked=config.dsml_fallback_enabled;$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
   syncCustomThinkingFields();syncCustomToolFields();
 }
 function syncCustomThinkingFields(){const mimo=isMimoModel(selectedModel()),thinking=$('#customThinking').value==='enabled',effort=$('#customReasoningEffortEnabled').checked;$('#customTemperature').disabled=mimo&&thinking;$('#customTopP').disabled=mimo&&thinking;$('#customSamplingNote').textContent=`thinking 将${thinking?'开启':'关闭'}；reasoning_effort 将${effort?'按顶部 High/Max 发送':'不发送'}。已知模型使用官方字段，其他 Custom 使用通用顶层字段；接口不支持时可在这里关闭。`}
@@ -736,7 +736,7 @@ function syncCustomToolFields(){const info=customWebToolInfo[$('#customWebToolBa
 function openCustomSettings(){if(!selectedProvider()||normalizeProviderType(selectedProvider().provider_type)!=='custom'){toast('请先选择 Custom API');return}fillCustomSettings();$('#customModal').showModal()}
 async function saveCustomSettings(event){
   event.preventDefault(); const provider=selectedProvider(); if(!provider)return;
-  const body={thinking:$('#customThinking').value,reasoning_effort_enabled:$('#customReasoningEffortEnabled').checked,max_completion_tokens:Number($('#customMaxCompletion').value),temperature:Number($('#customTemperature').value),top_p:Number($('#customTopP').value),web_tool_backend:$('#customWebToolBackend').value};
+  const body={thinking:$('#customThinking').value,reasoning_effort_enabled:$('#customReasoningEffortEnabled').checked,dsml_fallback_enabled:$('#customDsmlFallbackEnabled').checked,max_completion_tokens:Number($('#customMaxCompletion').value),temperature:Number($('#customTemperature').value),top_p:Number($('#customTopP').value),web_tool_backend:$('#customWebToolBackend').value};
   try{const updated=await api(`/api/providers/${provider.id}/settings`,{method:'PUT',body});const index=state.providers.findIndex(x=>x.id===provider.id);if(index>=0)state.providers[index]=updated;$('#customModal').close();updateProviderUi();toast('Custom 参数已保存')}catch(err){$('#customStatus').textContent=err.message}
 }
 
