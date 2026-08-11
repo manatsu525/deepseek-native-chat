@@ -87,6 +87,7 @@ CUSTOM_SYSTEM_PROMPT = PARALLEL_CUSTOM_SYSTEM_PROMPT
 DEFAULT_SETTINGS = {
     "thinking": "enabled",
     "reasoning_effort_enabled": True,
+    "include_reasoning_enabled": False,
     "dsml_fallback_enabled": True,
     "max_completion_tokens": 65536,
     "temperature": 1.0,
