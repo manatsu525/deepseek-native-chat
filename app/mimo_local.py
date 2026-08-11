@@ -172,7 +172,6 @@ def _apply_thinking_options(
     thinking: str,
     effort: str,
     effort_enabled: bool,
-    include_reasoning_enabled: bool,
     max_tokens: int,
 ) -> None:
     """Send optional reasoning controls using known or generic dialects."""
@@ -198,8 +197,6 @@ def _apply_thinking_options(
         payload["thinking"] = {"type": thinking}
     if effort_enabled and not _is_nvidia_deepseek_v4(base_url, model):
         payload["reasoning_effort"] = selected_effort
-    if include_reasoning_enabled:
-        payload["include_reasoning"] = True
 
 
 async def stream_response(
@@ -335,7 +332,6 @@ async def stream_response(
                 config["thinking"],
                 effort,
                 bool(config.get("reasoning_effort_enabled", True)),
-                bool(config.get("include_reasoning_enabled", False)),
                 int(config["max_completion_tokens"]),
             )
             if round_tools:
