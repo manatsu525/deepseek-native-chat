@@ -1,4 +1,4 @@
-"""Offline regression tests for replacing the latest answer in place."""
+"""Offline regression tests for regenerating any answer in place."""
 
 from __future__ import annotations
 
@@ -101,10 +101,16 @@ class RetryInPlaceTests(unittest.TestCase):
         self.add_message(conversation_id, "assistant", "answer to remove", 104, {"model": "old-model"})
         return conversation_id
 
-    def retry(self, conversation_id: str, provider_id: int, model: str):
+    def retry(self, conversation_id: str, prompt_message_id: int, provider_id: int, model: str):
         return self.client.post(
             f"/api/conversations/{conversation_id}/retry",
-            json={"provider_id": provider_id, "model": model, "effort": "max", "timezone": "UTC"},
+            json={
+                "prompt_message_id": prompt_message_id,
+                "provider_id": provider_id,
+                "model": model,
+                "effort": "max",
+                "timezone": "UTC",
+            },
         )
 
     def wait_for_job(self, job_id: str) -> dict:
@@ -137,7 +143,11 @@ class RetryInPlaceTests(unittest.TestCase):
             "AsyncClient",
             side_effect=AssertionError("external HTTP is forbidden in retry tests"),
         ):
-            response = self.retry(conversation_id, provider_id, "current-model")
+            prompt = main.db.one(
+                "SELECT id FROM messages WHERE conversation_id=? AND content=?",
+                (conversation_id, "retry this question"),
+            )
+            response = self.retry(conversation_id, prompt["id"], provider_id, "current-model")
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["conversation_id"], conversation_id)
             job = self.wait_for_job(response.json()["job_id"])
@@ -177,7 +187,11 @@ class RetryInPlaceTests(unittest.TestCase):
         provider_id = self.add_provider("current-provider", "current-model")
         conversation_id = self.seed_conversation(attachment=True)
 
-        response = self.retry(conversation_id, provider_id, "current-model")
+        prompt = main.db.one(
+            "SELECT id FROM messages WHERE conversation_id=? AND content=?",
+            (conversation_id, "retry this question"),
+        )
+        response = self.retry(conversation_id, prompt["id"], provider_id, "current-model")
 
         self.assertEqual(response.status_code, 409, response.text)
         self.assertIn("附件", response.json()["detail"])
@@ -187,6 +201,81 @@ class RetryInPlaceTests(unittest.TestCase):
         )
         self.assertEqual((latest["role"], latest["content"]), ("assistant", "answer to remove"))
         self.assertEqual(main.db.one("SELECT COUNT(*) AS n FROM jobs")["n"], 0)
+
+    def test_retry_earlier_prompt_discards_every_message_below_it(self) -> None:
+        provider_id = self.add_provider("current-provider", "current-model")
+        conversation_id = self.seed_conversation()
+        first_prompt = main.db.one(
+            "SELECT id FROM messages WHERE conversation_id=? AND content=?",
+            (conversation_id, "first question"),
+        )
+        histories: list[list[dict]] = []
+
+        async def fake_custom_stream_response(**kwargs):
+            histories.append(copy.deepcopy(kwargs["messages"]))
+            return {"answer": "new first answer", "reasoning": "", "searches": [], "sources": [], "usage": {}}
+
+        with patch.object(main, "custom_stream_response", new=fake_custom_stream_response), patch.object(
+            main.httpx,
+            "AsyncClient",
+            side_effect=AssertionError("external HTTP is forbidden in retry tests"),
+        ):
+            response = self.retry(conversation_id, first_prompt["id"], provider_id, "current-model")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.wait_for_job(response.json()["job_id"])
+
+        messages = main.db.all(
+            "SELECT role,content FROM messages WHERE conversation_id=? ORDER BY id",
+            (conversation_id,),
+        )
+        self.assertEqual(
+            [(item["role"], item["content"]) for item in messages],
+            [("user", "first question"), ("assistant", "new first answer")],
+        )
+        self.assertEqual(
+            [(item["role"], item["content"]) for item in histories[0]],
+            [("user", "first question")],
+        )
+
+    def test_failed_prompt_without_assistant_can_be_retried(self) -> None:
+        provider_id = self.add_provider("current-provider", "current-model")
+        conversation_id = "failed-conversation"
+        main.db.run(
+            "INSERT INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?)",
+            (conversation_id, self.user_id, "Failed", 100, 101),
+        )
+        prompt_id = self.add_message(conversation_id, "user", "failed question", 101)
+        main.db.run(
+            """INSERT INTO jobs(
+                   id,user_id,conversation_id,provider_id,provider_type,model,
+                   effort,timezone,status,error,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "old-failed-job", self.user_id, conversation_id, provider_id, "custom",
+                "current-model", "high", "UTC", "failed", "upstream failed", 102, 102,
+            ),
+        )
+
+        async def fake_custom_stream_response(**kwargs):
+            return {"answer": "recovered answer", "reasoning": "", "searches": [], "sources": [], "usage": {}}
+
+        with patch.object(main, "custom_stream_response", new=fake_custom_stream_response), patch.object(
+            main.httpx,
+            "AsyncClient",
+            side_effect=AssertionError("external HTTP is forbidden in retry tests"),
+        ):
+            response = self.retry(conversation_id, prompt_id, provider_id, "current-model")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.wait_for_job(response.json()["job_id"])
+
+        messages = main.db.all(
+            "SELECT role,content FROM messages WHERE conversation_id=? ORDER BY id",
+            (conversation_id,),
+        )
+        self.assertEqual(
+            [(item["role"], item["content"]) for item in messages],
+            [("user", "failed question"), ("assistant", "recovered answer")],
+        )
 
 
 if __name__ == "__main__":

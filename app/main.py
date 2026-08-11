@@ -101,6 +101,7 @@ class ChatBody(BaseModel):
 
 
 class RetryBody(BaseModel):
+    prompt_message_id: int = Field(gt=0)
     provider_id: int
     model: str = ""
     effort: str = "high"
@@ -799,12 +800,12 @@ def conversation(conversation_id: str, user: dict[str, Any] = Depends(current_us
 
 
 @app.post("/api/conversations/{conversation_id}/retry")
-async def retry_latest_answer(
+async def retry_answer(
     conversation_id: str,
     body: RetryBody,
     user: dict[str, Any] = Depends(current_user),
 ) -> dict[str, str]:
-    """Delete the latest answer and regenerate it in the same conversation."""
+    """Discard messages after one prompt and regenerate its answer in place."""
     provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (body.provider_id, user["id"]))
     if not provider:
         raise HTTPException(404, "请选择有效的 API 配置")
@@ -832,23 +833,20 @@ async def retry_latest_answer(
         ).fetchone()
         if active:
             raise HTTPException(409, "当前对话仍在生成回答")
-        latest = connection.execute(
-            "SELECT id,role FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 1",
-            (conversation_id,),
-        ).fetchone()
-        if not latest or latest["role"] != "assistant":
-            raise HTTPException(409, "只能重新回答当前会话的最后一条回答")
         prompt = connection.execute(
-            "SELECT id,meta_json FROM messages WHERE conversation_id=? AND role='user' AND id<? ORDER BY id DESC LIMIT 1",
-            (conversation_id, latest["id"]),
+            "SELECT id,role,meta_json FROM messages WHERE id=? AND conversation_id=?",
+            (body.prompt_message_id, conversation_id),
         ).fetchone()
-        if not prompt:
-            raise HTTPException(409, "找不到这条回答对应的问题")
+        if not prompt or prompt["role"] != "user":
+            raise HTTPException(409, "找不到要重新回答的问题")
         prompt_meta = db.decode(prompt["meta_json"], {})
         if isinstance(prompt_meta, dict) and prompt_meta.get("attachments"):
             raise HTTPException(409, "原问题包含已清理的附件，请重新上传后再提问")
 
-        connection.execute("DELETE FROM messages WHERE id=? AND conversation_id=?", (latest["id"], conversation_id))
+        connection.execute(
+            "DELETE FROM messages WHERE conversation_id=? AND id>?",
+            (conversation_id, prompt["id"]),
+        )
         connection.execute(
             """INSERT INTO jobs(
                    id,user_id,conversation_id,provider_id,provider_type,model,
@@ -892,7 +890,7 @@ def delete_conversation(conversation_id: str, user: dict[str, Any] = Depends(cur
 
 
 @app.post("/api/chat")
-async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, str]:
+async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (body.provider_id, user["id"]))
     if not provider:
         raise HTTPException(404, "请选择有效的 API 配置")
@@ -949,7 +947,7 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
             db.run("DELETE FROM conversations WHERE id=? AND user_id=?", (conversation_id, user["id"]))
         raise HTTPException(409, "附件状态已变化，请重新选择后发送")
     launch(job_id)
-    return {"job_id": job_id, "conversation_id": conversation_id}
+    return {"job_id": job_id, "conversation_id": conversation_id, "message_id": message_id}
 
 
 @app.get("/api/jobs/{job_id}")

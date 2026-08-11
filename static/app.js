@@ -374,9 +374,9 @@ function renderMessages() {
   if (state.job && ['queued','running','failed','stopped'].includes(state.job.status)) {
     items.push({role:'assistant', content:state.job.answer || '', meta:{job_id:state.job.id,trace_key:state.job.trace_key,provider_id:state.job.provider_id,provider_type:state.job.provider_type,model:state.job.model,reasoning:state.job.reasoning,searches:state.job.searches,sources:state.job.sources,usage:state.job.usage,error:state.job.error,stopped:state.job.status==='stopped'}, live:['queued','running'].includes(state.job.status)});
   }
-  const retryableIndex = !state.job && state.messages.length && state.messages[state.messages.length-1].role === 'assistant' ? state.messages.length-1 : -1;
+  const retryBlocked = state.retryingAnswer || (state.job && ['queued','running'].includes(state.job.status));
   $('#welcome').classList.toggle('hidden', items.length > 0);
-  $('#messages').innerHTML = items.map((m,i)=>messageHtml(m,i,!!m.live,i===retryableIndex)).join('');
+  $('#messages').innerHTML = items.map((m,i)=>messageHtml(m,i,!!m.live,!retryBlocked&&!m.live)).join('');
   restoreNestedScroll($('#messages'));
   scroll.scrollTop = oldTop;
   $$('details[data-detail-key]').forEach(detail => detail.addEventListener('toggle', () => detailState.set(detail.dataset.detailKey, detail.open)));
@@ -446,7 +446,7 @@ function wireMessageActions(items) {
     const index = Number(node.dataset.index), msg = items[index];
     $('[data-action="copy"]', node).onclick = async () => { await navigator.clipboard.writeText(msg.content || ''); toast('已复制'); };
     const retryButton = $('[data-action="retry"]', node);
-    if(retryButton)retryButton.onclick=retryLatestAnswer;
+    if(retryButton)retryButton.onclick=()=>retryAnswer(index,items);
     $$('.code-download', node).forEach(button => button.onclick = () => {
       const wrap = button.closest('.code-wrap');
       const codeNode = $('pre code', wrap);
@@ -463,22 +463,26 @@ function wireMessageActions(items) {
   });
 }
 
-async function retryLatestAnswer(){
+async function retryAnswer(messageIndex,items){
   if(state.retryingAnswer||!state.conversation||!state.conversation.id)return;
   if(state.uploadingAttachments){toast('请等待附件处理完成');return}
   if(state.job&&['queued','running'].includes(state.job.status)){toast('请先停止当前回答');return}
-  const last=state.messages[state.messages.length-1];
-  if(!last||last.role!=='assistant')return;
+  const selected=items[messageIndex];if(!selected)return;
+  let prompt=selected.role==='user'?selected:null;
+  for(let i=messageIndex-1;!prompt&&i>=0;i--){if(items[i].role==='user')prompt=items[i]}
+  if(!prompt||!prompt.id){toast('找不到这条消息对应的问题，请刷新后重试');return}
   const provider=selectedProvider();if(!provider){$('#providerModal').showModal();toast('请先添加 API 配置');return}
   const model=selectedModel();if(!model){$('#providerModal').showModal();toast('请先选择模型');return}
   const conversationId=state.conversation.id;
+  const promptMessageId=prompt.id;
   state.retryingAnswer=true;setRunning(false);renderMessages();
   try{
-    const data=await api(`/api/conversations/${encodeURIComponent(conversationId)}/retry`,{method:'POST',body:{provider_id:provider.id,model,effort:$('#effort').value,timezone:browserTimezone()}});
+    const data=await api(`/api/conversations/${encodeURIComponent(conversationId)}/retry`,{method:'POST',body:{prompt_message_id:promptMessageId,provider_id:provider.id,model,effort:$('#effort').value,timezone:browserTimezone()}});
     if(!state.conversation||String(state.conversation.id)!==String(conversationId)){
       toast('已在原对话中开始重新回答');loadHistory(1);return;
     }
-    state.messages.pop();
+    const promptIndex=state.messages.findIndex(message=>String(message.id)===String(promptMessageId));
+    if(promptIndex>=0)state.messages=state.messages.slice(0,promptIndex+1);
     state.job={id:data.job_id,status:'queued',trace_key:`trace-${data.job_id}`,provider_type:provider.provider_type,provider_id:provider.id,model,answer:'',reasoning:'',searches:[],sources:[],usage:{}};
     state.retryingAnswer=false;renderMessages();startPolling(data.job_id);loadHistory(1);
   }catch(err){toast(err.message)}finally{
@@ -559,6 +563,7 @@ async function submitPrompt(value) {
   try{
     const data=await api('/api/chat',{method:'POST',body:{conversation_id:(state.conversation&&state.conversation.id)||null,content,attachment_ids:attachmentIds,provider_id:provider.id,model,effort:$('#effort').value,timezone:browserTimezone()}});
     if(!state.conversation)state.conversation={id:data.conversation_id,title:content.slice(0,36)};
+    state.messages[state.messages.length-1].id=data.message_id;
     state.pendingAttachments=[];state.attachmentDraftId=null;storeValue('attachment-draft',null);renderPendingAttachments();setAttachmentStatus('');
     storeValue('active-conversation', state.conversation.id);
     state.job.id=data.job_id;$('#conversationTitle').textContent=state.conversation.title;loadHistory(1);startPolling(data.job_id);
