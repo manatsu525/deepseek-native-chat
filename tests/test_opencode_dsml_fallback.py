@@ -25,7 +25,7 @@ class OpenCodeDsmlFallbackTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("OPENCODE_DSML_FALLBACK", None)
             self.assertTrue(applies_to("https://opencode.ai/zen/v1", "deepseek-v4-flash-free"))
-            self.assertFalse(applies_to("https://opencode.ai/zen/v1", "deepseek-v4-flash"))
+            self.assertTrue(applies_to("https://opencode.ai/zen/v1", "deepseek-v4-flash"))
             self.assertFalse(applies_to("https://integrate.api.nvidia.com/v1", "deepseek-v4-flash"))
             self.assertFalse(applies_to("https://evil-opencode.ai/v1", "deepseek-v4-flash-free"))
             self.assertFalse(applies_to("https://opencode.ai/zen/v1", "mimo-v2.5-free"))

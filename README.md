@@ -25,7 +25,7 @@
 - 浏览器自动上报 IANA 时区；Custom/MiMo 每次回答都会获得对应的当前本地日期，并要求按绝对日期核对“今天/最新”等时效性问题
 - 每个账号可以一键清空自己的全部聊天记录；级联删除消息、思考、搜索记录和任务后会截断 WAL 并压缩 SQLite，实际释放 VPS 磁盘空间
 - NVIDIA Build 的 DeepSeek V4 Flash/Pro 会按官方协议发送 `chat_template_kwargs.thinking` 与 High/Max `reasoning_effort`，并兼容解析 `reasoning`/`reasoning_content`
-- OpenCode Zen 的 `deepseek-v4-flash-free` 可选用独立 DSML fallback：全局默认关闭，只能在精确选中该 host + 模型组合时手动勾选，并且仅当原生 `tool_calls` 为空时恢复工具调用；其他 API 和模型不会生效，也可用 `OPENCODE_DSML_FALLBACK=0` 全局停用
+- OpenCode Zen 的 `deepseek-v4-flash(-free)` 可选用独立 DSML fallback：新配置默认不勾选，用户可在任意 Custom 配置中手动开关；仅匹配 OpenCode host + 对应模型时生效，并且只在原生 `tool_calls` 为空时恢复工具调用，也可用 `OPENCODE_DSML_FALLBACK=0` 全局停用
 - NVIDIA Nemotron 3 Ultra 使用 `enable_thinking`、工具兼容标志和 16K reasoning budget；GLM-5.2 使用 `thinking.enabled` 与 High/Max `reasoning_effort`
 
 ## 资源占用

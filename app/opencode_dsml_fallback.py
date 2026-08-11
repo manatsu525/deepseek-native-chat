@@ -1,7 +1,7 @@
-"""Optional DSML tool-call fallback for OpenCode's free DeepSeek V4 Flash.
+"""Optional DSML tool-call fallback for OpenCode-hosted DeepSeek V4 Flash.
 
 The adapter is deliberately narrow: it is active only for OpenCode's Zen host
-and the explicit ``deepseek-v4-flash-free`` model ID.  Native ``tool_calls``
+and the explicit DeepSeek V4 Flash model IDs below.  Native ``tool_calls``
 always win.  Set ``OPENCODE_DSML_FALLBACK=0`` to disable the module globally,
 or disable ``dsml_fallback_enabled`` in the Custom provider settings.
 """
@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 _FALSE_VALUES = {"0", "false", "no", "off"}
 _OPENCODE_HOST = "opencode.ai"
-_SUPPORTED_MODELS = {"deepseek-v4-flash-free"}
+_SUPPORTED_MODELS = {"deepseek-v4-flash", "deepseek-v4-flash-free"}
 
 # The official tokenizer uses the full-width U+FF5C separator.  Gateways have
 # also been observed to normalize it to one or more ASCII pipes.
