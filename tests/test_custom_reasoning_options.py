@@ -20,7 +20,9 @@ class CustomReasoningOptionsTests(unittest.TestCase):
         return payload
 
     def test_default_setting_does_not_include_reasoning(self):
-        self.assertFalse(_settings({})["include_reasoning_enabled"])
+        settings = _settings({})
+        self.assertFalse(settings["include_reasoning_enabled"])
+        self.assertFalse(settings["dsml_fallback_enabled"])
         self.assertNotIn("include_reasoning", self.build_payload(False))
 
     def test_enabled_setting_sends_true(self):

@@ -227,7 +227,7 @@ async def stream_response(
     dsml_fallback_active = dsml_fallback_applies(
         base_url,
         model,
-        bool(config.get("dsml_fallback_enabled", True)),
+        bool(config.get("dsml_fallback_enabled", False)),
     )
     web_tool_backend = str(config.get("web_tool_backend") or "parallel")
     parallel_mode = web_tool_backend == "parallel"
