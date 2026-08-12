@@ -90,6 +90,10 @@ class CustomSettingsBody(BaseModel):
     web_tool_backend: Literal["parallel", "keenable", "tavily", "firecrawl", "you", "legacy"] = "parallel"
 
 
+class CustomModelSettingsBody(CustomSettingsBody):
+    model: str = Field(min_length=1, max_length=300)
+
+
 class ChatBody(BaseModel):
     conversation_id: Optional[str] = None
     content: str = Field(default="", max_length=100_000)
@@ -115,6 +119,52 @@ def normalize_custom_settings(value: Any = None) -> dict[str, Any]:
     elif isinstance(value, dict):
         data.update(value)
     return CustomSettingsBody(**data).model_dump()
+
+
+def _decoded_provider_settings(row: dict[str, Any]) -> dict[str, Any]:
+    value = row.get("settings_json", {})
+    decoded = value if isinstance(value, dict) else db.decode(str(value or "{}"), {})
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def custom_settings_by_model(row: dict[str, Any], models: Optional[list[str]] = None) -> dict[str, dict[str, Any]]:
+    """Return one independent, normalized Custom configuration per model.
+
+    Older providers stored one configuration at the top level. Until they are
+    persisted in the new format, treat that legacy configuration as the seed
+    for each already-enabled model.
+    """
+    saved = _decoded_provider_settings(row)
+    selected = models if models is not None else _models_from_settings(row.get("model"), saved)
+    raw_by_model = saved.get("model_settings")
+    has_model_map = isinstance(raw_by_model, dict)
+    legacy = {key: saved[key] for key in CUSTOM_DEFAULT_SETTINGS if key in saved}
+    result: dict[str, dict[str, Any]] = {}
+    for model in selected:
+        raw = raw_by_model.get(model) if has_model_map else legacy
+        result[model] = normalize_custom_settings(raw if isinstance(raw, dict) else None)
+    return result
+
+
+def custom_settings_document(row: dict[str, Any], models: Optional[list[str]] = None) -> dict[str, Any]:
+    selected = models if models is not None else provider_models(row)
+    return {"models": selected, "model_settings": custom_settings_by_model(row, selected)}
+
+
+def custom_settings_for_model(row: dict[str, Any], model: str) -> dict[str, Any]:
+    return custom_settings_by_model(row, [model])[model]
+
+
+def migrate_custom_provider_settings() -> None:
+    """Persist the former API-wide settings as independent per-model values."""
+    for provider in db.all("SELECT * FROM providers WHERE provider_type='custom'"):
+        before = _decoded_provider_settings(provider)
+        after = custom_settings_document(provider)
+        if before != after:
+            db.run(
+                "UPDATE providers SET settings_json=? WHERE id=?",
+                (json.dumps(after, ensure_ascii=False), provider["id"]),
+            )
 
 
 # Kept as a source-compatible alias for older integrations importing the
@@ -204,11 +254,19 @@ def admin_user(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
 
 
 def public_provider(row: dict[str, Any]) -> dict[str, Any]:
-    saved_settings = db.decode(row.get("settings_json", "{}"), {})
+    saved_settings = _decoded_provider_settings(row)
     saved_models = _models_from_settings(row.get("model"), saved_settings)
     key = row.pop("api_key", "")
     row["provider_type"] = provider_type(row)
-    row["settings"] = saved_settings
+    if row["provider_type"] == "custom":
+        row["model_settings"] = custom_settings_by_model(row, saved_models)
+        # Keep the old field useful for clients that have not yet learned the
+        # per-model response shape. It represents only the provider's primary
+        # model and is no longer used by this web client.
+        row["settings"] = row["model_settings"].get(row.get("model"), normalize_custom_settings())
+    else:
+        row["model_settings"] = {}
+        row["settings"] = saved_settings
     row["models"] = saved_models
     row.pop("settings_json", None)
     row["api_key_masked"] = (key[:3] + "••••" + key[-4:]) if len(key) > 8 else "••••••••"
@@ -321,8 +379,8 @@ async def run_job(job_id: str) -> None:
                 attachment_records,
                 kind == "custom",
             )
-        provider_settings = db.decode(provider.get("settings_json", "{}"), {})
         if kind == "custom":
+            provider_settings = custom_settings_for_model(provider, job["model"])
             result = await custom_stream_response(
                 base_url=provider["base_url"],
                 api_key=provider["api_key"],
@@ -403,6 +461,7 @@ def launch(job_id: str) -> None:
 async def lifespan(_: FastAPI):
     global secret, attachment_cleanup_task
     db.init()
+    migrate_custom_provider_settings()
     secret = load_secret(settings.secret_path)
     if not db.one("SELECT id FROM users LIMIT 1"):
         username = os.getenv("ADMIN_USERNAME", "admin").strip() or "admin"
@@ -707,8 +766,14 @@ def add_provider(body: ProviderBody, user: dict[str, Any] = Depends(current_user
         model = body.model.strip() or "deepseek-v4-flash"
         selected_models = [model]
     validate_provider_selection(kind, model)
-    settings_value = normalize_custom_settings(body.custom_settings if kind == "custom" else None)
-    settings_value["models"] = selected_models
+    if kind == "custom":
+        initial_settings = normalize_custom_settings(body.custom_settings)
+        settings_value = {
+            "models": selected_models,
+            "model_settings": {item: dict(initial_settings) for item in selected_models},
+        }
+    else:
+        settings_value = {"models": selected_models}
     settings_json = json.dumps(settings_value, ensure_ascii=False)
     provider_id = db.run(
         "INSERT INTO providers(user_id,name,api_key,base_url,model,provider_type,settings_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -744,10 +809,11 @@ def update_provider_models(provider_id: int, body: ProviderModelsBody, user: dic
         model = body.model.strip() or "deepseek-v4-flash"
         selected_models = [model]
     validate_provider_selection(kind, model)
-    settings_value = db.decode(provider.get("settings_json", "{}"), {})
-    if not isinstance(settings_value, dict):
-        settings_value = {}
-    settings_value["models"] = selected_models
+    settings_value = (
+        custom_settings_document(provider, selected_models)
+        if kind == "custom"
+        else {"models": selected_models}
+    )
     db.run(
         "UPDATE providers SET model=?,settings_json=? WHERE id=? AND user_id=?",
         (model, json.dumps(settings_value, ensure_ascii=False), provider_id, user["id"]),
@@ -766,15 +832,16 @@ def delete_provider(provider_id: int, user: dict[str, Any] = Depends(current_use
 
 
 @app.put("/api/providers/{provider_id}/settings")
-def update_provider_settings(provider_id: int, body: CustomSettingsBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+def update_provider_settings(provider_id: int, body: CustomModelSettingsBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"]))
     if not provider:
         raise HTTPException(404, "API 配置不存在")
     if provider_type(provider) != "custom":
         raise HTTPException(400, "只有 custom API 支持这组参数")
-    settings_value = db.decode(provider.get("settings_json", "{}"), {})
-    settings_value.update(body.model_dump())
-    settings_value["models"] = provider_models(provider)
+    model = body.model.strip()
+    validate_provider_selection("custom", model, provider)
+    settings_value = custom_settings_document(provider)
+    settings_value["model_settings"][model] = normalize_custom_settings(body.model_dump(exclude={"model"}))
     db.run("UPDATE providers SET settings_json=? WHERE id=? AND user_id=?", (json.dumps(settings_value, ensure_ascii=False), provider_id, user["id"]))
     return public_provider(db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"])))
 

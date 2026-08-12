@@ -730,9 +730,17 @@ async function testProvider(){
 function checkedCustomModels(){return $$('#customModelList input[type="checkbox"]:checked').map(input=>input.value)}
 function providerFormData(){const custom=providerType()==='custom';const manual=custom?manualModelList():[];const selected=custom?[...new Set([...checkedCustomModels(),...manual])]:['deepseek-v4-flash'];return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:selected[0]||$('#providerModel').value||'deepseek-v4-flash',selected_models:selected,manual_models:manual}}
 
-function customSettings(provider){return {...{thinking:'enabled',reasoning_effort_enabled:true,dsml_fallback_enabled:false,max_completion_tokens:65536,temperature:1,top_p:.95,web_tool_backend:'parallel'},...(provider&&provider.settings||{})}}
+function customSettings(provider,model=selectedModel()){
+  const defaults={thinking:'enabled',reasoning_effort_enabled:true,dsml_fallback_enabled:false,max_completion_tokens:65536,temperature:1,top_p:.95,web_tool_backend:'parallel'};
+  const byModel=provider&&provider.model_settings;
+  const saved=byModel&&typeof byModel==='object'&&byModel[model]&&typeof byModel[model]==='object'
+    ?byModel[model]
+    :(provider&&String(provider.model)===String(model)&&provider.settings||{});
+  return {...defaults,...saved};
+}
 function fillCustomSettings(){
-  const config=customSettings(selectedProvider());
+  const model=selectedModel(),config=customSettings(selectedProvider(),model);
+  $('#customModalTitle').textContent=`Custom 参数 · ${model}`;$('#customModalTitle').title=model;$('#customStatus').textContent='';
   $('#customThinking').value=config.thinking;$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customDsmlFallbackEnabled').checked=config.dsml_fallback_enabled;$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
   syncCustomThinkingFields();syncCustomToolFields();
 }
@@ -741,8 +749,9 @@ function syncCustomToolFields(){const info=customWebToolInfo[$('#customWebToolBa
 function openCustomSettings(){if(!selectedProvider()||normalizeProviderType(selectedProvider().provider_type)!=='custom'){toast('请先选择 Custom API');return}fillCustomSettings();$('#customModal').showModal()}
 async function saveCustomSettings(event){
   event.preventDefault(); const provider=selectedProvider(); if(!provider)return;
-  const body={thinking:$('#customThinking').value,reasoning_effort_enabled:$('#customReasoningEffortEnabled').checked,dsml_fallback_enabled:$('#customDsmlFallbackEnabled').checked,max_completion_tokens:Number($('#customMaxCompletion').value),temperature:Number($('#customTemperature').value),top_p:Number($('#customTopP').value),web_tool_backend:$('#customWebToolBackend').value};
-  try{const updated=await api(`/api/providers/${provider.id}/settings`,{method:'PUT',body});const index=state.providers.findIndex(x=>x.id===provider.id);if(index>=0)state.providers[index]=updated;$('#customModal').close();updateProviderUi();toast('Custom 参数已保存')}catch(err){$('#customStatus').textContent=err.message}
+  const model=selectedModel();
+  const body={model,thinking:$('#customThinking').value,reasoning_effort_enabled:$('#customReasoningEffortEnabled').checked,dsml_fallback_enabled:$('#customDsmlFallbackEnabled').checked,max_completion_tokens:Number($('#customMaxCompletion').value),temperature:Number($('#customTemperature').value),top_p:Number($('#customTopP').value),web_tool_backend:$('#customWebToolBackend').value};
+  try{const updated=await api(`/api/providers/${provider.id}/settings`,{method:'PUT',body});const index=state.providers.findIndex(x=>x.id===provider.id);if(index>=0)state.providers[index]=updated;$('#customModal').close();updateProviderUi();toast(`${model} 的 Custom 参数已保存`)}catch(err){$('#customStatus').textContent=err.message}
 }
 
 async function loadUsers(){const users=await api('/api/users');$('#userList').innerHTML=users.map(u=>`<div class="list-item"><span class="avatar">${escapeHtml(u.username[0].toUpperCase())}</span><div class="list-item-main"><strong>${escapeHtml(u.username)}</strong><small>${u.is_admin?'管理员':'普通账号'}</small></div><div class="item-actions"><button class="soft-btn" data-password-user="${u.id}" data-username="${escapeHtml(u.username)}">改密码</button>${u.id!==state.me.id?`<button class="danger-btn" data-user="${u.id}">删除</button>`:''}</div></div>`).join('');$$('[data-user]',$('#userList')).forEach(b=>b.onclick=async()=>{if(!confirm('删除账号及其全部独立数据？'))return;try{await api(`/api/users/${b.dataset.user}`,{method:'DELETE'});loadUsers()}catch(err){toast(err.message)}});$$('[data-password-user]',$('#userList')).forEach(b=>b.onclick=()=>{$('#passwordUserId').value=b.dataset.passwordUser;$('#passwordTarget').textContent=`正在修改：${b.dataset.username}`;$('#changePassword').value='';$('#changePasswordAgain').value='';$('#passwordError').textContent='';$('#passwordModal').showModal()})}
