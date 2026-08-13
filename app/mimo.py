@@ -93,6 +93,8 @@ DEFAULT_SETTINGS = {
     "top_p": 0.95,
     "web_tool_backend": "parallel",
 }
+REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+DEFAULT_REASONING_EFFORT = "high"
 
 _jina_call_times: deque[float] = deque()
 _jina_rate_lock = asyncio.Lock()

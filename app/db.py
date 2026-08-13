@@ -56,7 +56,8 @@ class Database:
                     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                     title TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
+                    updated_at INTEGER NOT NULL,
+                    pinned_at INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_conversations_user_updated ON conversations(user_id, updated_at DESC);
                 CREATE TABLE IF NOT EXISTS messages (
@@ -112,6 +113,12 @@ class Database:
                 db.execute("ALTER TABLE providers ADD COLUMN provider_type TEXT NOT NULL DEFAULT 'deepseek'")
             if "settings_json" not in provider_columns:
                 db.execute("ALTER TABLE providers ADD COLUMN settings_json TEXT NOT NULL DEFAULT '{}'")
+            conversation_columns = {row["name"] for row in db.execute("PRAGMA table_info(conversations)").fetchall()}
+            if "pinned_at" not in conversation_columns:
+                db.execute("ALTER TABLE conversations ADD COLUMN pinned_at INTEGER")
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conversations_user_pinned_updated ON conversations(user_id, pinned_at DESC, updated_at DESC)"
+            )
             job_columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)").fetchall()}
             if "provider_type" not in job_columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN provider_type TEXT NOT NULL DEFAULT 'deepseek'")

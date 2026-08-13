@@ -24,7 +24,8 @@ from .db import Database
 from .deepseek import list_models as deepseek_list_models
 from .deepseek import stream_response as deepseek_stream_response
 from .mimo import DEFAULT_SETTINGS as CUSTOM_DEFAULT_SETTINGS
-from .mimo import MIMO_MAX_COMPLETION_TOKENS, custom_auth_headers, is_mimo_model, list_models as custom_list_models
+from .mimo import DEFAULT_REASONING_EFFORT, MIMO_MAX_COMPLETION_TOKENS, REASONING_EFFORTS
+from .mimo import custom_auth_headers, is_mimo_model, list_models as custom_list_models
 from .mimo_local import stream_response as custom_stream_response
 from .security import load_secret, make_token, password_hash, password_ok, read_token
 
@@ -100,7 +101,7 @@ class ChatBody(BaseModel):
     attachment_ids: list[str] = Field(default_factory=list, max_length=attachments.MAX_ATTACHMENTS)
     provider_id: int
     model: str = ""
-    effort: str = "high"
+    effort: str = DEFAULT_REASONING_EFFORT
     timezone: str = Field(default="UTC", min_length=1, max_length=64)
 
 
@@ -108,8 +109,12 @@ class RetryBody(BaseModel):
     prompt_message_id: int = Field(gt=0)
     provider_id: int
     model: str = ""
-    effort: str = "high"
+    effort: str = DEFAULT_REASONING_EFFORT
     timezone: str = Field(default="UTC", min_length=1, max_length=64)
+
+
+class PinBody(BaseModel):
+    pinned: bool
 
 
 def normalize_custom_settings(value: Any = None) -> dict[str, Any]:
@@ -234,6 +239,28 @@ def clean_timezone(value: str) -> str:
     except (ZoneInfoNotFoundError, ValueError) as exc:
         raise HTTPException(400, "无效的浏览器时区") from exc
     return name
+
+
+def validate_effort(effort: str) -> str:
+    if effort not in REASONING_EFFORTS:
+        raise HTTPException(400, "无效的思考深度")
+    return effort
+
+
+def public_conversation(row: dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    item["pinned"] = bool(item.get("pinned_at"))
+    return item
+
+
+def trim_old_conversations(user_id: int) -> None:
+    """Keep at most 100 unpinned chats. Pinned chats are never auto-deleted."""
+    surplus = db.all(
+        "SELECT id FROM conversations WHERE user_id=? AND pinned_at IS NULL ORDER BY updated_at DESC LIMIT -1 OFFSET 100",
+        (user_id,),
+    )
+    for item in surplus:
+        db.run("DELETE FROM conversations WHERE id=?", (item["id"],))
 
 
 def current_user(session: Optional[str] = Cookie(default=None)) -> dict[str, Any]:
@@ -850,8 +877,13 @@ def update_provider_settings(provider_id: int, body: CustomModelSettingsBody, us
 def conversations(page: int = 1, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     page = max(1, page)
     total = db.one("SELECT COUNT(*) AS n FROM conversations WHERE user_id=?", (user["id"],))["n"]
-    rows = db.all("SELECT * FROM conversations WHERE user_id=? ORDER BY updated_at DESC LIMIT 10 OFFSET ?", (user["id"], (page - 1) * 10))
-    return {"items": rows, "page": page, "pages": max(1, (total + 9) // 10), "total": total}
+    rows = db.all(
+        """SELECT * FROM conversations WHERE user_id=?
+           ORDER BY CASE WHEN pinned_at IS NULL THEN 1 ELSE 0 END, pinned_at DESC, updated_at DESC
+           LIMIT 10 OFFSET ?""",
+        (user["id"], (page - 1) * 10),
+    )
+    return {"items": [public_conversation(row) for row in rows], "page": page, "pages": max(1, (total + 9) // 10), "total": total}
 
 
 @app.get("/api/conversations/{conversation_id}")
@@ -863,7 +895,28 @@ def conversation(conversation_id: str, user: dict[str, Any] = Depends(current_us
     for row in rows:
         row["meta"] = db.decode(row.pop("meta_json"), {})
     active = db.one("SELECT * FROM jobs WHERE conversation_id=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1", (conversation_id,))
-    return {"conversation": conv, "messages": rows, "active_job": public_job(active) if active else None}
+    return {"conversation": public_conversation(conv), "messages": rows, "active_job": public_job(active) if active else None}
+
+
+@app.post("/api/conversations/{conversation_id}/pin")
+def pin_conversation(
+    conversation_id: str,
+    body: PinBody,
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    conv = db.one("SELECT * FROM conversations WHERE id=? AND user_id=?", (conversation_id, user["id"]))
+    if not conv:
+        raise HTTPException(404, "对话不存在")
+    if body.pinned:
+        if not conv.get("pinned_at"):
+            db.run("UPDATE conversations SET pinned_at=? WHERE id=? AND user_id=?", (now(), conversation_id, user["id"]))
+    else:
+        db.run(
+            "UPDATE conversations SET pinned_at=NULL, updated_at=? WHERE id=? AND user_id=?",
+            (now(), conversation_id, user["id"]),
+        )
+    updated = db.one("SELECT * FROM conversations WHERE id=? AND user_id=?", (conversation_id, user["id"]))
+    return public_conversation(updated or conv)
 
 
 @app.post("/api/conversations/{conversation_id}/retry")
@@ -881,8 +934,7 @@ async def retry_answer(
     if kind == "deepseek" and model != provider["model"]:
         raise HTTPException(400, "当前回答使用的模型与 API 配置不一致，请重新选择模型配置")
     validate_provider_selection(kind, model, provider)
-    if body.effort not in {"high", "max"}:
-        raise HTTPException(400, "无效的思考深度")
+    validate_effort(body.effort)
     timezone_name = clean_timezone(body.timezone)
     job_id = uuid.uuid4().hex
     created_at = now()
@@ -966,8 +1018,7 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
     if kind == "deepseek" and model != provider["model"]:
         raise HTTPException(400, "当前回答使用的模型与 API 配置不一致，请重新选择模型配置")
     validate_provider_selection(kind, model, provider)
-    if body.effort not in {"high", "max"}:
-        raise HTTPException(400, "无效的思考深度")
+    validate_effort(body.effort)
     content = body.content.strip()
     attachment_ids = list(dict.fromkeys(body.attachment_ids))
     if any(not re.fullmatch(r"[a-f0-9]{32}", item) for item in attachment_ids):
@@ -992,9 +1043,7 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
         created_conversation = True
         title_source = content or "、".join(item["original_name"] for item in attachment_records) or "附件对话"
         db.run("INSERT INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?)", (conversation_id, user["id"], title_for(title_source), now(), now()))
-        surplus = db.all("SELECT id FROM conversations WHERE user_id=? ORDER BY updated_at DESC LIMIT -1 OFFSET 100", (user["id"],))
-        for item in surplus:
-            db.run("DELETE FROM conversations WHERE id=?", (item["id"],))
+        trim_old_conversations(user["id"])
     attachment_meta = [public_attachment(item) for item in attachment_records]
     message_content = content or "请分析这些附件。"
     message_id = db.run(

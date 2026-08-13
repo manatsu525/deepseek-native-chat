@@ -492,12 +492,23 @@ async function retryAnswer(messageIndex,items){
 
 async function loadHistory(page=1) {
   const data = await api(`/api/conversations?page=${page}`); state.page=data.page; state.pages=data.pages;
-  if(page===1) state.latestConversationId=data.items[0] ? data.items[0].id : null;
+  if(page===1){
+    const latest=data.items.find(item=>!item.pinned)||data.items[0];
+    state.latestConversationId=latest?latest.id:null;
+  }
   $('#historyCount').textContent=data.total;
   $('#clearHistory').disabled=!data.total;
-  $('#history').innerHTML=data.items.map(c=>`<button class="history-item ${state.conversation&&state.conversation.id===c.id?'active':''}" data-id="${c.id}"><span>${escapeHtml(c.title)}</span><b class="history-delete" title="删除">×</b></button>`).join('') || '<p class="muted" style="padding:10px;font-size:12px">还没有对话</p>';
+  $('#history').innerHTML=data.items.map(c=>`<button class="history-item ${state.conversation&&state.conversation.id===c.id?'active':''}${c.pinned?' pinned':''}" data-id="${c.id}"><span>${escapeHtml(c.title)}</span><b class="history-pin" title="${c.pinned?'取消置顶':'置顶'}">${c.pinned?'★':'☆'}</b><b class="history-delete" title="删除">×</b></button>`).join('') || '<p class="muted" style="padding:10px;font-size:12px">还没有对话</p>';
   $$('.history-item').forEach(button => {
-    button.onclick=e=>{if(e.target.classList.contains('history-delete'))return;openConversation(button.dataset.id);closeSidebar()};
+    button.onclick=e=>{if(e.target.classList.contains('history-delete')||e.target.classList.contains('history-pin'))return;openConversation(button.dataset.id);closeSidebar()};
+    $('.history-pin',button).onclick=async e=>{
+      e.stopPropagation();
+      if(state.retryingAnswer){toast('正在重新回答');return}
+      try{
+        await api(`/api/conversations/${button.dataset.id}/pin`,{method:'POST',body:{pinned:!button.classList.contains('pinned')}});
+        await loadHistory(1);
+      }catch(err){toast(err.message)}
+    };
     $('.history-delete',button).onclick=async e=>{e.stopPropagation();if(state.retryingAnswer){toast('正在重新回答');return}if(!confirm('永久删除这个对话？'))return;try{await api(`/api/conversations/${button.dataset.id}`,{method:'DELETE'});if(state.conversation&&state.conversation.id===button.dataset.id)newConversation();await loadHistory(state.page)}catch(err){toast(err.message)}};
   });
   $('#pagination').innerHTML = state.pages>1 ? `<button id="prevPage" ${state.page<=1?'disabled':''}>‹</button><button>${state.page}/${state.pages}</button><button id="nextPage" ${state.page>=state.pages?'disabled':''}>›</button>` : '';
@@ -745,7 +756,7 @@ function fillCustomSettings(){
   $('#customThinking').value=config.thinking;$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customDsmlFallbackEnabled').checked=config.dsml_fallback_enabled;$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
   syncCustomThinkingFields();syncCustomToolFields();
 }
-function syncCustomThinkingFields(){const mimo=isMimoModel(selectedModel()),thinking=$('#customThinking').value==='enabled',effort=$('#customReasoningEffortEnabled').checked;$('#customTemperature').disabled=mimo&&thinking;$('#customTopP').disabled=mimo&&thinking;$('#customSamplingNote').textContent=`thinking 将${thinking?'开启':'关闭'}；reasoning_effort 将${effort?'按顶部 High/Max 发送':'不发送'}。已知模型使用官方字段，其他 Custom 使用通用顶层字段；接口不支持时可在这里关闭。`}
+function syncCustomThinkingFields(){const mimo=isMimoModel(selectedModel()),thinking=$('#customThinking').value==='enabled',effort=$('#customReasoningEffortEnabled').checked;$('#customTemperature').disabled=mimo&&thinking;$('#customTopP').disabled=mimo&&thinking;$('#customSamplingNote').textContent=`thinking 将${thinking?'开启':'关闭'}；reasoning_effort 将${effort?'按顶部所选档位发送':'不发送'}。已知模型使用官方字段，其他 Custom 使用通用顶层字段；接口不支持时可在这里关闭。`}
 function syncCustomToolFields(){const info=customWebToolInfo[$('#customWebToolBackend').value]||customWebToolInfo.parallel;$('#customToolNote').textContent=`${info.description} 不需要 API Key；不会自动切换、并发调用或回退到其他方案。`}
 function openCustomSettings(){if(!selectedProvider()||normalizeProviderType(selectedProvider().provider_type)!=='custom'){toast('请先选择 Custom API');return}fillCustomSettings();$('#customModal').showModal()}
 async function saveCustomSettings(event){

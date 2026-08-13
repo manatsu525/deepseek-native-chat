@@ -14,19 +14,19 @@
 - 图片低内存缩放后发送给 Custom 多模态模型；PDF、DOCX、XLSX、文本和代码文件在本地限量提取文字
 - Markdown、可换行横向滚动表格、KaTeX 行内/块级公式和代码块渲染；代码块可复制、下载
 - 消息复制与重新回答
-- 每账号最多保留 100 个对话，历史每页显示 10 个
+- 每账号最多保留 100 个未置顶对话，历史每页显示 10 个；可从历史中置顶一个或多个对话，置顶项固定在列表顶部，取消置顶后回到普通列表最前
 - 最多 3 个账号，管理员可在前端新增或删除账号
 - 各账号的对话和 API 配置相互隔离
 - 前端测试 API、读取 `/models` 全部模型并勾选、手动填写模型名、重新编辑已保存 API 的模型列表、删除 API
-- Custom 参数：所有模型均可开关 `thinking`，可独立开关 `reasoning_effort` 并使用顶部 High/Max，另有普通采样参数、默认 65,536 的生成上限和联网方案切换
+- Custom 参数：所有模型均可开关 `thinking`，可独立开关 `reasoning_effort` 并使用顶部 Low/Medium/High/Extra High/Max 五档（默认 High），另有普通采样参数、默认 65,536 的生成上限和联网方案切换
 - Custom 匿名联网方案：Parallel Search + Fetch、Keenable Search + Live Fetch、Tavily Keyless Search + Extract、Firecrawl Keyless Search + Scrape、You Search + Jina Fetch、DDG Search + Jina Fetch
 - SQLite 单文件数据库、自签 HTTPS、systemd 守护
 - 手机和桌面端响应式界面
 - 浏览器自动上报 IANA 时区；Custom/MiMo 每次回答都会获得对应的当前本地日期，并要求按绝对日期核对“今天/最新”等时效性问题
 - 每个账号可以一键清空自己的全部聊天记录；级联删除消息、思考、搜索记录和任务后会截断 WAL 并压缩 SQLite，实际释放 VPS 磁盘空间
-- NVIDIA Build 的 DeepSeek V4 Flash/Pro 会按官方协议发送 `chat_template_kwargs.thinking` 与 High/Max `reasoning_effort`，并兼容解析 `reasoning`/`reasoning_content`
+- NVIDIA Build 的 DeepSeek V4 Flash/Pro 会按官方协议发送 `chat_template_kwargs.thinking` 与所选档位的 `reasoning_effort`，并兼容解析 `reasoning`/`reasoning_content`
 - OpenCode Zen 的 `deepseek-v4-flash(-free)` 可选用独立 DSML fallback：新配置默认不勾选，用户可在任意 Custom 配置中手动开关；仅匹配 OpenCode host + 对应模型时生效，并且只在原生 `tool_calls` 为空时恢复工具调用，也可用 `OPENCODE_DSML_FALLBACK=0` 全局停用
-- NVIDIA Nemotron 3 Ultra 使用 `enable_thinking`、工具兼容标志和 16K reasoning budget；GLM-5.2 使用 `thinking.enabled` 与 High/Max `reasoning_effort`
+- NVIDIA Nemotron 3 Ultra 使用 `enable_thinking`、工具兼容标志和 16K reasoning budget；GLM-5.2 使用 `thinking.enabled` 与所选档位的 `reasoning_effort`
 
 ## 资源占用
 
@@ -82,7 +82,7 @@ Custom 每个工具轮最多执行 1 个工具，最多 6 个工具轮；每个�
 
 前端发起问题时会同时提交浏览器的 IANA 时区（如 `Asia/Shanghai`）。后端只把“当前本地日期 + 时区”追加到 Custom 的固定系统提示词末尾，并要求模型把“今天、昨天、明天、目前、最新”等相对时间转换为绝对日期，核对来源的发布/事件日期，禁止把搜索返回的最新一篇误当作当天资料。日期每天只变化一次，且放在静态提示之后，以尽量保留固定前缀的缓存价值；旧客户端未提交时区时使用 UTC。
 
-Custom 的 `thinking` 和 `reasoning_effort` 都由用户控制：`thinking` 开/关会发送给每个模型，`reasoning_effort` 有独立开关，开启时使用顶部 High/Max。MiMo、NVIDIA DeepSeek V4 和 NVIDIA Nemotron 3 Ultra 使用其官方请求方言，其他 Custom 使用通用顶层 `thinking` / `reasoning_effort`；OpenAI 兼容协议本身并未标准化这两个扩展字段，因此不兼容的供应商可能返回参数错误，此时可在 Custom 参数中分别关闭。后端兼容解析 `reasoning` / `reasoning_content` 输出。工具额度结束后，后端会强制进入最终作答阶段；模型若把工具请求伪装成 `<tool_call>` 文本，该输出不会被保存为答案，而会进行一次受限纠正。
+Custom 的 `thinking` 和 `reasoning_effort` 都由用户控制：`thinking` 开/关会发送给每个模型，`reasoning_effort` 有独立开关，开启时使用顶部 Low 到 Max 五档（默认 High）。MiMo、NVIDIA DeepSeek V4 和 NVIDIA Nemotron 3 Ultra 使用其官方请求方言，其他 Custom 使用通用顶层 `thinking` / `reasoning_effort`；OpenAI 兼容协议本身并未标准化这两个扩展字段，因此不兼容的供应商可能返回参数错误，此时可在 Custom 参数中分别关闭。后端兼容解析 `reasoning` / `reasoning_content` 输出。工具额度结束后，后端会强制进入最终作答阶段；模型若把工具请求伪装成 `<tool_call>` 文本，该输出不会被保存为答案，而会进行一次受限纠正。
 
 备用方案的 `fetch_webpage` 把公开 URL 交给 `https://r.jina.ai/`，得到干净 Markdown 后作为 `tool` 结果回传给 Custom。Jina Reader 不需要 API Key；后端按约 20 次/分钟做进程级节流，每个回答最多读取 3 页，每页最多保留约 8,000 字符，并设置 `X-Respond-With: markdown`、`X-Timeout: 30` 和 `X-Remove-Selector`，自动移除常见 header、nav、aside、footer、sidebar、菜单、广告和 cookie 弹窗元素。Jina 官方支持通过 `X-Remove-Selector` 排除这些 CSS 选择器；如果目标站点有明确的文章容器，后续还可以针对该站点增加 `X-Target-Selector`。
 

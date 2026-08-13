@@ -49,6 +49,8 @@ from .mimo import (
     _normalize_usage,
     _url,
     is_mimo_model,
+    REASONING_EFFORTS,
+    DEFAULT_REASONING_EFFORT,
 )
 from .parallel_mcp import ParallelMCPClient
 from .opencode_dsml_fallback import DsmlStreamBuffer, applies_to as dsml_fallback_applies, recover_tool_calls
@@ -184,7 +186,7 @@ def _apply_thinking_options(
     host = (urlsplit(base_url).hostname or "").casefold()
     model_name = str(model or "").casefold().rsplit("/", 1)[-1]
     thinking_enabled = thinking == "enabled"
-    selected_effort = effort if effort in {"high", "max"} else "high"
+    selected_effort = effort if effort in REASONING_EFFORTS else DEFAULT_REASONING_EFFORT
     if is_mimo_model(model):
         payload["thinking"] = {"type": thinking}
     elif _is_nvidia_deepseek_v4(base_url, model):
