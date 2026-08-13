@@ -677,7 +677,7 @@ function syncProviderForm(){
   const custom=providerType()==='custom';
   const base=$('#providerBase'), model=$('#providerModel');
   base.value=custom?'https://api.openai.com/v1':'https://api.deepseek.com';
-  model.innerHTML='<option value="deepseek-v4-flash">deepseek-v4-flash</option>';
+  model.innerHTML='<option value="deepseek-v4-flash">deepseek-v4-flash</option><option value="deepseek-v4-pro">deepseek-v4-pro</option>';
   $('#providerModelField').classList.toggle('hidden',custom);
   $('#manualModelField').classList.toggle('hidden',!custom);
   $('#customModelsPanel').classList.toggle('hidden',!custom||!$('#customModelList input'));
@@ -722,13 +722,14 @@ async function testProvider(){
       renderCustomModels(available,selected.length?selected:(editing?providerModels(editing):available.slice(0,1)));
       $('#providerStatus').textContent=`连接成功，读取 ${(result.models||[]).length} 个模型${(result.manual_tested||[]).length?`，手填模型验证 ${result.manual_tested.length} 个`:''}${result.models_warning?'（/models 不可用，已使用手填模型验证）':''}。请勾选后保存。`;
     }else{
-      $('#providerModel').value='deepseek-v4-flash';
-      $('#providerStatus').textContent='连接成功，可用模型：deepseek-v4-flash';
+      const supported=result.supported_models||['deepseek-v4-flash','deepseek-v4-pro'];
+      if(!supported.includes($('#providerModel').value))$('#providerModel').value=supported[0]||'deepseek-v4-flash';
+      $('#providerStatus').textContent=`连接成功，可用模型：${supported.join('、')}`;
     }
   }catch(err){$('#providerStatus').textContent=err.message}finally{button.disabled=false}
 }
 function checkedCustomModels(){return $$('#customModelList input[type="checkbox"]:checked').map(input=>input.value)}
-function providerFormData(){const custom=providerType()==='custom';const manual=custom?manualModelList():[];const selected=custom?[...new Set([...checkedCustomModels(),...manual])]:['deepseek-v4-flash'];return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:selected[0]||$('#providerModel').value||'deepseek-v4-flash',selected_models:selected,manual_models:manual}}
+function providerFormData(){const custom=providerType()==='custom';const manual=custom?manualModelList():[];const selected=custom?[...new Set([...checkedCustomModels(),...manual])]:[$('#providerModel').value||'deepseek-v4-flash'];return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:selected[0]||'deepseek-v4-flash',selected_models:selected,manual_models:manual}}
 
 function customSettings(provider,model=selectedModel()){
   const defaults={thinking:'enabled',reasoning_effort_enabled:true,dsml_fallback_enabled:false,max_completion_tokens:65536,temperature:1,top_p:.95,web_tool_backend:'parallel'};

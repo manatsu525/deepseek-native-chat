@@ -37,7 +37,7 @@ attachment_upload_locks: dict[int, asyncio.Lock] = {}
 attachment_processing_lock = asyncio.Lock()
 attachment_job_lock = asyncio.Lock()
 SUPPORTED_MODELS = {
-    "deepseek": {"deepseek-v4-flash"},
+    "deepseek": {"deepseek-v4-flash", "deepseek-v4-pro"},
     # Custom providers advertise their own model IDs through /models or a
     # manually entered model name, so there is no static allow-list here.
     "custom": set(),
