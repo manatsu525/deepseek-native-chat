@@ -30,7 +30,7 @@ class CodeAgentTests(unittest.TestCase):
         self.assertTrue(looks_like_coding_request("implement a function to merge intervals"))
 
     def test_write_code_tool_is_not_labeled_as_page_fetch(self) -> None:
-        self.assertEqual(MAX_AGENT_ITERATIONS, 2)
+        self.assertEqual(MAX_AGENT_ITERATIONS, 3)
         self.assertEqual(_step_action("write_and_verify_code"), "code_write")
         self.assertEqual(_step_action("fetch_webpage"), "open_page")
         self.assertEqual(_step_action("web_search"), "search")
@@ -176,6 +176,85 @@ class CodeAgentTests(unittest.TestCase):
         self.assertTrue(result["passed"], result)
         self.assertEqual(result["tests"][0]["command"], "static_verify")
         self.assertNotIn("已达到 2 轮编码上限", result["review"])
+
+    def test_invalid_test_command_does_not_reloop_the_coder(self) -> None:
+        calls: list[str] = []
+
+        async def complete_round(**kwargs):
+            names = {item["function"]["name"] for item in kwargs["tools"]}
+            if "submit_code" in names:
+                calls.append("code")
+                return {
+                    "content": "",
+                    "reasoning": "",
+                    "usage": {},
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {
+                                "name": "submit_code",
+                                "arguments": json.dumps(
+                                    {
+                                        "plan": "add",
+                                        "files": [{"path": "mod.py", "content": "def add(a,b):\n    return a+b\n"}],
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                }
+            calls.append("review")
+            return {
+                "content": "",
+                "reasoning": "",
+                "usage": {},
+                "tool_calls": [
+                    {
+                        "id": "r1",
+                        "type": "function",
+                        "function": {
+                            "name": "submit_review",
+                            "arguments": json.dumps(
+                                {
+                                    "passed": False,
+                                    "issues": "needs tests",
+                                    "test_commands": ["python3 -c 'print(1)'"],
+                                }
+                            ),
+                        },
+                    }
+                ],
+            }
+
+        async def runner():
+            return await run_verified_coding(
+                task="write add()",
+                api_client=object(),
+                base_url="https://invalid.example/v1",
+                api_key="offline",
+                model="dummy",
+                config=dict(DEFAULT_SETTINGS),
+                effort="high",
+                timeout=30,
+                stopped=lambda: False,
+                update=AsyncMock(),
+                budget=SharedWebBudget(),
+                backend="parallel",
+                clients={},
+                parent_answer="",
+                parent_reasoning="",
+                parent_usage={},
+                complete_round=complete_round,
+            )
+
+        import asyncio
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(code_agents, "settings", Settings(data_dir=Path(temp))):
+            result = asyncio.run(runner())
+        self.assertEqual(calls.count("code"), 1)
+        self.assertFalse(result["passed"])
+        self.assertIn("没跑起来", result["review"])
 
     def test_nested_coding_job_is_rejected(self) -> None:
         token = coding_job_active.set(True)

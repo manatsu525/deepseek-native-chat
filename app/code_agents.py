@@ -44,7 +44,7 @@ from .mimo import (
 from .keyless_web import KEYLESS_FETCH_WEBPAGE_TOOL, KEYLESS_SEARCH_WEB_TOOL
 
 
-MAX_AGENT_ITERATIONS = 2
+MAX_AGENT_ITERATIONS = 3
 MAX_AGENT_TOOL_ROUNDS = 4
 CODE_STEP_ACTIONS = {"code_plan", "code_write", "code_review", "code_test"}
 coding_job_active: contextvars.ContextVar[bool] = contextvars.ContextVar("coding_job_active", default=False)
@@ -479,6 +479,20 @@ async def _run_web_tool(
     raise ValueError(f"不支持的工具：{name}")
 
 
+def classify_test_run(*, tests: list[dict[str, Any]], sandbox_blocked: bool, executed: bool) -> str:
+    """Only executed tests can send the coder back to work.
+
+    harness_error: commands never ran (illegal flags, path escape, etc.)
+    code_failed: tests ran and the program failed them
+    passed: tests ran and succeeded
+    """
+    if sandbox_blocked or not executed or not tests:
+        return "harness_error"
+    if all(item.get("ok") for item in tests):
+        return "passed"
+    return "code_failed"
+
+
 def _append_step(budget: SharedWebBudget, action: str, query: str, status: str = "completed", error: str = "") -> None:
     budget.steps.append(
         {
@@ -699,6 +713,8 @@ async def run_verified_coding(
                 },
             ]
             reviewed = False
+            send_to_coder = False
+            last_test_outcome = ""
             for _round in range(MAX_AGENT_TOOL_ROUNDS):
                 tools = [SUBMIT_REVIEW_TOOL]
                 if iteration < MAX_AGENT_ITERATIONS:
@@ -757,59 +773,81 @@ async def run_verified_coding(
                 frontend = code_sandbox.is_frontend_only(workspace)
                 static = code_sandbox.static_verify(workspace)
                 sandbox_blocked = False
+                executed = False
                 if commands:
                     try:
                         tests = tester(list(commands), workspace)
+                        executed = True
                     except code_sandbox.SandboxError as exc:
                         sandbox_blocked = True
                         tests = [{"command": "", "ok": False, "exit_code": 2, "stdout": "", "stderr": str(exc)}]
-                    tests_ok = bool(tests) and all(item.get("ok") for item in tests)
                 else:
                     tests = []
-                    tests_ok = False
-                if frontend:
-                    static_row = {
-                        "command": "static_verify",
-                        "ok": static["ok"],
-                        "exit_code": 0 if static["ok"] else 1,
-                        "stdout": "、".join(static["files"]),
-                        "stderr": "；".join(static["issues"]),
-                    }
-                    if sandbox_blocked or not commands:
-                        tests = [static_row]
-                        tests_ok = static["ok"]
-                    else:
-                        tests_ok = tests_ok and static["ok"]
-                        tests.append(static_row)
-                elif not commands:
-                    if claimed_pass:
-                        review = (review + "\n" if review else "") + "审查未提供可执行测试命令，不能算通过。"
-                    tests_ok = False
+                if frontend and (sandbox_blocked or not commands):
+                    tests = [
+                        {
+                            "command": "static_verify",
+                            "ok": static["ok"],
+                            "exit_code": 0 if static["ok"] else 1,
+                            "stdout": "、".join(static["files"]),
+                            "stderr": "；".join(static["issues"]),
+                        }
+                    ]
+                    sandbox_blocked = False
+                    executed = True
+                outcome = classify_test_run(tests=tests, sandbox_blocked=sandbox_blocked, executed=executed)
+                last_test_outcome = outcome
                 summary = "；".join(
                     f"{item.get('command') or 'test'}={'ok' if item.get('ok') else 'fail'}" for item in tests
-                ) or "未运行测试"
+                ) or "测试没有跑起来"
+                if outcome == "harness_error":
+                    _append_step(
+                        budget,
+                        "code_test",
+                        f"循环 {iteration}/{MAX_AGENT_ITERATIONS}。测试命令没跑起来，不交给写代码 Agent。{summary}",
+                        status="skipped",
+                        error=(tests[-1].get("stderr") if tests else "no tests") or "测试命令无效",
+                    )
+                    reviewer_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.get("id"),
+                            "content": (
+                                "These test commands never executed. That is a harness error, not a code bug. "
+                                "Call submit_review again with legal commands "
+                                "(python3 -m unittest / python3 -m py_compile / node --check), "
+                                "or empty test_commands for HTML. Do not ask the coder to fix this."
+                            ),
+                        }
+                    )
+                    await publish()
+                    continue
                 _append_step(
                     budget,
                     "code_test",
                     f"循环 {iteration}/{MAX_AGENT_ITERATIONS}。{summary}",
-                    status="completed" if tests_ok else "failed",
-                    error="" if tests_ok else (tests[-1].get("stderr") if tests else "no tests"),
+                    status="completed" if outcome == "passed" else "failed",
+                    error="" if outcome == "passed" else (tests[-1].get("stderr") if tests else "code failed tests"),
                 )
-                passed = bool(claimed_pass and tests_ok)
+                passed = outcome == "passed"
+                send_to_coder = outcome == "code_failed"
                 reviewed = True
                 await publish()
                 break
             if not reviewed:
+                if last_test_outcome == "harness_error":
+                    review = (review + "\n" if review else "") + "测试命令一直没跑起来，已停止，不再让写代码 Agent 空转。"
+                    break
                 raise RuntimeError("审查 Agent 没有提交审查结果")
-            if passed or iteration >= MAX_AGENT_ITERATIONS:
+            if passed or not send_to_coder or iteration >= MAX_AGENT_ITERATIONS:
                 break
             feedback = (
-                f"Reviewer passed={claimed_pass}. Issues: {review}\n"
+                f"Tests ran successfully and the code failed them.\n"
+                f"Reviewer notes: {review}\n"
                 f"Real test results: {json.dumps(tests, ensure_ascii=False)}\n"
-                f"This is a hard cap of {MAX_AGENT_ITERATIONS} coding loops. "
-                f"Next loop is {iteration + 1}/{MAX_AGENT_ITERATIONS}."
+                f"Fix the code. Loop {iteration + 1}/{MAX_AGENT_ITERATIONS}."
             )
-        if not passed:
+        if not passed and iteration >= MAX_AGENT_ITERATIONS:
             review = (review + "\n" if review else "") + f"已达到 {MAX_AGENT_ITERATIONS} 轮编码上限，停止继续改。"
         return {
             "passed": passed,
