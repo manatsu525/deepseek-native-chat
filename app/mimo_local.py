@@ -12,7 +12,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 from curl_cffi import requests as curl_requests
 
-from .code_agents import CODING_TOOL_PROMPT, SharedWebBudget, WRITE_AND_VERIFY_CODE_TOOL, run_verified_coding
+from .code_agents import (
+    CODING_TOOL_PROMPT,
+    SharedWebBudget,
+    WRITE_AND_VERIFY_CODE_TOOL,
+    coding_job_active,
+    run_verified_coding,
+)
 from .custom_tool_normalization import normalize_tool_calls
 from .keyless_web import (
     KEYLESS_CUSTOM_SYSTEM_PROMPT,
@@ -270,6 +276,7 @@ async def stream_response(
     parallel_session_id = (f"conversation_{conversation_id}" if conversation_id else f"response_{uuid.uuid4().hex}")[:100]
     last_search_objective = ""
     last_search_queries: list[str] = []
+    coding_invoked = False
     api_limits = httpx.Timeout(timeout, connect=30)
     search_context = curl_requests.AsyncSession(
         impersonate="chrome",
@@ -664,6 +671,9 @@ async def stream_response(
                         if fetch_count >= JINA_MAX_FETCHES_PER_RESPONSE:
                             reader_enabled = False
                 elif name == "write_and_verify_code":
+                    if coding_job_active.get() or coding_invoked:
+                        raise ValueError("本次回答已经在写代码流程中或已经跑过一轮，请根据已有结果作答，不要再调用 write_and_verify_code，更不要为了写测试再套一层")
+                    coding_invoked = True
                     task = " ".join(str(arguments.get("task") or "").split())
                     if not task:
                         raise ValueError("编码任务不能为空")

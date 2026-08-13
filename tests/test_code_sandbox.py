@@ -36,6 +36,8 @@ class CodeSandboxTests(unittest.TestCase):
             code_sandbox.validate_test_command("rm -rf /", self.workspace)
         with self.assertRaises(code_sandbox.SandboxError):
             code_sandbox.validate_test_command("python3 -m pip install x", self.workspace)
+        argv = code_sandbox.validate_test_command("python3 -m py_compile hello.py", self.workspace)
+        self.assertEqual(argv[-2:], ["py_compile", "hello.py"])
 
     def test_runs_real_unittest_in_workspace(self) -> None:
         code_sandbox.write_files(

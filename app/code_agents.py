@@ -6,6 +6,7 @@ quota (3 + 3). They never get a separate budget.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import re
 import uuid
@@ -46,6 +47,17 @@ from .keyless_web import KEYLESS_FETCH_WEBPAGE_TOOL, KEYLESS_SEARCH_WEB_TOOL
 MAX_AGENT_ITERATIONS = 3
 MAX_AGENT_TOOL_ROUNDS = 4
 CODE_STEP_ACTIONS = {"code_plan", "code_write", "code_review", "code_test"}
+coding_job_active: contextvars.ContextVar[bool] = contextvars.ContextVar("coding_job_active", default=False)
+_FENCE_RE = re.compile(r"```(?:([\w./+-]+))?\n(.*?)```", re.S)
+_FENCE_NAMES = {
+    "html": "index.html",
+    "htm": "index.html",
+    "python": "main.py",
+    "py": "main.py",
+    "javascript": "main.js",
+    "js": "main.js",
+    "css": "style.css",
+}
 
 CODING_HINTS = (
     "写代码", "写个代码", "写一段代码", "写一个脚本", "写个脚本", "写一个程序", "写个程序",
@@ -60,9 +72,11 @@ NON_CODING_HINTS = (
 )
 
 CODING_TOOL_PROMPT = (
-    " If the user needs you to write, implement, generate, or substantially revise executable code "
-    "(a script, program, module, or runnable function), you MUST call write_and_verify_code with a "
-    "self-contained task instead of dumping unverified programs into the final answer. "
+    " If the user needs you to write, implement, generate, or substantially revise a program "
+    "(HTML/JS app, script, module, or runnable function), call write_and_verify_code exactly once "
+    "with the full user task. Do not dump unverified programs into the final answer. "
+    "Do not call it again after it returns, do not wrap the same task as a Python file-writer, "
+    "and do not call it merely to write unit tests — tests belong inside that one job. "
     "Explaining existing code, tiny illustrative snippets, config, SQL-only, or regex does not need this tool. "
     "The coding agents share this answer's remaining web_search and fetch_webpage quota."
 )
@@ -73,7 +87,8 @@ WRITE_AND_VERIFY_CODE_TOOL = {
         "name": "write_and_verify_code",
         "description": (
             "Plan, write, independently review, and run tests for executable code on this server. "
-            "Required whenever you need to produce a working program. "
+            "Required once per answer when you need to produce a working program. "
+            "Never call this from inside an already running coding job, and never call it only to write tests. "
             "Shares this answer's remaining web_search/fetch_webpage quota (max 3 searches and 3 fetches total). "
             "Returns verified files, review notes, and real test output."
         ),
@@ -140,6 +155,33 @@ SUBMIT_REVIEW_TOOL = {
         "strict": False,
     },
 }
+
+
+def harvest_files_from_text(text: str) -> list[dict[str, str]]:
+    """Recover files when a model dumps fenced code instead of calling submit_code."""
+    files: list[dict[str, str]] = []
+    used_names: set[str] = set()
+    for index, (info, body) in enumerate(_FENCE_RE.findall(text or ""), 1):
+        content = str(body).strip("\n")
+        if len(content) < 20:
+            continue
+        token = str(info or "").strip()
+        path = ""
+        if "/" in token or "." in token:
+            try:
+                path = str(code_sandbox.safe_relpath(token.split()[0]))
+            except Exception:
+                path = ""
+        if not path:
+            lang = token.split()[0].lower() if token else ""
+            path = _FENCE_NAMES.get(lang, f"snippet_{index}.txt")
+        if path in used_names:
+            stem = Path(path).stem
+            suffix = Path(path).suffix or ".txt"
+            path = f"{stem}_{index}{suffix}"
+        used_names.add(path)
+        files.append({"path": path, "content": content})
+    return files
 
 
 def looks_like_coding_request(text: str) -> bool:
@@ -504,10 +546,13 @@ async def run_verified_coding(
     run_tests: Optional[Callable[[list[str], Path], list[dict[str, Any]]]] = None,
 ) -> dict[str, Any]:
     """Drive coder then reviewer until tests pass or the iteration cap is hit."""
+    if coding_job_active.get():
+        raise RuntimeError("编码任务进行中，不能再次套用写代码流程")
+    active_token = coding_job_active.set(True)
     complete = complete_round or _complete_round
     tester = run_tests or code_sandbox.run_test_commands
     run_id = uuid.uuid4().hex
-    workspace = code_sandbox.create_workspace(settings.data_dir, run_id)
+    workspace: Path | None = None
     plan = ""
     files: list[str] = []
     review = ""
@@ -527,6 +572,7 @@ async def run_verified_coding(
         )
 
     try:
+        workspace = code_sandbox.create_workspace(settings.data_dir, run_id)
         code_sandbox.cleanup_old_workspaces(settings.data_dir)
         brief = " ".join(str(task or "").split())
         if language:
@@ -542,6 +588,8 @@ async def run_verified_coding(
                     "role": "system",
                     "content": (
                         "You are the coding agent. First think of a short plan, then call submit_code with complete files. "
+                        "Do not call write_and_verify_code. Do not write a generator script that only emits the real program. "
+                        "If the user wants HTML/JS, submit those files directly. Include tests in the same submit_code call when useful. "
                         "You may use web_search/fetch_webpage only if necessary and only within the shared quota. "
                         f"{_quota_note(budget)}"
                     ),
@@ -556,6 +604,7 @@ async def run_verified_coding(
                 },
             ]
             submitted = False
+            arguments: dict[str, Any] = {}
             for _round in range(MAX_AGENT_TOOL_ROUNDS):
                 tools = [*_web_tools(backend, budget), SUBMIT_CODE_TOOL]
                 result = await complete(
@@ -573,9 +622,19 @@ async def run_verified_coding(
                 usage = _merge_usage(usage, result.get("usage") or {})
                 calls = result.get("tool_calls") or []
                 if not calls:
+                    harvested = harvest_files_from_text(str(result.get("content") or ""))
+                    if harvested:
+                        plan = plan or "Recovered files from assistant markdown."
+                        written = code_sandbox.write_files(workspace, harvested)
+                        files = written
+                        _append_step(budget, "code_plan", plan)
+                        _append_step(budget, "code_write", "、".join(written) + "（从正文代码块回收）")
+                        submitted = True
+                        await publish()
+                        break
                     if result.get("content"):
                         coder_messages.append({"role": "assistant", "content": result["content"]})
-                        coder_messages.append({"role": "user", "content": "Do not answer in prose. Call submit_code."})
+                        coder_messages.append({"role": "user", "content": "Do not answer in prose. Call submit_code with the actual files."})
                     continue
                 call = calls[0]
                 function = call.get("function") or {}
@@ -614,15 +673,17 @@ async def run_verified_coding(
                 await publish()
                 break
             if not submitted:
-                raise RuntimeError("编码 Agent 没有提交可审查的代码")
+                raise RuntimeError("编码 Agent 没有提交可审查的代码（未调用 submit_code，正文里也没有可回收的代码块）")
 
             reviewer_messages = [
                 {
                     "role": "system",
                     "content": (
                         "You are an independent reviewer. You did not write this code. "
-                        "Find bugs, then call submit_review with concrete python3/node test commands the sandbox can run. "
-                        "Do not approve if tests are missing or likely to fail. "
+                        "Find bugs, then call submit_review. "
+                        "For Python, prefer `python3 -m unittest ...` or `python3 -m py_compile file.py`. "
+                        "For JS, prefer `node --check file.js`. Never use python -c. "
+                        "Do not start another write_and_verify_code job just to create tests. "
                         f"{_quota_note(budget)}"
                     ),
                 },
@@ -682,13 +743,19 @@ async def run_verified_coding(
                     continue
                 review = str(arguments.get("issues") or "").strip()
                 claimed_pass = bool(arguments.get("passed"))
-                commands = arguments.get("test_commands") or []
+                commands = [str(item) for item in (arguments.get("test_commands") or []) if str(item).strip()]
                 _append_step(budget, "code_review", review or ("审查通过" if claimed_pass else "审查未通过"))
-                try:
-                    tests = tester(list(commands), workspace)
-                except code_sandbox.SandboxError as exc:
-                    tests = [{"command": "", "ok": False, "exit_code": 2, "stdout": "", "stderr": str(exc)}]
-                tests_ok = bool(tests) and all(item.get("ok") for item in tests)
+                if commands:
+                    try:
+                        tests = tester(list(commands), workspace)
+                    except code_sandbox.SandboxError as exc:
+                        tests = [{"command": "", "ok": False, "exit_code": 2, "stdout": "", "stderr": str(exc)}]
+                    tests_ok = bool(tests) and all(item.get("ok") for item in tests)
+                else:
+                    tests = []
+                    tests_ok = False
+                    if claimed_pass:
+                        review = (review + "\n" if review else "") + "审查未提供可执行测试命令，不能算通过。"
                 summary = "；".join(
                     f"{item.get('command') or 'test'}={'ok' if item.get('ok') else 'fail'}" for item in tests
                 )
@@ -725,4 +792,6 @@ async def run_verified_coding(
             "workspace": str(workspace),
         }
     finally:
-        code_sandbox.cleanup_workspace(workspace)
+        coding_job_active.reset(active_token)
+        if workspace is not None:
+            code_sandbox.cleanup_workspace(workspace)

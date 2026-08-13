@@ -9,7 +9,13 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from app import code_agents
-from app.code_agents import SharedWebBudget, looks_like_coding_request, run_verified_coding
+from app.code_agents import (
+    SharedWebBudget,
+    coding_job_active,
+    harvest_files_from_text,
+    looks_like_coding_request,
+    run_verified_coding,
+)
 from app.config import Settings
 from app.mimo import DEFAULT_SETTINGS, MIMO_MAX_SEARCHES
 
@@ -20,6 +26,98 @@ class CodeAgentTests(unittest.TestCase):
         self.assertFalse(looks_like_coding_request("这段代码是什么意思"))
         self.assertTrue(looks_like_coding_request("写一个 python 脚本把 csv 转 json"))
         self.assertTrue(looks_like_coding_request("implement a function to merge intervals"))
+
+    def test_harvests_fenced_html_instead_of_requiring_submit_code(self) -> None:
+        files = harvest_files_from_text(
+            "plan\n```html\n<!DOCTYPE html><html><body>象棋</body></html>\n```\n"
+        )
+        self.assertEqual(files[0]["path"], "index.html")
+        self.assertIn("象棋", files[0]["content"])
+
+    def test_prose_code_blocks_are_recovered_as_submitted_files(self) -> None:
+        async def complete_round(**kwargs):
+            if "submit_code" in {item["function"]["name"] for item in kwargs["tools"]}:
+                return {
+                    "content": "```python\ndef add(a, b):\n    return a + b\n```",
+                    "reasoning": "",
+                    "usage": {},
+                    "tool_calls": [],
+                }
+            return {
+                "content": "",
+                "reasoning": "",
+                "usage": {},
+                "tool_calls": [
+                    {
+                        "id": "r1",
+                        "type": "function",
+                        "function": {
+                            "name": "submit_review",
+                            "arguments": json.dumps(
+                                {"passed": False, "issues": "need tests", "test_commands": []}
+                            ),
+                        },
+                    }
+                ],
+            }
+
+        async def runner():
+            return await run_verified_coding(
+                task="write add()",
+                api_client=object(),
+                base_url="https://invalid.example/v1",
+                api_key="offline",
+                model="dummy",
+                config=dict(DEFAULT_SETTINGS),
+                effort="high",
+                timeout=30,
+                stopped=lambda: False,
+                update=AsyncMock(),
+                budget=SharedWebBudget(),
+                backend="parallel",
+                clients={},
+                parent_answer="",
+                parent_reasoning="",
+                parent_usage={},
+                complete_round=complete_round,
+            )
+
+        import asyncio
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(code_agents, "settings", Settings(data_dir=Path(temp))):
+            result = asyncio.run(runner())
+        self.assertIn("main.py", result["files"])
+        self.assertFalse(result["passed"])
+
+    def test_nested_coding_job_is_rejected(self) -> None:
+        token = coding_job_active.set(True)
+        try:
+            import asyncio
+
+            async def runner():
+                return await run_verified_coding(
+                    task="nested",
+                    api_client=object(),
+                    base_url="https://invalid.example/v1",
+                    api_key="offline",
+                    model="dummy",
+                    config=dict(DEFAULT_SETTINGS),
+                    effort="high",
+                    timeout=30,
+                    stopped=lambda: False,
+                    update=AsyncMock(),
+                    budget=SharedWebBudget(),
+                    backend="parallel",
+                    clients={},
+                    parent_answer="",
+                    parent_reasoning="",
+                    parent_usage={},
+                )
+
+            with self.assertRaisesRegex(RuntimeError, "不能再次套用"):
+                asyncio.run(runner())
+        finally:
+            coding_job_active.reset(token)
 
     def test_loop_uses_review_and_real_tests_then_passes(self) -> None:
         calls: list[str] = []

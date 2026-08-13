@@ -19,7 +19,7 @@ MAX_TEST_COMMANDS = 3
 TEST_TIMEOUT_SECONDS = 25
 WORKSPACE_TTL_SECONDS = 60 * 60
 ALLOWED_INTERPRETERS = {"python": "python3", "python3": "python3", "node": "node"}
-ALLOWED_PYTHON_MODULES = {"unittest"}
+ALLOWED_PYTHON_MODULES = {"unittest", "py_compile"}
 
 
 class SandboxError(ValueError):
@@ -136,7 +136,7 @@ def validate_test_command(command: str, workspace: Path) -> list[str]:
     if not resolved:
         raise SandboxError(f"服务器没有 {ALLOWED_INTERPRETERS[binary_name]}")
     args = parts[1:]
-    if any(flag in args for flag in ("-c", "-e", "--eval", "--")):
+    if any(flag in {"-c", "-e", "--eval", "--"} for flag in args):
         raise SandboxError("不允许内联代码或额外解释器开关")
     if "-m" in args:
         index = args.index("-m")
