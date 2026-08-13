@@ -12,13 +12,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 from curl_cffi import requests as curl_requests
 
-from .code_agents import (
-    CODING_TOOL_PROMPT,
-    SharedWebBudget,
-    WRITE_AND_VERIFY_CODE_TOOL,
-    coding_job_active,
-    run_verified_coding,
-)
 from .custom_tool_normalization import normalize_tool_calls
 from .keyless_web import (
     KEYLESS_CUSTOM_SYSTEM_PROMPT,
@@ -140,16 +133,6 @@ class _AsyncNullContext:
         return None
 
 
-def _step_action(name: str) -> str:
-    if name == "web_search":
-        return "search"
-    if name == "fetch_webpage":
-        return "open_page"
-    if name == "write_and_verify_code":
-        return "code_write"
-    return "search"
-
-
 def _looks_like_text_tool_call(value: str) -> bool:
     """Detect a tool request emitted as answer text after tools are disabled."""
     stripped = str(value or "").strip().casefold()
@@ -158,7 +141,7 @@ def _looks_like_text_tool_call(value: str) -> bool:
     if not (stripped.startswith("<tool_call") or stripped.startswith("<function=")):
         return False
     head = stripped[:2000]
-    return "fetch_webpage" in head or "web_search" in head or "write_and_verify_code" in head
+    return "fetch_webpage" in head or "web_search" in head
 
 
 def _dated_system_prompt(base_prompt: str, user_timezone: str) -> str:
@@ -264,7 +247,7 @@ async def stream_response(
         base_prompt = LEGACY_CUSTOM_SYSTEM_PROMPT
     else:
         base_prompt = KEYLESS_CUSTOM_SYSTEM_PROMPT
-    system_prompt = _dated_system_prompt(base_prompt, user_timezone) + CODING_TOOL_PROMPT
+    system_prompt = _dated_system_prompt(base_prompt, user_timezone)
     conversation: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}, *[dict(message) for message in messages]]
     answer = ""
     reasoning = ""
@@ -286,7 +269,6 @@ async def stream_response(
     parallel_session_id = (f"conversation_{conversation_id}" if conversation_id else f"response_{uuid.uuid4().hex}")[:100]
     last_search_objective = ""
     last_search_queries: list[str] = []
-    coding_invoked = False
     api_limits = httpx.Timeout(timeout, connect=30)
     search_context = curl_requests.AsyncSession(
         impersonate="chrome",
@@ -330,8 +312,6 @@ async def stream_response(
                         round_tools.append(FETCH_WEBPAGE_TOOL)
                     else:
                         round_tools.append(KEYLESS_FETCH_WEBPAGE_TOOL)
-                if tool_rounds_used < MIMO_MAX_TOOL_ROUNDS:
-                    round_tools.append(WRITE_AND_VERIFY_CODE_TOOL)
             final_answer_only = force_final_answer or not round_tools
             mimo_model = is_mimo_model(model)
             request_messages = conversation
@@ -492,7 +472,7 @@ async def stream_response(
             step: dict[str, Any] = {
                 "id": call_id,
                 "status": "running",
-                "action": _step_action(name),
+                "action": "search" if is_search else "open_page",
                 "query": "",
                 "url": "",
                 "error": "",
@@ -680,75 +660,15 @@ async def stream_response(
                         step["status"] = "completed"
                         if fetch_count >= JINA_MAX_FETCHES_PER_RESPONSE:
                             reader_enabled = False
-                elif name == "write_and_verify_code":
-                    if coding_job_active.get() or coding_invoked:
-                        raise ValueError("本次回答已经在写代码流程中或已经跑过一轮，请根据已有结果作答，不要再调用 write_and_verify_code，更不要为了写测试再套一层")
-                    coding_invoked = True
-                    task = " ".join(str(arguments.get("task") or "").split())
-                    if not task:
-                        raise ValueError("编码任务不能为空")
-                    step["action"] = "code_write"
-                    step["query"] = task[:200]
-                    budget = SharedWebBudget(
-                        search_count=search_count,
-                        fetch_count=fetch_count,
-                        searched_queries=searched_queries,
-                        known_urls=known_urls,
-                        attempted_urls=attempted_urls,
-                        last_search_objective=last_search_objective,
-                        last_search_queries=last_search_queries,
-                        reader_enabled=reader_enabled,
-                        sources=sources,
-                        steps=steps,
-                    )
-                    coding = await run_verified_coding(
-                        task=task,
-                        api_client=api_client,
-                        base_url=base_url,
-                        api_key=api_key,
-                        model=model,
-                        config=config,
-                        effort=effort,
-                        timeout=timeout,
-                        stopped=stopped,
-                        update=update,
-                        budget=budget,
-                        backend=web_tool_backend,
-                        clients={
-                            "parallel": parallel_client,
-                            "search": search_client,
-                            "jina": jina_client,
-                            "keyless": keyless_client,
-                            "session_id": parallel_session_id,
-                        },
-                        parent_answer=answer,
-                        parent_reasoning=reasoning,
-                        parent_usage=usage,
-                        language=str(arguments.get("language") or ""),
-                    )
-                    search_count = coding["search_count"]
-                    fetch_count = coding["fetch_count"]
-                    reader_enabled = bool(coding["reader_enabled"])
-                    last_search_objective = budget.last_search_objective
-                    last_search_queries = budget.last_search_queries
-                    usage = coding.get("usage") or usage
-                    result_text = coding["tool_result"]
-                    step["status"] = "completed" if coding.get("passed") else "failed"
-                    if not coding.get("passed"):
-                        step["error"] = str(coding.get("review") or "未通过审查或测试")[:1000]
                 else:
                     raise ValueError(f"不支持的工具：{name or '未命名工具'}")
             except asyncio.CancelledError:
                 raise
-            except InterruptedError as exc:
-                raise asyncio.CancelledError from exc
             except Exception as exc:
                 step["status"] = "failed"
                 step["error"] = str(exc)[:1000]
                 if isinstance(exc, ToolQuotaExceeded):
                     result_text = str(exc)[:1000]
-                elif name == "write_and_verify_code":
-                    result_text = f"编码验证失败：{str(exc)[:1000]}"
                 elif is_search:
                     engine = (
                         "Parallel Search MCP"

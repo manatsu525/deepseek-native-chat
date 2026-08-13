@@ -318,8 +318,7 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
   if (!reasoning && !searches.length && !active) return '';
   const status = active ? '进行中' : (meta.stopped ? '已停止' : '已完成');
   const searchHtml = searches.map((s,i) => {
-    const labels={open_page:'读取网页',code_plan:'编码计划',code_write:'编写代码',code_review:'代码审查',code_test:'运行测试'};
-    const label=labels[s.action]||'联网搜索';
+    const label=s.action==='open_page'?'读取网页':'联网搜索';
     const searchKey=`${detailKey}-search-${s.id || i}`;
     const searchOpen=detailState.get(searchKey) ? ' open' : '';
     const detail=s.url?`<a href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(s.url)}</a>`:escapeHtml(Array.isArray(s.query)?s.query.filter(x=>!String(x).startsWith('ws_call_id=')).join('；'):(s.query||'DeepSeek 未返回查询词'));
@@ -328,7 +327,7 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
     return `<details class="search-step" data-detail-key="${escapeHtml(searchKey)}"${searchOpen}><summary>${label} ${i+1} · ${escapeHtml(statusLabels[s.status] || s.status || '已完成')}</summary><div class="search-detail">${detail}${error}</div></details>`;
   }).join('');
   const traceOpen=detailState.get(detailKey) ? ' open' : '';
-  const searchCount=searches.filter(item=>item.action!=='open_page'&&!String(item.action||'').startsWith('code_')).length;
+  const searchCount=searches.filter(item=>item.action!=='open_page').length;
   const readCount=searches.filter(item=>item.action==='open_page'&&item.status==='completed').length;
   const activity=`${searchCount ? ` · ${searchCount} 次搜索` : ''}${readCount ? ` · ${readCount} 次读取` : ''}`;
   return `<details class="trace" data-detail-key="${escapeHtml(detailKey)}"${traceOpen}><summary>思考与联网 · ${status}${activity}</summary><div class="trace-body">${reasoning ? `<div class="reasoning-text" data-scroll-key="${escapeHtml(detailKey)}-reasoning">${escapeHtml(reasoning)}</div>` : active ? '<div class="typing"><i></i><i></i><i></i></div>' : ''}${searchHtml}</div></details>`;
