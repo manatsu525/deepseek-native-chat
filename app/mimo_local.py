@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 from curl_cffi import requests as curl_requests
 
+from .custom_tool_normalization import normalize_tool_calls
 from .keyless_web import (
     KEYLESS_CUSTOM_SYSTEM_PROMPT,
     KEYLESS_FETCH_WEBPAGE_TOOL,
@@ -408,7 +409,7 @@ async def stream_response(
                     )
 
             usage = _merge_usage(usage, round_usage)
-            calls = _tool_calls(round_tools_by_index, round_number)
+            calls = normalize_tool_calls(_tool_calls(round_tools_by_index, round_number))
             if dsml_stream is not None:
                 round_preview += dsml_stream.flush()
                 round_answer, calls = recover_tool_calls(
