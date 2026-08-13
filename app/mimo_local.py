@@ -140,6 +140,16 @@ class _AsyncNullContext:
         return None
 
 
+def _step_action(name: str) -> str:
+    if name == "web_search":
+        return "search"
+    if name == "fetch_webpage":
+        return "open_page"
+    if name == "write_and_verify_code":
+        return "code_write"
+    return "search"
+
+
 def _looks_like_text_tool_call(value: str) -> bool:
     """Detect a tool request emitted as answer text after tools are disabled."""
     stripped = str(value or "").strip().casefold()
@@ -482,7 +492,7 @@ async def stream_response(
             step: dict[str, Any] = {
                 "id": call_id,
                 "status": "running",
-                "action": "search" if is_search else "open_page",
+                "action": _step_action(name),
                 "query": "",
                 "url": "",
                 "error": "",

@@ -16,6 +16,7 @@ from app.code_agents import (
     looks_like_coding_request,
     run_verified_coding,
 )
+from app.mimo_local import _step_action
 from app.config import Settings
 from app.mimo import DEFAULT_SETTINGS, MIMO_MAX_SEARCHES
 
@@ -26,6 +27,11 @@ class CodeAgentTests(unittest.TestCase):
         self.assertFalse(looks_like_coding_request("这段代码是什么意思"))
         self.assertTrue(looks_like_coding_request("写一个 python 脚本把 csv 转 json"))
         self.assertTrue(looks_like_coding_request("implement a function to merge intervals"))
+
+    def test_write_code_tool_is_not_labeled_as_page_fetch(self) -> None:
+        self.assertEqual(_step_action("write_and_verify_code"), "code_write")
+        self.assertEqual(_step_action("fetch_webpage"), "open_page")
+        self.assertEqual(_step_action("web_search"), "search")
 
     def test_harvests_fenced_html_instead_of_requiring_submit_code(self) -> None:
         files = harvest_files_from_text(
