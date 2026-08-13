@@ -17,6 +17,16 @@ class CodeSandboxTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def test_frontend_static_verify_catches_truncated_html(self) -> None:
+        code_sandbox.write_files(
+            self.workspace,
+            [{"path": "index.html", "content": "<!DOCTYPE html><html><body><script>const nb = makeMove(m."}],
+        )
+        self.assertTrue(code_sandbox.is_frontend_only(self.workspace))
+        result = code_sandbox.static_verify(self.workspace)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("截断" in item for item in result["issues"]))
+
     def test_write_and_list_files(self) -> None:
         written = code_sandbox.write_files(
             self.workspace,

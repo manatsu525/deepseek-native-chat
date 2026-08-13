@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 from app import code_agents
 from app.code_agents import (
+    MAX_AGENT_ITERATIONS,
     SharedWebBudget,
     coding_job_active,
     harvest_files_from_text,
@@ -29,6 +30,7 @@ class CodeAgentTests(unittest.TestCase):
         self.assertTrue(looks_like_coding_request("implement a function to merge intervals"))
 
     def test_write_code_tool_is_not_labeled_as_page_fetch(self) -> None:
+        self.assertEqual(MAX_AGENT_ITERATIONS, 2)
         self.assertEqual(_step_action("write_and_verify_code"), "code_write")
         self.assertEqual(_step_action("fetch_webpage"), "open_page")
         self.assertEqual(_step_action("web_search"), "search")
@@ -94,6 +96,86 @@ class CodeAgentTests(unittest.TestCase):
             result = asyncio.run(runner())
         self.assertIn("main.py", result["files"])
         self.assertFalse(result["passed"])
+
+    def test_html_project_ignores_illegal_python_inline_tests(self) -> None:
+        async def complete_round(**kwargs):
+            names = {item["function"]["name"] for item in kwargs["tools"]}
+            if "submit_code" in names:
+                return {
+                    "content": "",
+                    "reasoning": "",
+                    "usage": {},
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {
+                                "name": "submit_code",
+                                "arguments": json.dumps(
+                                    {
+                                        "plan": "html page",
+                                        "files": [
+                                            {
+                                                "path": "index.html",
+                                                "content": "<!DOCTYPE html><html><body><h1>象棋</h1></body></html>\n",
+                                            }
+                                        ],
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                }
+            return {
+                "content": "",
+                "reasoning": "",
+                "usage": {},
+                "tool_calls": [
+                    {
+                        "id": "r1",
+                        "type": "function",
+                        "function": {
+                            "name": "submit_review",
+                            "arguments": json.dumps(
+                                {
+                                    "passed": True,
+                                    "issues": "looks complete",
+                                    "test_commands": ["python3 -c 'print(1)'"],
+                                }
+                            ),
+                        },
+                    }
+                ],
+            }
+
+        async def runner():
+            return await run_verified_coding(
+                task="html chess",
+                api_client=object(),
+                base_url="https://invalid.example/v1",
+                api_key="offline",
+                model="dummy",
+                config=dict(DEFAULT_SETTINGS),
+                effort="high",
+                timeout=30,
+                stopped=lambda: False,
+                update=AsyncMock(),
+                budget=SharedWebBudget(),
+                backend="parallel",
+                clients={},
+                parent_answer="",
+                parent_reasoning="",
+                parent_usage={},
+                complete_round=complete_round,
+            )
+
+        import asyncio
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(code_agents, "settings", Settings(data_dir=Path(temp))):
+            result = asyncio.run(runner())
+        self.assertTrue(result["passed"], result)
+        self.assertEqual(result["tests"][0]["command"], "static_verify")
+        self.assertNotIn("已达到 2 轮编码上限", result["review"])
 
     def test_nested_coding_job_is_rejected(self) -> None:
         token = coding_job_active.set(True)

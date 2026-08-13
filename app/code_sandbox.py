@@ -20,6 +20,8 @@ TEST_TIMEOUT_SECONDS = 25
 WORKSPACE_TTL_SECONDS = 60 * 60
 ALLOWED_INTERPRETERS = {"python": "python3", "python3": "python3", "node": "node"}
 ALLOWED_PYTHON_MODULES = {"unittest", "py_compile"}
+FRONTEND_SUFFIXES = {".html", ".htm", ".css", ".js", ".mjs"}
+PYTHON_SUFFIXES = {".py"}
 
 
 class SandboxError(ValueError):
@@ -98,6 +100,34 @@ def write_files(workspace: Path, files: list[dict[str, Any]]) -> list[str]:
             pass
         written.append(str(rel))
     return written
+
+
+def file_suffixes(workspace: Path) -> set[str]:
+    return {Path(name).suffix.lower() for name in list_files(workspace)}
+
+
+def is_frontend_only(workspace: Path) -> bool:
+    suffixes = file_suffixes(workspace)
+    extra = suffixes - FRONTEND_SUFFIXES - {".md", ".txt", ".json", ""}
+    return bool(suffixes & FRONTEND_SUFFIXES) and not (suffixes & PYTHON_SUFFIXES) and not extra
+
+
+def static_verify(workspace: Path) -> dict[str, Any]:
+    """Cheap completeness check for HTML/JS when unittest cannot run the app."""
+    issues: list[str] = []
+    names = list_files(workspace)
+    if not names:
+        return {"ok": False, "issues": ["工作区没有文件"], "files": []}
+    for rel in names:
+        text = read_workspace_file(workspace, rel, limit=MAX_FILE_BYTES)
+        stripped = text.rstrip()
+        if rel.lower().endswith((".html", ".htm")):
+            low = text.lower()
+            if "<html" not in low and "<!doctype" not in low:
+                issues.append(f"{rel} 不像完整 HTML")
+        if len(stripped) > 40 and stripped[-1] in ".+,\\(":
+            issues.append(f"{rel} 末尾像是截断代码")
+    return {"ok": not issues, "issues": issues, "files": names}
 
 
 def list_files(workspace: Path) -> list[str]:

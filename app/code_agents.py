@@ -44,7 +44,7 @@ from .mimo import (
 from .keyless_web import KEYLESS_FETCH_WEBPAGE_TOOL, KEYLESS_SEARCH_WEB_TOOL
 
 
-MAX_AGENT_ITERATIONS = 3
+MAX_AGENT_ITERATIONS = 2
 MAX_AGENT_TOOL_ROUNDS = 4
 CODE_STEP_ACTIONS = {"code_plan", "code_write", "code_review", "code_test"}
 coding_job_active: contextvars.ContextVar[bool] = contextvars.ContextVar("coding_job_active", default=False)
@@ -606,7 +606,9 @@ async def run_verified_coding(
             submitted = False
             arguments: dict[str, Any] = {}
             for _round in range(MAX_AGENT_TOOL_ROUNDS):
-                tools = [*_web_tools(backend, budget), SUBMIT_CODE_TOOL]
+                tools = [SUBMIT_CODE_TOOL]
+                if iteration < MAX_AGENT_ITERATIONS:
+                    tools = [*_web_tools(backend, budget), SUBMIT_CODE_TOOL]
                 result = await complete(
                     api_client=api_client,
                     base_url=base_url,
@@ -682,7 +684,8 @@ async def run_verified_coding(
                         "You are an independent reviewer. You did not write this code. "
                         "Find bugs, then call submit_review. "
                         "For Python, prefer `python3 -m unittest ...` or `python3 -m py_compile file.py`. "
-                        "For JS, prefer `node --check file.js`. Never use python -c. "
+                        "For a single HTML/JS page, leave test_commands empty; do not invent python -c or /dev/stdin tests. "
+                        "For JS files you may use `node --check file.js`. Never use python -c. "
                         "Do not start another write_and_verify_code job just to create tests. "
                         f"{_quota_note(budget)}"
                     ),
@@ -697,7 +700,9 @@ async def run_verified_coding(
             ]
             reviewed = False
             for _round in range(MAX_AGENT_TOOL_ROUNDS):
-                tools = [*_web_tools(backend, budget), SUBMIT_REVIEW_TOOL]
+                tools = [SUBMIT_REVIEW_TOOL]
+                if iteration < MAX_AGENT_ITERATIONS:
+                    tools = [*_web_tools(backend, budget), SUBMIT_REVIEW_TOOL]
                 result = await complete(
                     api_client=api_client,
                     base_url=base_url,
@@ -744,25 +749,49 @@ async def run_verified_coding(
                 review = str(arguments.get("issues") or "").strip()
                 claimed_pass = bool(arguments.get("passed"))
                 commands = [str(item) for item in (arguments.get("test_commands") or []) if str(item).strip()]
-                _append_step(budget, "code_review", review or ("审查通过" if claimed_pass else "审查未通过"))
+                _append_step(
+                    budget,
+                    "code_review",
+                    f"循环 {iteration}/{MAX_AGENT_ITERATIONS}。{review or ('审查通过' if claimed_pass else '审查未通过')}",
+                )
+                frontend = code_sandbox.is_frontend_only(workspace)
+                static = code_sandbox.static_verify(workspace)
+                sandbox_blocked = False
                 if commands:
                     try:
                         tests = tester(list(commands), workspace)
                     except code_sandbox.SandboxError as exc:
+                        sandbox_blocked = True
                         tests = [{"command": "", "ok": False, "exit_code": 2, "stdout": "", "stderr": str(exc)}]
                     tests_ok = bool(tests) and all(item.get("ok") for item in tests)
                 else:
                     tests = []
                     tests_ok = False
+                if frontend:
+                    static_row = {
+                        "command": "static_verify",
+                        "ok": static["ok"],
+                        "exit_code": 0 if static["ok"] else 1,
+                        "stdout": "、".join(static["files"]),
+                        "stderr": "；".join(static["issues"]),
+                    }
+                    if sandbox_blocked or not commands:
+                        tests = [static_row]
+                        tests_ok = static["ok"]
+                    else:
+                        tests_ok = tests_ok and static["ok"]
+                        tests.append(static_row)
+                elif not commands:
                     if claimed_pass:
                         review = (review + "\n" if review else "") + "审查未提供可执行测试命令，不能算通过。"
+                    tests_ok = False
                 summary = "；".join(
                     f"{item.get('command') or 'test'}={'ok' if item.get('ok') else 'fail'}" for item in tests
-                )
+                ) or "未运行测试"
                 _append_step(
                     budget,
                     "code_test",
-                    summary or "未运行测试",
+                    f"循环 {iteration}/{MAX_AGENT_ITERATIONS}。{summary}",
                     status="completed" if tests_ok else "failed",
                     error="" if tests_ok else (tests[-1].get("stderr") if tests else "no tests"),
                 )
@@ -772,12 +801,16 @@ async def run_verified_coding(
                 break
             if not reviewed:
                 raise RuntimeError("审查 Agent 没有提交审查结果")
-            if passed:
+            if passed or iteration >= MAX_AGENT_ITERATIONS:
                 break
             feedback = (
                 f"Reviewer passed={claimed_pass}. Issues: {review}\n"
-                f"Real test results: {json.dumps(tests, ensure_ascii=False)}"
+                f"Real test results: {json.dumps(tests, ensure_ascii=False)}\n"
+                f"This is a hard cap of {MAX_AGENT_ITERATIONS} coding loops. "
+                f"Next loop is {iteration + 1}/{MAX_AGENT_ITERATIONS}."
             )
+        if not passed:
+            review = (review + "\n" if review else "") + f"已达到 {MAX_AGENT_ITERATIONS} 轮编码上限，停止继续改。"
         return {
             "passed": passed,
             "plan": plan,
