@@ -61,6 +61,7 @@ class ToolQuotaExceeded(RuntimeError):
 
 FINAL_ANSWER_ATTEMPTS = 2
 PARALLEL_MAX_SEARCH_EXCERPT_CHARS = 1200
+BILLING_RESERVATION_RETRY_DELAY = 1.5
 FINAL_ANSWER_PROMPT = (
     "CRITICAL FINALIZATION INSTRUCTION: The tool-call budget is completely exhausted. No search or webpage-reading "
     "tool is available now, and requesting another tool cannot succeed. You MUST stop researching and answer the "
@@ -183,6 +184,21 @@ def _is_malformed_tool_call_error(error: Any) -> bool:
     if not isinstance(error, dict):
         return False
     return str(error.get("code") or "").strip().casefold() == "malformed_tool_call"
+
+
+def _is_billing_reservation_failure(status_code: int, body: str) -> bool:
+    """Retry only NanoGPT's explicit pre-generation reservation failure."""
+    if status_code != 503:
+        return False
+    try:
+        data = json.loads(body)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    error = data.get("error")
+    code = error.get("code") if isinstance(error, dict) else data.get("code")
+    return str(code or "").strip().casefold() == "async_billing_reservation_failed"
 
 
 def _apply_thinking_options(
@@ -376,63 +392,70 @@ async def stream_response(
             round_tools_by_index: dict[int, dict[str, Any]] = {}
             malformed_tool_call = False
             dsml_stream = DsmlStreamBuffer() if dsml_fallback_active else None
-            async with api_client.stream("POST", _url(base_url, "/chat/completions"), headers=headers, json=payload) as response:
-                if response.status_code >= 400:
-                    body = (await response.aread()).decode(errors="replace")[:2000]
-                    raise RuntimeError(f"Custom API {response.status_code}: {body}")
-                async for line in response.aiter_lines():
-                    if stopped():
-                        raise asyncio.CancelledError
-                    if not line or not line.startswith("data:"):
-                        continue
-                    raw = line[5:].strip()
-                    if not raw:
-                        continue
-                    if raw == "[DONE]":
-                        break
-                    try:
-                        data = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    if data.get("error"):
-                        if round_tools and _is_malformed_tool_call_error(data["error"]):
-                            malformed_tool_call = True
+            for reservation_attempt in range(2):
+                async with api_client.stream("POST", _url(base_url, "/chat/completions"), headers=headers, json=payload) as response:
+                    if response.status_code >= 400:
+                        body = (await response.aread()).decode(errors="replace")[:2000]
+                        if reservation_attempt == 0 and _is_billing_reservation_failure(response.status_code, body):
+                            await asyncio.sleep(BILLING_RESERVATION_RETRY_DELAY)
+                            if stopped():
+                                raise asyncio.CancelledError
+                            continue
+                        raise RuntimeError(f"Custom API {response.status_code}: {body}")
+                    async for line in response.aiter_lines():
+                        if stopped():
+                            raise asyncio.CancelledError
+                        if not line or not line.startswith("data:"):
+                            continue
+                        raw = line[5:].strip()
+                        if not raw:
+                            continue
+                        if raw == "[DONE]":
                             break
-                        raise RuntimeError(f"Custom 响应失败: {data['error']}")
-                    raw_usage = data.get("usage")
-                    if isinstance(raw_usage, dict):
-                        round_usage = _normalize_usage(raw_usage)
-                    for choice in data.get("choices") or []:
-                        delta = choice.get("delta") or {}
-                        message = choice.get("message") or {}
-                        delta_content = str(delta.get("content") or "")
-                        round_answer += delta_content
-                        if dsml_stream is not None:
-                            round_preview += dsml_stream.feed(delta_content)
-                        delta_reasoning = delta.get("reasoning_content") or delta.get("reasoning")
-                        round_reasoning += str(delta_reasoning or "")
-                        if message.get("content") and not delta.get("content"):
-                            message_content = str(message.get("content") or "")
-                            round_answer += message_content
+                        try:
+                            data = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        if data.get("error"):
+                            if round_tools and _is_malformed_tool_call_error(data["error"]):
+                                malformed_tool_call = True
+                                break
+                            raise RuntimeError(f"Custom 响应失败: {data['error']}")
+                        raw_usage = data.get("usage")
+                        if isinstance(raw_usage, dict):
+                            round_usage = _normalize_usage(raw_usage)
+                        for choice in data.get("choices") or []:
+                            delta = choice.get("delta") or {}
+                            message = choice.get("message") or {}
+                            delta_content = str(delta.get("content") or "")
+                            round_answer += delta_content
                             if dsml_stream is not None:
-                                round_preview += dsml_stream.feed(message_content)
-                        message_reasoning = message.get("reasoning_content") or message.get("reasoning")
-                        if message_reasoning and not delta_reasoning:
-                            round_reasoning += str(message_reasoning)
-                        for index, call in enumerate(delta.get("tool_calls") or []):
-                            _merge_tool_call(round_tools_by_index, call, index)
-                        for index, call in enumerate(message.get("tool_calls") or []):
-                            _merge_tool_call(round_tools_by_index, call, index)
-                    preview_usage = _merge_usage(usage, round_usage)
-                    await update(
-                        {
-                            "answer": answer + (round_preview if dsml_stream is not None else round_answer),
-                            "reasoning": reasoning + round_reasoning,
-                            "searches": steps,
-                            "usage": preview_usage,
-                            "sources": list(sources.values()),
-                        }
-                    )
+                                round_preview += dsml_stream.feed(delta_content)
+                            delta_reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                            round_reasoning += str(delta_reasoning or "")
+                            if message.get("content") and not delta.get("content"):
+                                message_content = str(message.get("content") or "")
+                                round_answer += message_content
+                                if dsml_stream is not None:
+                                    round_preview += dsml_stream.feed(message_content)
+                            message_reasoning = message.get("reasoning_content") or message.get("reasoning")
+                            if message_reasoning and not delta_reasoning:
+                                round_reasoning += str(message_reasoning)
+                            for index, call in enumerate(delta.get("tool_calls") or []):
+                                _merge_tool_call(round_tools_by_index, call, index)
+                            for index, call in enumerate(message.get("tool_calls") or []):
+                                _merge_tool_call(round_tools_by_index, call, index)
+                        preview_usage = _merge_usage(usage, round_usage)
+                        await update(
+                            {
+                                "answer": answer + (round_preview if dsml_stream is not None else round_answer),
+                                "reasoning": reasoning + round_reasoning,
+                                "searches": steps,
+                                "usage": preview_usage,
+                                "sources": list(sources.values()),
+                            }
+                        )
+                    break
 
             usage = _merge_usage(usage, round_usage)
             if malformed_tool_call:
