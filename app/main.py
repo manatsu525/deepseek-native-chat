@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import re
 import time
 import uuid
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal, Optional
@@ -14,7 +16,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 import uvicorn
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -29,6 +31,7 @@ from .mimo_local import stream_response as custom_stream_response
 from .reasoning_effort import DEFAULT as DEFAULT_REASONING_EFFORT
 from .reasoning_effort import LEVELS as REASONING_EFFORT_LEVELS
 from .security import load_secret, make_token, password_hash, password_ok, read_token
+from .workspace import ConversationWorkspace, WorkspaceError, delete_conversation_workspace, delete_user_workspaces
 
 
 db = Database(settings.db_path)
@@ -257,16 +260,16 @@ def public_conversation(row: dict[str, Any]) -> dict[str, Any]:
 def trim_old_conversations(user_id: int) -> None:
     """Keep the newest 100 regular chats without ever pruning pinned chats."""
     with db.lock, db.connect() as connection:
-        connection.execute(
-            """DELETE FROM conversations
-               WHERE user_id=? AND pinned_at IS NULL AND id IN (
-                   SELECT id FROM conversations
-                   WHERE user_id=? AND pinned_at IS NULL
-                   ORDER BY updated_at DESC
-                   LIMIT -1 OFFSET 100
-               )""",
-            (user_id, user_id),
-        )
+        rows = connection.execute(
+            """SELECT id FROM conversations
+               WHERE user_id=? AND pinned_at IS NULL
+               ORDER BY updated_at DESC LIMIT -1 OFFSET 100""",
+            (user_id,),
+        ).fetchall()
+        if rows:
+            connection.executemany("DELETE FROM conversations WHERE id=? AND user_id=?", [(row["id"], user_id) for row in rows])
+    for row in rows:
+        delete_conversation_workspace(user_id, row["id"])
 
 
 def current_user(session: Optional[str] = Cookie(default=None)) -> dict[str, Any]:
@@ -430,6 +433,7 @@ async def run_job(job_id: str) -> None:
                 conversation_id=job["conversation_id"],
                 user_timezone=job.get("timezone") or "UTC",
                 effort=job["effort"],
+                workspace=ConversationWorkspace(job["user_id"], job["conversation_id"]),
             )
         else:
             result = await deepseek_stream_response(
@@ -947,7 +951,49 @@ def conversation(conversation_id: str, user: dict[str, Any] = Depends(current_us
     for row in rows:
         row["meta"] = db.decode(row.pop("meta_json"), {})
     active = db.one("SELECT * FROM jobs WHERE conversation_id=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1", (conversation_id,))
-    return {"conversation": public_conversation(conv), "messages": rows, "active_job": public_job(active) if active else None}
+    workspace_files = ConversationWorkspace(user["id"], conversation_id).list_files()
+    return {"conversation": public_conversation(conv), "messages": rows, "active_job": public_job(active) if active else None, "workspace_files": workspace_files}
+
+
+def owned_workspace(conversation_id: str, user: dict[str, Any]) -> ConversationWorkspace:
+    if not db.one("SELECT id FROM conversations WHERE id=? AND user_id=?", (conversation_id, user["id"])):
+        raise HTTPException(404, "对话不存在")
+    return ConversationWorkspace(user["id"], conversation_id)
+
+
+@app.get("/api/conversations/{conversation_id}/workspace")
+def conversation_workspace(conversation_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    workspace = owned_workspace(conversation_id, user)
+    files = workspace.list_files()
+    return {"files": files, "total_size": sum(int(item["size"]) for item in files)}
+
+
+@app.get("/api/conversations/{conversation_id}/workspace/files/{file_path:path}")
+def download_workspace_file(conversation_id: str, file_path: str, user: dict[str, Any] = Depends(current_user)) -> FileResponse:
+    workspace = owned_workspace(conversation_id, user)
+    try:
+        target, relative = workspace.resolve(file_path)
+    except WorkspaceError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not target.is_file() or target.is_symlink():
+        raise HTTPException(404, "工作区文件不存在")
+    return FileResponse(target, filename=Path(relative).name, media_type="application/octet-stream")
+
+
+@app.get("/api/conversations/{conversation_id}/workspace.zip")
+def download_workspace_zip(conversation_id: str, user: dict[str, Any] = Depends(current_user)) -> StreamingResponse:
+    workspace = owned_workspace(conversation_id, user)
+    files = workspace.list_files()
+    if not files:
+        raise HTTPException(404, "当前对话还没有工作区文件")
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        for item in files:
+            target, relative = workspace.resolve(item["path"])
+            output.write(target, relative)
+    archive.seek(0)
+    headers = {"Content-Disposition": f'attachment; filename="workspace-{conversation_id[:8]}.zip"'}
+    return StreamingResponse(archive, media_type="application/zip", headers=headers)
 
 
 @app.post("/api/conversations/{conversation_id}/pin")
@@ -1043,6 +1089,7 @@ def delete_all_conversations(user: dict[str, Any] = Depends(current_user)) -> di
     if not compacted:
         raise HTTPException(409, "请先等待或停止所有正在生成的回答")
     attachments.delete_files(attachment_records)
+    delete_user_workspaces(user["id"])
     return {"ok": True, "deleted": deleted, "compacted": True}
 
 
@@ -1059,6 +1106,7 @@ def delete_conversation(conversation_id: str, user: dict[str, Any] = Depends(cur
         db.delete_attachments(user["id"], [item["id"] for item in attachment_records])
     db.run("DELETE FROM conversations WHERE id=? AND user_id=?", (conversation_id, user["id"]))
     attachments.delete_files(attachment_records)
+    delete_conversation_workspace(user["id"], conversation_id)
     return {"ok": True}
 
 

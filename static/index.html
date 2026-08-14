@@ -11,6 +11,7 @@
     .item-actions{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.item-actions .soft-btn{min-height:0;padding:7px 9px;font-size:12px}
     .code-actions{display:flex;align-items:center;gap:5px}.code-tool{display:grid;place-items:center;width:28px;height:26px;padding:4px;border:0;border-radius:7px;background:#ffffff10;color:#d5ddeb}.code-tool:hover{background:#ffffff20;color:#fff}.code-tool svg{width:16px;height:16px;stroke-linecap:round;stroke-linejoin:round}
     .history-title-actions{display:flex;align-items:center;gap:7px}.history-title-actions button{border:0;background:transparent;color:#7f8ca5;padding:1px 3px;font-size:10px;font-weight:700}.history-title-actions button:hover{color:#e48b8b}.history-title-actions button:disabled{visibility:hidden}
+    .workspace-summary{margin:12px 0 8px;color:var(--muted);font-size:12px}.workspace-files{display:grid;gap:7px;max-height:420px;overflow:auto}.workspace-file{display:flex;align-items:center;gap:10px;border:1px solid var(--line);border-radius:10px;padding:9px 11px;color:var(--ink);text-decoration:none}.workspace-file:hover{background:var(--soft);border-color:#b9c5e3}.workspace-file-name{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}.workspace-file-size{color:var(--muted);font-size:11px}.workspace-empty{padding:22px 8px;text-align:center;color:var(--muted);font-size:13px}
     @media (prefers-color-scheme:dark){.message-content table{background:#192130;color:#e8edf6}.message-content th{background:#28354a;color:#fff}.message-content td{color:#e8edf6;border-color:#3a4658}}
     /* Keep the conversation readable like the previous chat view: compact bubbles, a bounded line length, and stable scrolling. */
     .chat-scroll{overflow-anchor:none}
@@ -96,6 +97,7 @@
         <div class="title-block"><h2 id="conversationTitle">新对话</h2><span class="status-dot">外部搜索工具已就绪</span></div>
         <div class="top-actions">
           <label class="compact-select" title="控制模型的 reasoning effort"><span id="effortLabel">推理</span><select id="effort" aria-label="推理档位"><option value="low">低</option><option value="medium">中</option><option value="high" selected>高</option><option value="xhigh">很高</option><option value="max">最大</option></select></label>
+          <button id="workspaceButton" class="soft-btn hidden" type="button">文件 <span id="workspaceCount">0</span></button>
           <button id="providerButton" class="soft-btn">API</button>
           <button id="customSettingsButton" class="soft-btn hidden">Custom 参数</button>
           <button id="usersButton" class="soft-btn hidden">账号</button>
@@ -202,6 +204,13 @@
       <p id="passwordError" class="error"></p>
       <div class="form-actions"><button class="primary" type="submit">保存新密码</button></div>
     </form>
+  </dialog>
+
+  <dialog id="workspaceModal" class="modal small-modal">
+    <div class="modal-head"><div><p class="eyebrow">CODING WORKSPACE</p><h3>对话文件</h3><p class="muted">模型创建和后续修改的文件会持续保存在当前对话中。</p></div><button class="icon-btn close-modal">×</button></div>
+    <div id="workspaceSummary" class="workspace-summary"></div>
+    <div id="workspaceFiles" class="workspace-files"></div>
+    <div class="form-actions" style="margin-top:14px"><a id="workspaceZip" class="soft-btn" href="#">下载全部 ZIP</a></div>
   </dialog>
 
   <div id="toast" class="toast"></div>

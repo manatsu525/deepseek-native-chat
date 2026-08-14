@@ -27,6 +27,7 @@
 - NVIDIA Build 的 DeepSeek V4 Flash/Pro 会按官方协议发送 `chat_template_kwargs.thinking` 与所选 `reasoning_effort` 档位，并兼容解析 `reasoning`/`reasoning_content`
 - OpenCode Zen 的 `deepseek-v4-flash(-free)` 可选用独立 DSML fallback：新配置默认不勾选，用户可在任意 Custom 配置中手动开关；仅匹配 OpenCode host + 对应模型时生效，并且只在原生 `tool_calls` 为空时恢复工具调用，也可用 `OPENCODE_DSML_FALLBACK=0` 全局停用
 - NVIDIA Nemotron 3 Ultra 使用 `enable_thinking`、工具兼容标志和 16K reasoning budget；GLM-5.2 使用 `thinking.enabled` 与所选 `reasoning_effort` 档位
+- 每个对话拥有隔离且持久的编码工作区。Custom 模型可列出、读取、搜索、创建、精确修改和删除 UTF-8 文本文件；网页端支持单文件和 ZIP 下载。工作区不执行代码，删除对话时同步清理
 
 ## 资源占用
 

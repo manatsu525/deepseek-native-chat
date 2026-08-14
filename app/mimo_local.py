@@ -53,6 +53,12 @@ from .mimo import (
 from .parallel_mcp import ParallelMCPClient
 from .opencode_dsml_fallback import DsmlStreamBuffer, applies_to as dsml_fallback_applies, recover_tool_calls
 from .reasoning_effort import normalize as normalize_reasoning_effort
+from .workspace import (
+    WORKSPACE_SYSTEM_PROMPT,
+    WORKSPACE_TOOL_NAMES,
+    WORKSPACE_TOOLS,
+    ConversationWorkspace,
+)
 
 
 class ToolQuotaExceeded(RuntimeError):
@@ -60,10 +66,11 @@ class ToolQuotaExceeded(RuntimeError):
 
 
 FINAL_ANSWER_ATTEMPTS = 2
+MAX_AGENT_TOOL_ROUNDS = 20
 PARALLEL_MAX_SEARCH_EXCERPT_CHARS = 1200
 FINAL_ANSWER_PROMPT = (
-    "CRITICAL FINALIZATION INSTRUCTION: The tool-call budget is completely exhausted. No search or webpage-reading "
-    "tool is available now, and requesting another tool cannot succeed. You MUST stop researching and answer the "
+    "CRITICAL FINALIZATION INSTRUCTION: The tool-call budget is completely exhausted. No search, webpage-reading, "
+    "or workspace tool is available now, and requesting another tool cannot succeed. You MUST stop using tools and answer the "
     "user's original question immediately using only the evidence already present above. Do not emit tool_calls, "
     "XML such as <tool_call>, function-call JSON, a search query, or prose saying that you will search/read next. "
     "Even if the evidence is incomplete or a previous tool failed, provide the best supported answer now and state "
@@ -233,6 +240,7 @@ async def stream_response(
     conversation_id: str = "",
     user_timezone: str = "UTC",
     effort: str = "high",
+    workspace: ConversationWorkspace | None = None,
 ) -> dict[str, Any]:
     """Run a custom OpenAI-compatible model with local web tools.
 
@@ -264,6 +272,8 @@ async def stream_response(
         _dated_system_prompt(base_prompt, user_timezone),
         model,
     )
+    if workspace is not None:
+        system_prompt = f"{system_prompt}\n\n{WORKSPACE_SYSTEM_PROMPT}"
     conversation: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}, *[dict(message) for message in messages]]
     answer = ""
     reasoning = ""
@@ -306,10 +316,11 @@ async def stream_response(
         parallel_context as parallel_client,
         keyless_context as keyless_client,
     ):
-        # Tool calls stay capped at six. Up to two answer-only attempts are
-        # reserved for providers that try to print a tool request as plain
-        # text after the tools have been removed.
-        for round_number in range(MIMO_MAX_TOOL_ROUNDS + FINAL_ANSWER_ATTEMPTS):
+        # Web calls keep their existing six-round budget. Coding workspaces
+        # may use more rounds because multi-file edits commonly require several
+        # reads and patches. Two answer-only attempts remain reserved after all
+        # tools have been removed.
+        for round_number in range(MAX_AGENT_TOOL_ROUNDS + FINAL_ANSWER_ATTEMPTS):
             if stopped():
                 raise asyncio.CancelledError
             round_tools: list[dict[str, Any]] = []
@@ -328,6 +339,8 @@ async def stream_response(
                         round_tools.append(FETCH_WEBPAGE_TOOL)
                     else:
                         round_tools.append(KEYLESS_FETCH_WEBPAGE_TOOL)
+                if workspace is not None and tool_rounds_used < MAX_AGENT_TOOL_ROUNDS:
+                    round_tools.extend(WORKSPACE_TOOLS)
             final_answer_only = force_final_answer or not round_tools
             mimo_model = is_mimo_model(model)
             request_messages = conversation
@@ -485,15 +498,21 @@ async def stream_response(
             function = call.get("function") or {}
             name = str(function.get("name") or "")
             is_search = name == "web_search"
+            is_workspace = name in WORKSPACE_TOOL_NAMES
             step: dict[str, Any] = {
                 "id": call_id,
                 "status": "running",
-                "action": "search" if is_search else "open_page",
+                "action": "workspace" if is_workspace else "search" if is_search else "open_page",
                 "query": "",
                 "url": "",
+                "path": "",
+                "tool": name,
                 "error": "",
             }
-            (search_steps if is_search else fetch_steps).append(step)
+            if is_search:
+                search_steps.append(step)
+            elif not is_workspace:
+                fetch_steps.append(step)
             steps.append(step)
             await update(
                 {
@@ -535,7 +554,13 @@ async def stream_response(
                 arguments = json.loads(str(function.get("arguments") or "{}"))
                 if not isinstance(arguments, dict):
                     raise ValueError("工具参数必须是 JSON 对象")
-                if is_search:
+                if is_workspace:
+                    if workspace is None:
+                        raise ValueError("当前对话没有可用的编码工作区")
+                    step["path"] = str(arguments.get("path") or "")[:300]
+                    result_text = workspace.execute(name, arguments)
+                    step["status"] = "completed"
+                elif is_search:
                     if parallel_mode:
                         objective = " ".join(str(arguments.get("objective") or "").split())[:1000]
                         raw_queries = arguments.get("search_queries") or []
@@ -694,9 +719,11 @@ async def stream_response(
                         else str(KEYLESS_PROVIDERS[web_tool_backend]["label"])
                     )
                     result_text = f"{engine} 搜索失败：{str(exc)[:1000]}。可以改写查询继续，或根据已有资料回答。"
+                elif is_workspace:
+                    result_text = f"工作区操作失败：{str(exc)[:1000]}。请先读取当前文件并修正参数后重试。"
                 else:
                     result_text = f"读取网页失败：{str(exc)[:1000]}。请根据已有搜索结果继续回答，必要时选择其他来源。"
-            tool_trace.append({"id": call_id, "name": name, "url": target_url, "backend": web_tool_backend, "status": step["status"], "error": step["error"]})
+            tool_trace.append({"id": call_id, "name": name, "url": target_url, "path": step.get("path", ""), "backend": "workspace" if is_workspace else web_tool_backend, "status": step["status"], "error": step["error"]})
             conversation.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
             await update(
                 {
