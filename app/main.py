@@ -24,9 +24,10 @@ from .db import Database
 from .deepseek import list_models as deepseek_list_models
 from .deepseek import stream_response as deepseek_stream_response
 from .mimo import DEFAULT_SETTINGS as CUSTOM_DEFAULT_SETTINGS
-from .mimo import DEFAULT_REASONING_EFFORT, MIMO_MAX_COMPLETION_TOKENS, REASONING_EFFORTS
-from .mimo import custom_auth_headers, is_mimo_model, list_models as custom_list_models
+from .mimo import MIMO_MAX_COMPLETION_TOKENS, custom_auth_headers, is_mimo_model, list_models as custom_list_models
 from .mimo_local import stream_response as custom_stream_response
+from .reasoning_effort import DEFAULT as DEFAULT_REASONING_EFFORT
+from .reasoning_effort import LEVELS as REASONING_EFFORT_LEVELS
 from .security import load_secret, make_token, password_hash, password_ok, read_token
 
 
@@ -241,26 +242,31 @@ def clean_timezone(value: str) -> str:
     return name
 
 
-def validate_effort(effort: str) -> str:
-    if effort not in REASONING_EFFORTS:
+def validate_effort(value: str) -> str:
+    if value not in REASONING_EFFORT_LEVELS:
         raise HTTPException(400, "无效的思考深度")
-    return effort
+    return value
 
 
 def public_conversation(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
-    item["pinned"] = bool(item.get("pinned_at"))
+    item["pinned"] = item.get("pinned_at") is not None
     return item
 
 
 def trim_old_conversations(user_id: int) -> None:
-    """Keep at most 100 unpinned chats. Pinned chats are never auto-deleted."""
-    surplus = db.all(
-        "SELECT id FROM conversations WHERE user_id=? AND pinned_at IS NULL ORDER BY updated_at DESC LIMIT -1 OFFSET 100",
-        (user_id,),
-    )
-    for item in surplus:
-        db.run("DELETE FROM conversations WHERE id=?", (item["id"],))
+    """Keep the newest 100 regular chats without ever pruning pinned chats."""
+    with db.lock, db.connect() as connection:
+        connection.execute(
+            """DELETE FROM conversations
+               WHERE user_id=? AND pinned_at IS NULL AND id IN (
+                   SELECT id FROM conversations
+                   WHERE user_id=? AND pinned_at IS NULL
+                   ORDER BY updated_at DESC
+                   LIMIT -1 OFFSET 100
+               )""",
+            (user_id, user_id),
+        )
 
 
 def current_user(session: Optional[str] = Cookie(default=None)) -> dict[str, Any]:
@@ -879,11 +885,16 @@ def conversations(page: int = 1, user: dict[str, Any] = Depends(current_user)) -
     total = db.one("SELECT COUNT(*) AS n FROM conversations WHERE user_id=?", (user["id"],))["n"]
     rows = db.all(
         """SELECT * FROM conversations WHERE user_id=?
-           ORDER BY CASE WHEN pinned_at IS NULL THEN 1 ELSE 0 END, pinned_at DESC, updated_at DESC
+           ORDER BY pinned_at IS NULL, pinned_at DESC, updated_at DESC
            LIMIT 10 OFFSET ?""",
         (user["id"], (page - 1) * 10),
     )
-    return {"items": [public_conversation(row) for row in rows], "page": page, "pages": max(1, (total + 9) // 10), "total": total}
+    return {
+        "items": [public_conversation(row) for row in rows],
+        "page": page,
+        "pages": max(1, (total + 9) // 10),
+        "total": total,
+    }
 
 
 @app.get("/api/conversations/{conversation_id}")
@@ -907,13 +918,15 @@ def pin_conversation(
     conv = db.one("SELECT * FROM conversations WHERE id=? AND user_id=?", (conversation_id, user["id"]))
     if not conv:
         raise HTTPException(404, "对话不存在")
-    if body.pinned:
-        if not conv.get("pinned_at"):
-            db.run("UPDATE conversations SET pinned_at=? WHERE id=? AND user_id=?", (now(), conversation_id, user["id"]))
-    else:
+    if body.pinned and conv.get("pinned_at") is None:
         db.run(
-            "UPDATE conversations SET pinned_at=NULL, updated_at=? WHERE id=? AND user_id=?",
-            (now(), conversation_id, user["id"]),
+            "UPDATE conversations SET pinned_at=? WHERE id=? AND user_id=?",
+            (time.time_ns() // 1_000_000, conversation_id, user["id"]),
+        )
+    elif not body.pinned and conv.get("pinned_at") is not None:
+        db.run(
+            "UPDATE conversations SET pinned_at=NULL WHERE id=? AND user_id=?",
+            (conversation_id, user["id"]),
         )
     updated = db.one("SELECT * FROM conversations WHERE id=? AND user_id=?", (conversation_id, user["id"]))
     return public_conversation(updated or conv)

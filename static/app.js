@@ -492,24 +492,15 @@ async function retryAnswer(messageIndex,items){
 
 async function loadHistory(page=1) {
   const data = await api(`/api/conversations?page=${page}`); state.page=data.page; state.pages=data.pages;
-  if(page===1){
-    const latest=data.items.find(item=>!item.pinned)||data.items[0];
-    state.latestConversationId=latest?latest.id:null;
-  }
+  if(page===1){const latest=data.items.find(item=>!item.pinned)||data.items[0];state.latestConversationId=latest?latest.id:null}
   $('#historyCount').textContent=data.total;
   $('#clearHistory').disabled=!data.total;
-  $('#history').innerHTML=data.items.map(c=>`<button class="history-item ${state.conversation&&state.conversation.id===c.id?'active':''}${c.pinned?' pinned':''}" data-id="${c.id}"><span>${escapeHtml(c.title)}</span><b class="history-pin" title="${c.pinned?'取消置顶':'置顶'}">${c.pinned?'★':'☆'}</b><b class="history-delete" title="删除">×</b></button>`).join('') || '<p class="muted" style="padding:10px;font-size:12px">还没有对话</p>';
-  $$('.history-item').forEach(button => {
-    button.onclick=e=>{if(e.target.classList.contains('history-delete')||e.target.classList.contains('history-pin'))return;openConversation(button.dataset.id);closeSidebar()};
-    $('.history-pin',button).onclick=async e=>{
-      e.stopPropagation();
-      if(state.retryingAnswer){toast('正在重新回答');return}
-      try{
-        await api(`/api/conversations/${button.dataset.id}/pin`,{method:'POST',body:{pinned:!button.classList.contains('pinned')}});
-        await loadHistory(1);
-      }catch(err){toast(err.message)}
-    };
-    $('.history-delete',button).onclick=async e=>{e.stopPropagation();if(state.retryingAnswer){toast('正在重新回答');return}if(!confirm('永久删除这个对话？'))return;try{await api(`/api/conversations/${button.dataset.id}`,{method:'DELETE'});if(state.conversation&&state.conversation.id===button.dataset.id)newConversation();await loadHistory(state.page)}catch(err){toast(err.message)}};
+  $('#history').innerHTML=data.items.map(c=>`<div class="history-item ${state.conversation&&state.conversation.id===c.id?'active':''}${c.pinned?' pinned':''}" data-id="${c.id}"><button class="history-open" type="button" title="${escapeHtml(c.title)}"><span>${escapeHtml(c.title)}</span></button><button class="history-pin" type="button" title="${c.pinned?'取消置顶':'置顶'}" aria-label="${c.pinned?'取消置顶':'置顶'}">${c.pinned?'★':'☆'}</button><button class="history-delete" type="button" title="删除" aria-label="删除">×</button></div>`).join('') || '<p class="muted" style="padding:10px;font-size:12px">还没有对话</p>';
+  $$('.history-item').forEach(item => {
+    const conversationId=item.dataset.id;
+    $('.history-open',item).onclick=()=>{openConversation(conversationId);closeSidebar()};
+    $('.history-pin',item).onclick=async()=>{if(state.retryingAnswer){toast('正在重新回答');return}try{await api(`/api/conversations/${conversationId}/pin`,{method:'POST',body:{pinned:!item.classList.contains('pinned')}});await loadHistory(1)}catch(err){toast(err.message)}};
+    $('.history-delete',item).onclick=async()=>{if(state.retryingAnswer){toast('正在重新回答');return}if(!confirm('永久删除这个对话？'))return;try{await api(`/api/conversations/${conversationId}`,{method:'DELETE'});if(state.conversation&&state.conversation.id===conversationId)newConversation();await loadHistory(Math.min(state.page,state.pages))}catch(err){toast(err.message)}};
   });
   $('#pagination').innerHTML = state.pages>1 ? `<button id="prevPage" ${state.page<=1?'disabled':''}>‹</button><button>${state.page}/${state.pages}</button><button id="nextPage" ${state.page>=state.pages?'disabled':''}>›</button>` : '';
   if($('#prevPage'))$('#prevPage').onclick=()=>loadHistory(state.page-1); if($('#nextPage'))$('#nextPage').onclick=()=>loadHistory(state.page+1);
@@ -771,12 +762,13 @@ async function loadUsers(){const users=await api('/api/users');$('#userList').in
 function resizePrompt(){const p=$('#prompt');p.style.height='auto';p.style.height=Math.min(p.scrollHeight,180)+'px'}
 function openSidebar(){$('#sidebar').classList.add('open')}function closeSidebar(){$('#sidebar').classList.remove('open')}
 
-async function boot(){try{state.me=await api('/api/me');$('#loginView').classList.add('hidden');$('#appView').classList.remove('hidden');$('#accountName').textContent=state.me.username;$('#accountRole').textContent=state.me.is_admin?'管理员':'用户';$('#avatar').textContent=state.me.username[0].toUpperCase();$('#usersButton').classList.toggle('hidden',!state.me.is_admin);await Promise.all([loadProviders(),loadHistory(1)]);const stored=storedValue('active-conversation');const activeId=stored==='__new__'?null:(stored||state.latestConversationId);const restored=activeId?await openConversation(activeId):false;if(!restored){renderMessages();await loadPendingAttachments()}}catch{$('#loginView').classList.remove('hidden');$('#appView').classList.add('hidden')}}
+async function boot(){try{state.me=await api('/api/me');$('#loginView').classList.add('hidden');$('#appView').classList.remove('hidden');$('#accountName').textContent=state.me.username;$('#accountRole').textContent=state.me.is_admin?'管理员':'用户';$('#avatar').textContent=state.me.username[0].toUpperCase();$('#usersButton').classList.toggle('hidden',!state.me.is_admin);const savedEffort=storedValue('reasoning-effort');if(['low','medium','high','xhigh','max'].includes(savedEffort))$('#effort').value=savedEffort;await Promise.all([loadProviders(),loadHistory(1)]);const stored=storedValue('active-conversation');const activeId=stored==='__new__'?null:(stored||state.latestConversationId);const restored=activeId?await openConversation(activeId):false;if(!restored){renderMessages();await loadPendingAttachments()}}catch{$('#loginView').classList.remove('hidden');$('#appView').classList.add('hidden')}}
 
 $('#loginForm').onsubmit=async e=>{e.preventDefault();$('#loginError').textContent='';try{await api('/api/login',{method:'POST',body:{username:$('#loginUser').value,password:$('#loginPass').value}});await boot()}catch(err){$('#loginError').textContent=err.message}};
 $('#logout').onclick=async()=>{await api('/api/logout',{method:'POST'});location.reload()};
 $('#newChat').onclick=()=>{newConversation();closeSidebar()};$('#composer').onsubmit=e=>{e.preventDefault();submitPrompt()};
 $('#clearHistory').onclick=clearAllHistory;
+$('#effort').onchange=()=>storeValue('reasoning-effort',$('#effort').value);
 // Enter always inserts a newline. Sending is explicit via the send button.
 $('#prompt').oninput=resizePrompt;
 $('#attachButton').onclick=()=>{if(!state.uploadingAttachments&&!state.retryingAnswer&&!(state.job&&['queued','running'].includes(state.job.status)))$('#fileInput').click()};

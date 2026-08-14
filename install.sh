@@ -30,8 +30,10 @@ apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 python3-venv openssl ca-certificates poppler-utils util-linux >/dev/null
 
 mkdir -p "$INSTALL_DIR" "$DATA_DIR/tls"
-find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name data -exec rm -rf -- {} +
-cp -a "$SOURCE_DIR/app" "$SOURCE_DIR/static" "$SOURCE_DIR/requirements.txt" "$SOURCE_DIR/run.sh" "$SOURCE_DIR/.env.example" "$INSTALL_DIR/"
+if [[ $SOURCE_DIR != "$INSTALL_DIR" ]]; then
+  find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name data -exec rm -rf -- {} +
+  cp -a "$SOURCE_DIR/app" "$SOURCE_DIR/static" "$SOURCE_DIR/requirements.txt" "$SOURCE_DIR/run.sh" "$SOURCE_DIR/.env.example" "$INSTALL_DIR/"
+fi
 chmod +x "$INSTALL_DIR/run.sh"
 
 python3 -m venv "$INSTALL_DIR/.venv"

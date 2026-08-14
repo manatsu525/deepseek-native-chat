@@ -53,7 +53,7 @@
     @media (prefers-color-scheme:dark){.message.user{background:#1d2a46}.message.assistant{background:#192130}.user .message-content{background:transparent}}
     @media (prefers-color-scheme:dark){.message-content a,.search-detail a{color:#83a9ff}.message-content a:hover,.search-detail a:hover{color:#b1c8ff}.message-content blockquote{color:#b4bfd1;background:#202b3d;border-left-color:#718ab9}.md-callout-note{color:#a9ceff;border-color:#4d87c5;background:#172b43}.md-callout-note .md-callout-title{background:#1d3b5e}.md-callout-tip{color:#a8e1b8;border-color:#4f9a68;background:#172d22}.md-callout-tip .md-callout-title{background:#1d4930}.md-callout-important{color:#d2bfff;border-color:#8363be;background:#281d3d}.md-callout-important .md-callout-title{background:#3a2a59}.md-callout-warning{color:#f4cf78;border-color:#ae7e26;background:#3b2e12}.md-callout-warning .md-callout-title{background:#574316}.md-callout-danger{color:#ffb0b0;border-color:#b96464;background:#3c2023}.md-callout-danger .md-callout-title{background:#572b30}}
     @media (prefers-color-scheme:dark){.location-grid input,.custom-model-filter{background:#121925;color:var(--ink)}}
-    @media (max-width:760px){.message{max-width:100%;padding:11px 12px;margin-bottom:14px}.message.user{max-width:92%;margin-left:auto}.message.assistant{margin-right:0}.message-content th,.message-content td{min-width:6.25rem;max-width:min(19rem,76vw);padding:.44rem .5rem}.location-grid{grid-template-columns:1fr}.custom-model-list{grid-template-columns:1fr}.top-actions{flex-wrap:nowrap;justify-content:flex-end}}
+    @media (max-width:760px){.message{max-width:100%;padding:11px 12px;margin-bottom:14px}.message.user{max-width:92%;margin-left:auto}.message.assistant{margin-right:0}.message-content th,.message-content td{min-width:6.25rem;max-width:min(19rem,76vw);padding:.44rem .5rem}.location-grid{grid-template-columns:1fr}.custom-model-list{grid-template-columns:1fr}.top-actions{flex-wrap:wrap;justify-content:flex-end}}
   </style>
 </head>
 <body>
@@ -95,9 +95,9 @@
         <button id="openSidebar" class="icon-btn mobile-only" aria-label="菜单">☰</button>
         <div class="title-block"><h2 id="conversationTitle">新对话</h2><span class="status-dot">外部搜索工具已就绪</span></div>
         <div class="top-actions">
-          <label class="compact-select" title="控制 DeepSeek 模型推理投入"><span id="effortLabel">推理</span><select id="effort"><option value="low">低</option><option value="medium">中</option><option value="high" selected>高</option><option value="xhigh">很高</option><option value="max">最大</option></select></label>
+          <label class="compact-select" title="控制模型的 reasoning effort"><span id="effortLabel">推理</span><select id="effort" aria-label="推理档位"><option value="low">低</option><option value="medium">中</option><option value="high" selected>高</option><option value="xhigh">很高</option><option value="max">最大</option></select></label>
           <button id="providerButton" class="soft-btn">API</button>
-          <button id="customSettingsButton" class="soft-btn hidden" title="Custom 参数">参数</button>
+          <button id="customSettingsButton" class="soft-btn hidden">Custom 参数</button>
           <button id="usersButton" class="soft-btn hidden">账号</button>
         </div>
       </header>

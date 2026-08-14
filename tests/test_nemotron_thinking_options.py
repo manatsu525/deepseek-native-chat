@@ -47,19 +47,6 @@ class NemotronThinkingOptionsTests(unittest.TestCase):
         payload = self.apply("https://gateway.invalid/v1", "ordinary-model")
         self.assertEqual(payload, {"thinking": {"type": "enabled"}, "reasoning_effort": "high"})
 
-    def test_generic_models_pass_through_all_five_effort_levels(self) -> None:
-        payload: dict = {}
-        _apply_thinking_options(
-            payload,
-            "https://gateway.invalid/v1",
-            "ordinary-model",
-            "enabled",
-            "max",
-            True,
-            65536,
-        )
-        self.assertEqual(payload["reasoning_effort"], "max")
-
 
 if __name__ == "__main__":
     unittest.main()

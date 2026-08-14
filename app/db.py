@@ -117,7 +117,8 @@ class Database:
             if "pinned_at" not in conversation_columns:
                 db.execute("ALTER TABLE conversations ADD COLUMN pinned_at INTEGER")
             db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_conversations_user_pinned_updated ON conversations(user_id, pinned_at DESC, updated_at DESC)"
+                "CREATE INDEX IF NOT EXISTS idx_conversations_user_pinned_updated "
+                "ON conversations(user_id, pinned_at DESC, updated_at DESC)"
             )
             job_columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)").fetchall()}
             if "provider_type" not in job_columns:
