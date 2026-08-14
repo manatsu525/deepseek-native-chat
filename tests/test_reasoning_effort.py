@@ -69,7 +69,7 @@ class ReasoningEffortTests(unittest.TestCase):
         )
         self.assertNotIn("reasoning_effort", payload)
 
-    def test_nanogpt_muse_omits_incompatible_reasoning_fields(self) -> None:
+    def test_nanogpt_muse_uses_only_supported_reasoning_effort(self) -> None:
         payload: dict = {}
         _apply_thinking_options(
             payload,
@@ -80,7 +80,32 @@ class ReasoningEffortTests(unittest.TestCase):
             True,
             65536,
         )
-        self.assertEqual(payload, {})
+        self.assertEqual(payload, {"reasoning_effort": "high"})
+
+    def test_nanogpt_muse_maps_max_and_can_disable_reasoning(self) -> None:
+        maximum: dict = {}
+        _apply_thinking_options(
+            maximum,
+            "https://nano-gpt.com/api/v1",
+            "meta/muse-spark-1.2-contributor",
+            "enabled",
+            "max",
+            True,
+            65536,
+        )
+        self.assertEqual(maximum, {"reasoning_effort": "xhigh"})
+
+        disabled: dict = {}
+        _apply_thinking_options(
+            disabled,
+            "https://nano-gpt.com/api/v1",
+            "meta/muse-spark-1.2-contributor",
+            "disabled",
+            "high",
+            True,
+            65536,
+        )
+        self.assertEqual(disabled, {"reasoning_effort": "none"})
 
     def test_only_structured_malformed_tool_call_error_is_recoverable(self) -> None:
         self.assertTrue(_is_malformed_tool_call_error({"code": "malformed_tool_call"}))

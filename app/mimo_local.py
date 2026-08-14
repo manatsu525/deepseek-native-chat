@@ -200,9 +200,12 @@ def _apply_thinking_options(
     thinking_enabled = thinking == "enabled"
     selected_effort = normalize_reasoning_effort(effort)
     if _is_nanogpt_muse(base_url, model):
-        # A live NanoGPT probe showed that Muse reasons internally and reports
-        # reasoning_tokens, but rejects these generic request extensions with
-        # finish_reason=error. It does not expose reasoning text to render.
+        # NanoGPT supports reasoning_effort, but Muse rejects the unrelated
+        # generic `thinking` object. Its documented maximum spelling is xhigh.
+        if not thinking_enabled:
+            payload["reasoning_effort"] = "none"
+        elif effort_enabled:
+            payload["reasoning_effort"] = "xhigh" if selected_effort == "max" else selected_effort
         return
     if is_mimo_model(model):
         payload["thinking"] = {"type": thinking}
