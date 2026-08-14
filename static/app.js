@@ -192,6 +192,11 @@ function isTableDivider(line) {
   return cells.length > 0 && cells.every(cell => /^:?-{2,}:?$/.test(cell));
 }
 
+function isStrictPipeRow(line) {
+  const value = String(line || '').trim();
+  return value.startsWith('|') && value.endsWith('|') && splitTableRow(value).length >= 2;
+}
+
 function calloutInfo(lines) {
   if (!lines.length) return null;
   const marker = lines[0].match(/^\s*\[!(NOTE|INFO|TIP|SUCCESS|IMPORTANT|WARNING|CAUTION|DANGER|ERROR)\]\s*(.*)$/i);
@@ -279,6 +284,25 @@ function markdown(raw='', scrollKeyPrefix='message') {
       table += '</tr></thead><tbody>';
       rows.forEach(row => { table += `<tr>${headers.map((_, index) => `<td${align[index] ? ` style="text-align:${align[index]}"` : ''}>${inline(row[index] || '')}</td>`).join('')}</tr>`; });
       out.push(`${table}</tbody></table></div>`); continue;
+    }
+    if (isStrictPipeRow(line) && i + 1 < lines.length && isStrictPipeRow(lines[i + 1]) && !isTableDivider(lines[i + 1])) {
+      const columnCount = splitTableRow(line).length;
+      const rows = [];
+      let cursor = i;
+      while (cursor < lines.length && isStrictPipeRow(lines[cursor])) {
+        const row = splitTableRow(lines[cursor]);
+        if (row.length !== columnCount || isTableDivider(lines[cursor])) break;
+        rows.push(row); cursor++;
+      }
+      if (rows.length >= 2) {
+        flushParagraph(); closeList();
+        const tableScrollKey = `${scrollKeyPrefix}-table-${tableIndex++}`;
+        let table = `<div class="table-wrap" data-scroll-key="${escapeHtml(tableScrollKey)}"><table><tbody>`;
+        rows.forEach(row => { table += `<tr>${row.map(cell => `<td>${inline(cell)}</td>`).join('')}</tr>`; });
+        out.push(`${table}</tbody></table></div>`);
+        i = cursor - 1;
+        continue;
+      }
     }
     if (!trimmed) { flushParagraph(); closeList(); continue; }
     let match = trimmed.match(/^(#{1,6})\s+(.+)$/);

@@ -277,6 +277,65 @@ class RetryInPlaceTests(unittest.TestCase):
             [("user", "failed question"), ("assistant", "recovered answer")],
         )
 
+    def test_failed_answer_is_persisted_but_excluded_from_later_model_context(self) -> None:
+        provider_id = self.add_provider("current-provider", "current-model")
+        conversation_id = "persisted-failure"
+        main.db.run(
+            "INSERT INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?)",
+            (conversation_id, self.user_id, "Failure", 100, 100),
+        )
+        prompt_id = self.add_message(conversation_id, "user", "question that fails", 101)
+
+        async def failing_response(**kwargs):
+            await kwargs["update"](
+                {
+                    "answer": "已经查到一部分资料。",
+                    "reasoning": "partial reasoning",
+                    "searches": [{"id": "search-1", "status": "completed", "action": "search"}],
+                    "sources": [{"url": "https://example.com", "title": "Example"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                }
+            )
+            raise RuntimeError("upstream exploded")
+
+        with patch.object(main, "custom_stream_response", new=failing_response):
+            response = self.retry(conversation_id, prompt_id, provider_id, "current-model")
+            self.assertEqual(response.status_code, 200, response.text)
+            failed_job = self.wait_for_job(response.json()["job_id"])
+
+        self.assertEqual(failed_job["status"], "failed")
+        persisted = main.db.one(
+            "SELECT content,meta_json FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 1",
+            (conversation_id,),
+        )
+        self.assertEqual(persisted["content"], "已经查到一部分资料。")
+        meta = json.loads(persisted["meta_json"])
+        self.assertTrue(meta["failed"])
+        self.assertEqual(meta["error"], "upstream exploded")
+        self.assertEqual(meta["reasoning"], "partial reasoning")
+
+        loaded = self.client.get(f"/api/conversations/{conversation_id}")
+        self.assertEqual(loaded.status_code, 200, loaded.text)
+        self.assertIsNone(loaded.json()["active_job"])
+        self.assertEqual(loaded.json()["messages"][-1]["meta"]["error"], "upstream exploded")
+
+        later_histories: list[list[dict]] = []
+        later_prompt = self.add_message(conversation_id, "user", "follow-up question", 102)
+
+        async def successful_response(**kwargs):
+            later_histories.append(copy.deepcopy(kwargs["messages"]))
+            return {"answer": "follow-up answer", "reasoning": "", "searches": [], "sources": [], "usage": {}}
+
+        with patch.object(main, "custom_stream_response", new=successful_response):
+            response = self.retry(conversation_id, later_prompt, provider_id, "current-model")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.wait_for_job(response.json()["job_id"])
+
+        self.assertEqual(
+            [(item["role"], item["content"]) for item in later_histories[0]],
+            [("user", "question that fails"), ("user", "follow-up question")],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

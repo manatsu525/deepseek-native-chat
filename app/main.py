@@ -368,6 +368,11 @@ async def run_job(job_id: str) -> None:
     )
     history: list[dict[str, Any]] = []
     for row in reversed(history_rows):
+        meta = db.decode(row.get("meta_json", "{}"), {})
+        # Failed answers are kept for the user to inspect, but an incomplete
+        # status sentence must not pollute the next model request's context.
+        if row["role"] == "assistant" and meta.get("failed"):
+            continue
         message: dict[str, Any] = {"role": row["role"], "content": row["content"]}
         # Custom Chat Completions gateways may accept historical reasoning_content
         # in later turns. Client-side
@@ -375,7 +380,6 @@ async def run_job(job_id: str) -> None:
         # message is persisted, while replaying an assistant tool_call without
         # its matching tool result can make compatible gateways reject history.
         if kind == "custom" and is_mimo_model(job.get("model")) and row["role"] == "assistant":
-            meta = db.decode(row.get("meta_json", "{}"), {})
             if meta.get("reasoning") and not meta.get("invalid_answer"):
                 message["reasoning_content"] = meta.get("reasoning", "")
         history.append(message)
@@ -475,7 +479,44 @@ async def run_job(job_id: str) -> None:
             )
         db.update_job(job_id, status="stopped", error="")
     except Exception as exc:
-        db.update_job(job_id, status="failed", error=str(exc)[:3000])
+        error = str(exc)[:3000]
+        partial = db.one(
+            "SELECT answer,reasoning,searches_json,sources_json,usage_json FROM jobs WHERE id=?",
+            (job_id,),
+        ) or {}
+        meta = {
+            "job_id": job_id,
+            "failed": True,
+            "invalid_answer": True,
+            "error": error,
+            "provider_id": job["provider_id"],
+            "provider_type": kind,
+            "model": job["model"],
+            "reasoning": partial.get("reasoning", ""),
+            "searches": db.decode(partial.get("searches_json", "[]"), []),
+            "sources": db.decode(partial.get("sources_json", "[]"), []),
+            "usage": db.decode(partial.get("usage_json", "{}"), {}),
+        }
+        failed_at = now()
+        with db.lock, db.connect() as connection:
+            connection.execute(
+                "INSERT INTO messages(conversation_id,role,content,meta_json,created_at) VALUES(?,?,?,?,?)",
+                (
+                    job["conversation_id"],
+                    "assistant",
+                    partial.get("answer", ""),
+                    json.dumps(meta, ensure_ascii=False),
+                    failed_at,
+                ),
+            )
+            connection.execute(
+                "UPDATE conversations SET updated_at=? WHERE id=?",
+                (failed_at, job["conversation_id"]),
+            )
+            connection.execute(
+                "UPDATE jobs SET status='failed',error=?,updated_at=? WHERE id=?",
+                (error, failed_at, job_id),
+            )
     finally:
         if attachment_lock_acquired:
             attachment_job_lock.release()
