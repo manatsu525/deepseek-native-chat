@@ -69,6 +69,13 @@ FINAL_ANSWER_PROMPT = (
     "Even if the evidence is incomplete or a previous tool failed, provide the best supported answer now and state "
     "the uncertainty explicitly. 工具调用额度已经全部耗尽；禁止继续搜索或读取网页，必须立即根据已有资料回答原问题。"
 )
+NEMOTRON_LANGUAGE_PROMPT = (
+    "LANGUAGE REQUIREMENT: Answer in the same language as the user's most recent message. "
+    "If that message is in Chinese, the final answer MUST be in Chinese; if it is in another language, "
+    "use that language. For mixed-language messages, use the predominant natural language. "
+    "Code, commands, URLs, quotations, and technical names may remain in their original language. "
+    "This requirement applies to the final answer even when web sources or tool results are in English."
+)
 
 
 def _tool_quota_message(
@@ -172,6 +179,13 @@ def _is_nemotron_model(model: str) -> bool:
     return "nemotron" in str(model or "").casefold()
 
 
+def _apply_model_system_prompt(system_prompt: str, model: str) -> str:
+    """Apply narrowly scoped behavioral guidance for models that need it."""
+    if _is_nemotron_model(model):
+        return f"{system_prompt}\n\n{NEMOTRON_LANGUAGE_PROMPT}"
+    return system_prompt
+
+
 def _apply_thinking_options(
     payload: dict[str, Any],
     base_url: str,
@@ -246,7 +260,10 @@ async def stream_response(
         base_prompt = LEGACY_CUSTOM_SYSTEM_PROMPT
     else:
         base_prompt = KEYLESS_CUSTOM_SYSTEM_PROMPT
-    system_prompt = _dated_system_prompt(base_prompt, user_timezone)
+    system_prompt = _apply_model_system_prompt(
+        _dated_system_prompt(base_prompt, user_timezone),
+        model,
+    )
     conversation: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}, *[dict(message) for message in messages]]
     answer = ""
     reasoning = ""

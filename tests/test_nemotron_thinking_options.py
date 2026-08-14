@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from app.mimo_local import _apply_thinking_options
+from app.mimo_local import NEMOTRON_LANGUAGE_PROMPT, _apply_model_system_prompt, _apply_thinking_options
 
 
 class NemotronThinkingOptionsTests(unittest.TestCase):
@@ -46,6 +46,14 @@ class NemotronThinkingOptionsTests(unittest.TestCase):
     def test_non_nemotron_custom_models_keep_generic_controls(self) -> None:
         payload = self.apply("https://gateway.invalid/v1", "ordinary-model")
         self.assertEqual(payload, {"thinking": {"type": "enabled"}, "reasoning_effort": "high"})
+
+    def test_nemotron_gets_same_language_instruction(self) -> None:
+        prompt = _apply_model_system_prompt("base prompt", "nvidia/nemotron-3.5-lightning")
+        self.assertEqual(prompt, f"base prompt\n\n{NEMOTRON_LANGUAGE_PROMPT}")
+        self.assertIn("final answer MUST be in Chinese", prompt)
+
+    def test_other_models_do_not_get_language_instruction(self) -> None:
+        self.assertEqual(_apply_model_system_prompt("base prompt", "deepseek-v4-flash"), "base prompt")
 
 
 if __name__ == "__main__":
