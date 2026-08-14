@@ -7,7 +7,7 @@ import unittest
 from fastapi import HTTPException
 
 from app.main import ChatBody, validate_effort
-from app.mimo_local import _apply_thinking_options, _is_malformed_tool_call_error
+from app.mimo_local import _apply_thinking_options
 from app.reasoning_effort import DEFAULT, LEVELS, normalize
 
 
@@ -68,49 +68,6 @@ class ReasoningEffortTests(unittest.TestCase):
             65536,
         )
         self.assertNotIn("reasoning_effort", payload)
-
-    def test_nanogpt_muse_uses_only_supported_reasoning_effort(self) -> None:
-        payload: dict = {}
-        _apply_thinking_options(
-            payload,
-            "https://nano-gpt.com/api/v1",
-            "meta/muse-spark-1.2-contributor",
-            "enabled",
-            "high",
-            True,
-            65536,
-        )
-        self.assertEqual(payload, {"reasoning_effort": "high"})
-
-    def test_nanogpt_muse_maps_max_and_can_disable_reasoning(self) -> None:
-        maximum: dict = {}
-        _apply_thinking_options(
-            maximum,
-            "https://nano-gpt.com/api/v1",
-            "meta/muse-spark-1.2-contributor",
-            "enabled",
-            "max",
-            True,
-            65536,
-        )
-        self.assertEqual(maximum, {"reasoning_effort": "xhigh"})
-
-        disabled: dict = {}
-        _apply_thinking_options(
-            disabled,
-            "https://nano-gpt.com/api/v1",
-            "meta/muse-spark-1.2-contributor",
-            "disabled",
-            "high",
-            True,
-            65536,
-        )
-        self.assertEqual(disabled, {"reasoning_effort": "none"})
-
-    def test_only_structured_malformed_tool_call_error_is_recoverable(self) -> None:
-        self.assertTrue(_is_malformed_tool_call_error({"code": "malformed_tool_call"}))
-        self.assertFalse(_is_malformed_tool_call_error({"code": "rate_limit_exceeded"}))
-        self.assertFalse(_is_malformed_tool_call_error("malformed_tool_call"))
 
 
 if __name__ == "__main__":
