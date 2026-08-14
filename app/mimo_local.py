@@ -172,6 +172,19 @@ def _is_nemotron_model(model: str) -> bool:
     return "nemotron" in str(model or "").casefold()
 
 
+def _is_nanogpt_muse(base_url: str, model: str) -> bool:
+    """NanoGPT Muse rejects generic reasoning request extensions."""
+    host = (urlsplit(base_url).hostname or "").casefold()
+    return host in {"nano-gpt.com", "www.nano-gpt.com"} and "muse-spark" in str(model or "").casefold()
+
+
+def _is_malformed_tool_call_error(error: Any) -> bool:
+    """Recognize the structured gateway error without hiding other failures."""
+    if not isinstance(error, dict):
+        return False
+    return str(error.get("code") or "").strip().casefold() == "malformed_tool_call"
+
+
 def _apply_thinking_options(
     payload: dict[str, Any],
     base_url: str,
@@ -186,6 +199,11 @@ def _apply_thinking_options(
     model_name = str(model or "").casefold().rsplit("/", 1)[-1]
     thinking_enabled = thinking == "enabled"
     selected_effort = normalize_reasoning_effort(effort)
+    if _is_nanogpt_muse(base_url, model):
+        # A live NanoGPT probe showed that Muse reasons internally and reports
+        # reasoning_tokens, but rejects these generic request extensions with
+        # finish_reason=error. It does not expose reasoning text to render.
+        return
     if is_mimo_model(model):
         payload["thinking"] = {"type": thinking}
     elif _is_nvidia_deepseek_v4(base_url, model):
@@ -353,6 +371,7 @@ async def stream_response(
             round_reasoning = ""
             round_usage: dict[str, Any] = {}
             round_tools_by_index: dict[int, dict[str, Any]] = {}
+            malformed_tool_call = False
             dsml_stream = DsmlStreamBuffer() if dsml_fallback_active else None
             async with api_client.stream("POST", _url(base_url, "/chat/completions"), headers=headers, json=payload) as response:
                 if response.status_code >= 400:
@@ -373,6 +392,9 @@ async def stream_response(
                     except json.JSONDecodeError:
                         continue
                     if data.get("error"):
+                        if round_tools and _is_malformed_tool_call_error(data["error"]):
+                            malformed_tool_call = True
+                            break
                         raise RuntimeError(f"Custom 响应失败: {data['error']}")
                     raw_usage = data.get("usage")
                     if isinstance(raw_usage, dict):
@@ -410,6 +432,21 @@ async def stream_response(
                     )
 
             usage = _merge_usage(usage, round_usage)
+            if malformed_tool_call:
+                # The gateway consumed the malformed native tool payload, so
+                # there is nothing client-side to parse or repair. Preserve
+                # completed tool results and make the next round answer-only.
+                force_final_answer = True
+                await update(
+                    {
+                        "answer": answer,
+                        "reasoning": reasoning,
+                        "searches": steps,
+                        "usage": usage,
+                        "sources": list(sources.values()),
+                    }
+                )
+                continue
             calls = normalize_tool_calls(_tool_calls(round_tools_by_index, round_number))
             if dsml_stream is not None:
                 round_preview += dsml_stream.flush()
