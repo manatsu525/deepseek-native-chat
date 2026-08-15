@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+from copy import deepcopy
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -16,7 +17,7 @@ MAX_TOTAL_BYTES = 10 * 1024 * 1024
 MAX_READ_CHARS = 120_000
 MAX_SEARCH_RESULTS = 50
 
-WORKSPACE_SYSTEM_PROMPT = """A persistent, isolated coding workspace is available for this conversation. When the user asks you to create code or a multi-file project, use the workspace tools to save the actual files instead of only printing complete files in chat. On later requests, inspect the existing workspace files and patch only what needs to change. Do not recreate or overwrite unrelated files. After editing, briefly summarize changed files; the UI supplies download links automatically. This workspace cannot run commands or execute code, so do not claim that files were executed or tests passed."""
+WORKSPACE_SYSTEM_PROMPT = """A persistent, isolated coding workspace is available for this conversation. When the user asks you to create code or a multi-file project, use the workspace tools to save the actual files instead of only printing complete files in chat. On later requests, inspect the existing workspace files and patch only what needs to change. Do not recreate or overwrite unrelated files. Every workspace tool call must include every field marked required in its JSON schema. In particular, read_file, write_file, apply_patch, and delete_file must always include a non-empty workspace-relative path exactly as listed by list_files (or the intended new relative path for write_file). Before emitting a tool call, verify its arguments against the schema; never omit path and never repeat an unchanged read_file call. After editing, briefly summarize changed files; the UI supplies download links automatically. This workspace cannot run commands or execute code, so do not claim that files were executed or tests passed."""
 
 
 def _function(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -134,6 +135,21 @@ class ConversationWorkspace:
             {"path": path.relative_to(self.root).as_posix(), "size": path.stat().st_size}
             for path in self._files()
         ]
+
+    def tool_definitions(self) -> list[dict[str, Any]]:
+        """Return schemas constrained to the files that actually exist now."""
+        tools = deepcopy(WORKSPACE_TOOLS)
+        paths = [item["path"] for item in self.list_files()]
+        for tool in tools:
+            function = tool.get("function") or {}
+            name = str(function.get("name") or "")
+            if name not in {"read_file", "apply_patch", "delete_file"} or not paths:
+                continue
+            path_schema = ((function.get("parameters") or {}).get("properties") or {}).get("path")
+            if isinstance(path_schema, dict):
+                path_schema["enum"] = paths
+                path_schema["description"] = "Required existing workspace file path. Choose exactly one value from this list."
+        return tools
 
     def _read_text(self, path: Any) -> tuple[str, str]:
         target, relative = self.resolve(path)

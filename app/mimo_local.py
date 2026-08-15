@@ -61,7 +61,6 @@ from .reasoning_effort import normalize as normalize_reasoning_effort
 from .workspace import (
     WORKSPACE_SYSTEM_PROMPT,
     WORKSPACE_TOOL_NAMES,
-    WORKSPACE_TOOLS,
     ConversationWorkspace,
 )
 
@@ -71,7 +70,7 @@ class ToolQuotaExceeded(RuntimeError):
 
 
 FINAL_ANSWER_ATTEMPTS = 2
-MAX_AGENT_TOOL_ROUNDS = 20
+MAX_AGENT_TOOL_ROUNDS = 12
 PARALLEL_MAX_SEARCH_EXCERPT_CHARS = 1200
 FINAL_ANSWER_PROMPT = (
     "CRITICAL FINALIZATION INSTRUCTION: The tool-call budget is completely exhausted. No search, webpage-reading, "
@@ -298,6 +297,7 @@ async def stream_response(
     reader_enabled = bool(known_urls)
     final_answer_attempts = 0
     force_final_answer = False
+    workspace_reads: set[str] = set()
     parallel_session_id = (f"conversation_{conversation_id}" if conversation_id else f"response_{uuid.uuid4().hex}")[:100]
     last_search_objective = ""
     last_search_queries: list[str] = []
@@ -346,7 +346,7 @@ async def stream_response(
                     else:
                         round_tools.append(KEYLESS_FETCH_WEBPAGE_TOOL)
                 if workspace is not None and tool_rounds_used < MAX_AGENT_TOOL_ROUNDS:
-                    round_tools.extend(WORKSPACE_TOOLS)
+                    round_tools.extend(workspace.tool_definitions())
             final_answer_only = force_final_answer or not round_tools
             mimo_model = is_mimo_model(model)
             request_messages = conversation
@@ -578,7 +578,42 @@ async def stream_response(
                     if workspace is None:
                         raise ValueError("当前对话没有可用的编码工作区")
                     step["path"] = str(arguments.get("path") or "")[:300]
-                    result_text = workspace.execute(name, arguments)
+                    required_arguments = {
+                        "read_file": ("path",),
+                        "write_file": ("path", "content"),
+                        "apply_patch": ("path", "old_text", "new_text"),
+                        "search_files": ("query",),
+                        "delete_file": ("path",),
+                    }.get(name, ())
+                    non_empty_arguments = {"path", "query", "old_text"}
+                    missing = [
+                        key
+                        for key in required_arguments
+                        if key not in arguments
+                        or arguments[key] is None
+                        or (key in non_empty_arguments and str(arguments[key]).strip() == "")
+                    ]
+                    if missing:
+                        raise ValueError(f"{name} 缺少必填参数：{', '.join(missing)}。请严格按工具 JSON Schema 重新调用，不要省略字段")
+                    normalized_path = ""
+                    if "path" in arguments:
+                        _, normalized_path = workspace.resolve(arguments["path"], allow_root=name == "search_files")
+                    if name == "read_file" and normalized_path in workspace_reads:
+                        result_text = json.dumps(
+                            {
+                                "ok": True,
+                                "path": normalized_path,
+                                "unchanged": True,
+                                "message": "文件自上次读取后未改变；请使用本轮上下文中上一次 read_file 返回的内容，不再重复返回全文。",
+                            },
+                            ensure_ascii=False,
+                        )
+                    else:
+                        result_text = workspace.execute(name, arguments)
+                        if name == "read_file":
+                            workspace_reads.add(normalized_path)
+                        elif name in {"write_file", "apply_patch", "delete_file"}:
+                            workspace_reads.discard(normalized_path)
                     step["status"] = "completed"
                 elif is_search:
                     if parallel_mode:
@@ -743,6 +778,12 @@ async def stream_response(
                     result_text = f"工作区操作失败：{str(exc)[:1000]}。请先读取当前文件并修正参数后重试。"
                 else:
                     result_text = f"读取网页失败：{str(exc)[:1000]}。请根据已有搜索结果继续回答，必要时选择其他来源。"
+            if is_workspace and step["status"] == "failed":
+                # Failed patches can contain many kilobytes of old/new text.
+                # Keeping those unusable arguments in every later request
+                # multiplies input-token cost without giving the model useful
+                # state. The paired tool result below retains the exact error.
+                function["arguments"] = "{}"
             tool_trace.append({"id": call_id, "name": name, "url": target_url, "path": step.get("path", ""), "backend": "workspace" if is_workspace else web_tool_backend, "status": step["status"], "error": step["error"]})
             conversation.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
             await update(

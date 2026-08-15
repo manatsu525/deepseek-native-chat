@@ -60,6 +60,16 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn('"ok": true', result)
         self.assertIn('"path": "index.html"', result)
 
+    def test_existing_file_tools_are_constrained_to_real_paths(self) -> None:
+        self.workspace.write_file("index.html", "<h1>Hi</h1>")
+        self.workspace.write_file("src/app.js", "start()")
+        tools = {item["function"]["name"]: item for item in self.workspace.tool_definitions()}
+        expected = ["index.html", "src/app.js"]
+        for name in ("read_file", "apply_patch", "delete_file"):
+            schema = tools[name]["function"]["parameters"]["properties"]["path"]
+            self.assertEqual(schema["enum"], expected)
+        self.assertNotIn("enum", tools["write_file"]["function"]["parameters"]["properties"]["path"])
+
 
 if __name__ == "__main__":
     unittest.main()
