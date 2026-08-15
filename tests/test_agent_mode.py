@@ -60,7 +60,7 @@ class _FakeApiClient:
                     "arguments": '{"path":"hello.py","content":"print(\\"ok\\")\\n"}',
                 },
             }
-            event = {"choices": [{"delta": {"reasoning_content": "act", "tool_calls": [call]}}]}
+            event = {"choices": [{"delta": {"content": "I'll write the file now.", "reasoning_content": "act", "tool_calls": [call]}}]}
         else:
             event = {"choices": [{"delta": {"content": "已保存 hello.py。"}}]}
         return _FakeStreamResponse([f"data: {json_module.dumps(event)}", "data: [DONE]"])
@@ -133,6 +133,9 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(first["reasoning_effort"], "low")
         self.assertEqual(second["tool_choice"], "auto")
         self.assertEqual(second["reasoning_effort"], "medium")
+        tool_turn = next(message for message in second["messages"] if message.get("tool_calls"))
+        self.assertEqual(tool_turn["content"], "I'll write the file now.")
+        self.assertEqual(tool_turn["tool_calls"][0]["function"]["arguments"], "{}")
         first_tools = {item["function"]["name"] for item in first["tools"]}
         self.assertIn("web_search", first_tools)
         self.assertIn("write_file", first_tools)
@@ -140,6 +143,8 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(result["reasoning_before_first_write"], 3)
         self.assertEqual(result["stall_nudges"], 0)
         self.assertEqual(result["answer"], "已保存 hello.py。")
+        self.assertNotIn("I'll write", result["answer"])
+        self.assertIn("I'll write", result["reasoning"])
 
     def test_database_migrates_old_jobs_with_auto_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
