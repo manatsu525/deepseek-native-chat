@@ -57,6 +57,12 @@ from .minimax_tool_fallback import (
     applies_to as minimax_fallback_applies,
     recover_tool_calls as recover_minimax_tool_calls,
 )
+from .inkling_tool_compat import (
+    InklingStreamBuffer,
+    applies_to as inkling_compat_applies,
+    bind_patch_tools as bind_inkling_patch_tools,
+    recover_tool_calls as recover_inkling_tool_calls,
+)
 from .reasoning_effort import normalize as normalize_reasoning_effort
 from .workspace import (
     WORKSPACE_SYSTEM_PROMPT,
@@ -260,6 +266,7 @@ async def stream_response(
         bool(config.get("dsml_fallback_enabled", True)),
     )
     minimax_fallback_active = minimax_fallback_applies(model)
+    inkling_compat_active = inkling_compat_applies(model)
     web_tool_backend = str(config.get("web_tool_backend") or "parallel")
     parallel_mode = web_tool_backend == "parallel"
     legacy_mode = web_tool_backend == "legacy"
@@ -330,6 +337,7 @@ async def stream_response(
             if stopped():
                 raise asyncio.CancelledError
             round_tools: list[dict[str, Any]] = []
+            inkling_patch_bindings: dict[str, tuple[str, str]] = {}
             if not force_final_answer:
                 if tool_rounds_used < MIMO_MAX_TOOL_ROUNDS and search_count < MIMO_MAX_SEARCHES:
                     if parallel_mode:
@@ -347,6 +355,11 @@ async def stream_response(
                         round_tools.append(KEYLESS_FETCH_WEBPAGE_TOOL)
                 if workspace is not None and tool_rounds_used < MAX_AGENT_TOOL_ROUNDS:
                     round_tools.extend(workspace.tool_definitions())
+                    if inkling_compat_active:
+                        round_tools, inkling_patch_bindings = bind_inkling_patch_tools(
+                            round_tools,
+                            [item["path"] for item in workspace.list_files()],
+                        )
             final_answer_only = force_final_answer or not round_tools
             mimo_model = is_mimo_model(model)
             request_messages = conversation
@@ -390,7 +403,9 @@ async def stream_response(
             round_usage: dict[str, Any] = {}
             round_tools_by_index: dict[int, dict[str, Any]] = {}
             markup_stream = (
-                DsmlStreamBuffer()
+                InklingStreamBuffer()
+                if inkling_compat_active
+                else DsmlStreamBuffer()
                 if dsml_fallback_active
                 else MiniMaxStreamBuffer()
                 if minimax_fallback_active
@@ -469,6 +484,13 @@ async def stream_response(
                     id_prefix=f"minimax-{round_number + 1}",
                     tools_available=bool(round_tools),
                 )
+            if inkling_compat_active:
+                round_answer, calls = recover_inkling_tool_calls(
+                    round_answer,
+                    calls,
+                    id_prefix=f"inkling-{round_number + 1}",
+                    tools_available=bool(round_tools),
+                )
             invalid_answer = not round_answer.strip() or _looks_like_text_tool_call(round_answer)
             if (final_answer_only and (calls or invalid_answer)) or (not calls and invalid_answer):
                 final_answer_attempts += 1
@@ -517,8 +539,9 @@ async def stream_response(
             call_id = call["id"]
             function = call.get("function") or {}
             name = str(function.get("name") or "")
+            workspace_name, bound_path = inkling_patch_bindings.get(name, (name, ""))
             is_search = name == "web_search"
-            is_workspace = name in WORKSPACE_TOOL_NAMES
+            is_workspace = workspace_name in WORKSPACE_TOOL_NAMES
             step: dict[str, Any] = {
                 "id": call_id,
                 "status": "running",
@@ -526,7 +549,7 @@ async def stream_response(
                 "query": "",
                 "url": "",
                 "path": "",
-                "tool": name,
+                "tool": workspace_name,
                 "error": "",
             }
             if is_search:
@@ -577,6 +600,8 @@ async def stream_response(
                 if is_workspace:
                     if workspace is None:
                         raise ValueError("当前对话没有可用的编码工作区")
+                    if bound_path:
+                        arguments["path"] = bound_path
                     step["path"] = str(arguments.get("path") or "")[:300]
                     required_arguments = {
                         "read_file": ("path",),
@@ -587,7 +612,7 @@ async def stream_response(
                         "delete_file": ("path",),
                         "run_python": ("path",),
                         "check_web_syntax": ("path",),
-                    }.get(name, ())
+                    }.get(workspace_name, ())
                     non_empty_arguments = {"path", "query", "old_text"}
                     missing = [
                         key
@@ -597,11 +622,11 @@ async def stream_response(
                         or (key in non_empty_arguments and str(arguments[key]).strip() == "")
                     ]
                     if missing:
-                        raise ValueError(f"{name} 缺少必填参数：{', '.join(missing)}。请严格按工具 JSON Schema 重新调用，不要省略字段")
+                        raise ValueError(f"{workspace_name} 缺少必填参数：{', '.join(missing)}。请严格按工具 JSON Schema 重新调用，不要省略字段")
                     normalized_path = ""
                     if "path" in arguments:
-                        _, normalized_path = workspace.resolve(arguments["path"], allow_root=name == "search_files")
-                    if name == "read_file" and normalized_path in workspace_reads:
+                        _, normalized_path = workspace.resolve(arguments["path"], allow_root=workspace_name == "search_files")
+                    if workspace_name == "read_file" and normalized_path in workspace_reads:
                         result_text = json.dumps(
                             {
                                 "ok": True,
@@ -612,10 +637,10 @@ async def stream_response(
                             ensure_ascii=False,
                         )
                     else:
-                        result_text = await asyncio.to_thread(workspace.execute, name, arguments)
-                        if name == "read_file":
+                        result_text = await asyncio.to_thread(workspace.execute, workspace_name, arguments)
+                        if workspace_name == "read_file":
                             workspace_reads.add(normalized_path)
-                        elif name in {"write_file", "apply_patch", "apply_patch_batch", "delete_file"}:
+                        elif workspace_name in {"write_file", "apply_patch", "apply_patch_batch", "delete_file"}:
                             workspace_reads.discard(normalized_path)
                     step["status"] = "completed"
                 elif is_search:
@@ -787,7 +812,7 @@ async def stream_response(
                 # multiplies input-token cost without giving the model useful
                 # state. The paired tool result below retains the exact error.
                 function["arguments"] = "{}"
-            tool_trace.append({"id": call_id, "name": name, "url": target_url, "path": step.get("path", ""), "backend": "workspace" if is_workspace else web_tool_backend, "status": step["status"], "error": step["error"]})
+            tool_trace.append({"id": call_id, "name": workspace_name if is_workspace else name, "url": target_url, "path": step.get("path", ""), "backend": "workspace" if is_workspace else web_tool_backend, "status": step["status"], "error": step["error"]})
             conversation.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
             await update(
                 {
