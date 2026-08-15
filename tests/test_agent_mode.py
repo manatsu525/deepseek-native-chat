@@ -51,13 +51,14 @@ class _FakeApiClient:
     def stream(self, method: str, url: str, *, headers: dict, json: dict):
         self.payloads.append(json)
         if len(self.payloads) == 1:
+            large_content = "x" * 5000
             call = {
                 "index": 0,
                 "id": "call-write",
                 "type": "function",
                 "function": {
                     "name": "write_file",
-                    "arguments": '{"path":"hello.py","content":"print(\\"ok\\")\\n"}',
+                    "arguments": json_module.dumps({"path": "hello.py", "content": large_content}),
                 },
             }
             event = {"choices": [{"delta": {"content": "I'll write the file now.", "reasoning_content": "act", "tool_calls": [call]}}]}

@@ -74,6 +74,7 @@ class ToolQuotaExceeded(RuntimeError):
 FINAL_ANSWER_ATTEMPTS = 2
 PARALLEL_MAX_SEARCH_EXCERPT_CHARS = 1200
 WORKSPACE_MUTATION_TOOLS = {"write_file", "apply_patch", "apply_patch_batch", "delete_file"}
+WORKSPACE_ARGUMENT_COMPACT_THRESHOLD = 4096
 FINAL_ANSWER_PROMPT = (
     "CRITICAL FINALIZATION INSTRUCTION: The tool-call budget is completely exhausted. No search, webpage-reading, "
     "or workspace tool is available now, and requesting another tool cannot succeed. You MUST stop using tools and answer the "
@@ -320,7 +321,6 @@ async def stream_response(
     first_write_seen = False
     required_tool_choice_supported = True
     workspace_reads: set[str] = set()
-    workspace_read_messages: dict[str, dict[str, Any]] = {}
     parallel_session_id = (f"conversation_{conversation_id}" if conversation_id else f"response_{uuid.uuid4().hex}")[:100]
     last_search_objective = ""
     last_search_queries: list[str] = []
@@ -886,33 +886,26 @@ async def stream_response(
                     result_text = f"工作区操作失败：{str(exc)[:1000]}。请先读取当前文件并修正参数后重试。"
                 else:
                     result_text = f"读取网页失败：{str(exc)[:1000]}。请根据已有搜索结果继续回答，必要时选择其他来源。"
-            if is_workspace and (
-                step["status"] == "failed"
-                or (step["status"] == "completed" and workspace_name in WORKSPACE_MUTATION_TOOLS)
+            workspace_argument_chars = len(str(function.get("arguments") or ""))
+            if (
+                is_workspace
+                and workspace_argument_chars > WORKSPACE_ARGUMENT_COMPACT_THRESHOLD
+                and (
+                    step["status"] == "failed"
+                    or (step["status"] == "completed" and workspace_name in WORKSPACE_MUTATION_TOOLS)
+                )
             ):
                 # Mutation arguments can contain a complete file or a large
                 # old/new snapshot. The paired tool result is authoritative;
                 # retaining those arguments in every later request multiplies
-                # input tokens without adding current state. Failed arguments
-                # are likewise unusable, so both are compacted after execution.
+                # input tokens without adding current state. Compact only large
+                # arguments before they first enter a subsequent request. Small
+                # calls and prior read results remain byte-stable so automatic
+                # provider prefix caching can continue to hit.
                 function["arguments"] = "{}"
-            if is_workspace and step["status"] == "completed" and workspace_name in WORKSPACE_MUTATION_TOOLS:
-                stale_read = workspace_read_messages.pop(normalized_path, None)
-                if stale_read is not None:
-                    stale_read["content"] = json.dumps(
-                        {
-                            "ok": True,
-                            "path": normalized_path,
-                            "stale": True,
-                            "message": "该读取快照随后已被修改，为节省上下文已移除；需要当前内容时重新调用 read_file。",
-                        },
-                        ensure_ascii=False,
-                    )
             tool_trace.append({"id": call_id, "name": workspace_name if is_workspace else name, "url": target_url, "path": step.get("path", ""), "backend": "workspace" if is_workspace else web_tool_backend, "status": step["status"], "error": step["error"]})
             tool_message = {"role": "tool", "tool_call_id": call_id, "content": result_text}
             conversation.append(tool_message)
-            if is_workspace and step["status"] == "completed" and workspace_name == "read_file":
-                workspace_read_messages[normalized_path] = tool_message
             await update(
                 {
                     "answer": answer,
