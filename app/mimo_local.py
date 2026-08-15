@@ -52,6 +52,11 @@ from .mimo import (
 )
 from .parallel_mcp import ParallelMCPClient
 from .opencode_dsml_fallback import DsmlStreamBuffer, applies_to as dsml_fallback_applies, recover_tool_calls
+from .minimax_tool_fallback import (
+    MiniMaxStreamBuffer,
+    applies_to as minimax_fallback_applies,
+    recover_tool_calls as recover_minimax_tool_calls,
+)
 from .reasoning_effort import normalize as normalize_reasoning_effort
 from .workspace import (
     WORKSPACE_SYSTEM_PROMPT,
@@ -255,6 +260,7 @@ async def stream_response(
         model,
         bool(config.get("dsml_fallback_enabled", True)),
     )
+    minimax_fallback_active = minimax_fallback_applies(model)
     web_tool_backend = str(config.get("web_tool_backend") or "parallel")
     parallel_mode = web_tool_backend == "parallel"
     legacy_mode = web_tool_backend == "legacy"
@@ -383,7 +389,13 @@ async def stream_response(
             round_reasoning = ""
             round_usage: dict[str, Any] = {}
             round_tools_by_index: dict[int, dict[str, Any]] = {}
-            dsml_stream = DsmlStreamBuffer() if dsml_fallback_active else None
+            markup_stream = (
+                DsmlStreamBuffer()
+                if dsml_fallback_active
+                else MiniMaxStreamBuffer()
+                if minimax_fallback_active
+                else None
+            )
             async with api_client.stream("POST", _url(base_url, "/chat/completions"), headers=headers, json=payload) as response:
                 if response.status_code >= 400:
                     body = (await response.aread()).decode(errors="replace")[:2000]
@@ -412,15 +424,15 @@ async def stream_response(
                         message = choice.get("message") or {}
                         delta_content = str(delta.get("content") or "")
                         round_answer += delta_content
-                        if dsml_stream is not None:
-                            round_preview += dsml_stream.feed(delta_content)
+                        if markup_stream is not None:
+                            round_preview += markup_stream.feed(delta_content)
                         delta_reasoning = delta.get("reasoning_content") or delta.get("reasoning")
                         round_reasoning += str(delta_reasoning or "")
                         if message.get("content") and not delta.get("content"):
                             message_content = str(message.get("content") or "")
                             round_answer += message_content
-                            if dsml_stream is not None:
-                                round_preview += dsml_stream.feed(message_content)
+                            if markup_stream is not None:
+                                round_preview += markup_stream.feed(message_content)
                         message_reasoning = message.get("reasoning_content") or message.get("reasoning")
                         if message_reasoning and not delta_reasoning:
                             round_reasoning += str(message_reasoning)
@@ -431,7 +443,7 @@ async def stream_response(
                     preview_usage = _merge_usage(usage, round_usage)
                     await update(
                         {
-                            "answer": answer + (round_preview if dsml_stream is not None else round_answer),
+                            "answer": answer + (round_preview if markup_stream is not None else round_answer),
                             "reasoning": reasoning + round_reasoning,
                             "searches": steps,
                             "usage": preview_usage,
@@ -441,12 +453,20 @@ async def stream_response(
 
             usage = _merge_usage(usage, round_usage)
             calls = normalize_tool_calls(_tool_calls(round_tools_by_index, round_number))
-            if dsml_stream is not None:
-                round_preview += dsml_stream.flush()
+            if markup_stream is not None:
+                round_preview += markup_stream.flush()
+            if dsml_fallback_active:
                 round_answer, calls = recover_tool_calls(
                     round_answer,
                     calls,
                     id_prefix=f"dsml-{round_number + 1}",
+                    tools_available=bool(round_tools),
+                )
+            if minimax_fallback_active:
+                round_answer, calls = recover_minimax_tool_calls(
+                    round_answer,
+                    calls,
+                    id_prefix=f"minimax-{round_number + 1}",
                     tools_available=bool(round_tools),
                 )
             invalid_answer = not round_answer.strip() or _looks_like_text_tool_call(round_answer)

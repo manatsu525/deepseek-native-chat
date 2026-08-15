@@ -310,11 +310,14 @@ def public_provider(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def public_job(row: dict[str, Any]) -> dict[str, Any]:
+    row = dict(row)
     for name, fallback in (("searches_json", []), ("sources_json", []), ("usage_json", {})):
         row[name.removesuffix("_json")] = db.decode(row.pop(name), fallback)
     row["stop_requested"] = bool(row["stop_requested"])
     if row.get("provider_type") == "mimo":
         row["provider_type"] = "custom"
+    if row.get("status") in {"completed", "failed", "stopped"} and row.get("user_id") and row.get("conversation_id"):
+        row["workspace_files"] = ConversationWorkspace(row["user_id"], row["conversation_id"]).list_files()
     return row
 
 
@@ -365,6 +368,7 @@ async def run_job(job_id: str) -> None:
             await asyncio.to_thread(attachments.delete_files, deleted)
         return
     kind = provider_type(provider)
+    job_workspace = ConversationWorkspace(job["user_id"], job["conversation_id"])
     history_rows = db.all(
         "SELECT role, content, meta_json FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 20",
         (job["conversation_id"],),
@@ -433,7 +437,7 @@ async def run_job(job_id: str) -> None:
                 conversation_id=job["conversation_id"],
                 user_timezone=job.get("timezone") or "UTC",
                 effort=job["effort"],
-                workspace=ConversationWorkspace(job["user_id"], job["conversation_id"]),
+                workspace=job_workspace,
             )
         else:
             result = await deepseek_stream_response(
@@ -446,7 +450,7 @@ async def run_job(job_id: str) -> None:
                 stopped=stopped,
                 update=update,
             )
-        meta = {"job_id": job_id, "provider_id": job["provider_id"], "provider_type": kind, "model": job["model"], "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"]}
+        meta = {"job_id": job_id, "conversation_id": job["conversation_id"], "provider_id": job["provider_id"], "provider_type": kind, "model": job["model"], "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"], "workspace_files": job_workspace.list_files()}
         if result.get("tool_trace"):
             meta["tool_trace"] = result["tool_trace"]
         db.run(
@@ -490,6 +494,7 @@ async def run_job(job_id: str) -> None:
         ) or {}
         meta = {
             "job_id": job_id,
+            "conversation_id": job["conversation_id"],
             "failed": True,
             "invalid_answer": True,
             "error": error,
@@ -500,6 +505,7 @@ async def run_job(job_id: str) -> None:
             "searches": db.decode(partial.get("searches_json", "[]"), []),
             "sources": db.decode(partial.get("sources_json", "[]"), []),
             "usage": db.decode(partial.get("usage_json", "{}"), {}),
+            "workspace_files": job_workspace.list_files(),
         }
         failed_at = now()
         with db.lock, db.connect() as connection:
@@ -952,6 +958,12 @@ def conversation(conversation_id: str, user: dict[str, Any] = Depends(current_us
         row["meta"] = db.decode(row.pop("meta_json"), {})
     active = db.one("SELECT * FROM jobs WHERE conversation_id=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1", (conversation_id,))
     workspace_files = ConversationWorkspace(user["id"], conversation_id).list_files()
+    if workspace_files:
+        for row in reversed(rows):
+            if row["role"] == "assistant":
+                row["meta"]["conversation_id"] = conversation_id
+                row["meta"]["workspace_files"] = workspace_files
+                break
     return {"conversation": public_conversation(conv), "messages": rows, "active_job": public_job(active) if active else None, "workspace_files": workspace_files}
 
 

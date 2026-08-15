@@ -389,6 +389,13 @@ function sourcesHtml(meta={}, detailKey='trace') {
     : `<div class="sources"><span class="sources-label">来源</span>${sourceChips}</div>`;
 }
 
+function workspaceArtifactsHtml(meta={}) {
+  const files=Array.isArray(meta.workspace_files)?meta.workspace_files:[],conversationId=meta.conversation_id||'';
+  if(!files.length||!conversationId)return '';
+  const links=files.map(item=>`<a class="message-workspace-file" href="${workspaceFileUrl(conversationId,item.path)}" download><span>▤ ${escapeHtml(item.path)}</span><small>${escapeHtml(formatBytes(item.size))}</small></a>`).join('');
+  return `<div class="message-workspace"><div class="message-workspace-head"><span>工作区文件 · ${files.length}</span><a href="/api/conversations/${encodeURIComponent(conversationId)}/workspace.zip" download>下载全部 ZIP</a></div><div class="message-workspace-files">${links}</div></div>`;
+}
+
 function messageHtml(message, index, live=false, retryable=false) {
   const assistant = message.role === 'assistant';
   const meta = message.meta || {};
@@ -400,7 +407,7 @@ function messageHtml(message, index, live=false, retryable=false) {
   return `<article class="message ${assistant ? 'assistant' : 'user'}${live ? ' live-message' : ''}" data-index="${index}">
     <div class="message-icon">${assistant ? (custom ? 'CU' : 'DS') : escapeHtml(((state.me && state.me.username) || 'U')[0].toUpperCase())}</div>
     <div class="message-body"><div class="message-head"><strong>${assistant ? assistantName : escapeHtml((state.me && state.me.username) || '你')}</strong></div>
-    ${assistant ? traceHtml(meta, live, detailKey) : ''}${messageAttachments}<div class="message-content">${assistant ? (content ? markdown(content, detailKey) : live ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div>${assistant ? sourcesHtml(meta,detailKey) : ''}${assistant && !live ? usageHtml(meta.usage || {}) : ''}<div class="message-actions"><button type="button" data-action="copy">复制</button>${retryable ? `<button type="button" data-action="retry" ${state.retryingAnswer ? 'disabled' : ''}>重新回答</button>` : ''}</div>
+    ${assistant ? traceHtml(meta, live, detailKey) : ''}${messageAttachments}<div class="message-content">${assistant ? (content ? markdown(content, detailKey) : live ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div>${assistant ? sourcesHtml(meta,detailKey) : ''}${assistant && !live ? workspaceArtifactsHtml(meta) : ''}${assistant && !live ? usageHtml(meta.usage || {}) : ''}<div class="message-actions"><button type="button" data-action="copy">复制</button>${retryable ? `<button type="button" data-action="retry" ${state.retryingAnswer ? 'disabled' : ''}>重新回答</button>` : ''}</div>
     ${meta.error ? `<p class="job-error">${escapeHtml(meta.error)}</p>` : ''}</div></article>`;
 }
 
@@ -410,7 +417,7 @@ function renderMessages() {
   rememberNestedScroll($('#messages'));
   const items = [...state.messages];
   if (state.job && ['queued','running','failed','stopped'].includes(state.job.status)) {
-    items.push({role:'assistant', content:state.job.answer || '', meta:{job_id:state.job.id,trace_key:state.job.trace_key,provider_id:state.job.provider_id,provider_type:state.job.provider_type,model:state.job.model,reasoning:state.job.reasoning,searches:state.job.searches,sources:state.job.sources,usage:state.job.usage,error:state.job.error,stopped:state.job.status==='stopped'}, live:['queued','running'].includes(state.job.status)});
+    items.push({role:'assistant', content:state.job.answer || '', meta:{job_id:state.job.id,trace_key:state.job.trace_key,conversation_id:state.job.conversation_id||(state.conversation&&state.conversation.id),provider_id:state.job.provider_id,provider_type:state.job.provider_type,model:state.job.model,reasoning:state.job.reasoning,searches:state.job.searches,sources:state.job.sources,usage:state.job.usage,workspace_files:state.job.workspace_files||[],error:state.job.error,stopped:state.job.status==='stopped'}, live:['queued','running'].includes(state.job.status)});
   }
   const retryBlocked = state.retryingAnswer || (state.job && ['queued','running'].includes(state.job.status));
   $('#welcome').classList.toggle('hidden', items.length > 0);
@@ -436,6 +443,8 @@ function replaceJobMessage(job, liveState) {
       searches: job.searches,
       sources: job.sources,
       usage: job.usage,
+      conversation_id: job.conversation_id || (state.conversation&&state.conversation.id),
+      workspace_files: job.workspace_files || [],
       error: job.error,
       stopped: job.status === 'stopped',
     },
