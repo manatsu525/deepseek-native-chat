@@ -106,6 +106,7 @@ class ChatBody(BaseModel):
     provider_id: int
     model: str = ""
     effort: str = DEFAULT_REASONING_EFFORT
+    mode: Literal["auto", "chat", "coding"] = "auto"
     timezone: str = Field(default="UTC", min_length=1, max_length=64)
 
 
@@ -114,6 +115,7 @@ class RetryBody(BaseModel):
     provider_id: int
     model: str = ""
     effort: str = DEFAULT_REASONING_EFFORT
+    mode: Literal["auto", "chat", "coding"] = "auto"
     timezone: str = Field(default="UTC", min_length=1, max_length=64)
 
 
@@ -438,6 +440,7 @@ async def run_job(job_id: str) -> None:
                 user_timezone=job.get("timezone") or "UTC",
                 effort=job["effort"],
                 workspace=job_workspace,
+                mode=job.get("mode") or "auto",
             )
         else:
             result = await deepseek_stream_response(
@@ -450,7 +453,7 @@ async def run_job(job_id: str) -> None:
                 stopped=stopped,
                 update=update,
             )
-        meta = {"job_id": job_id, "conversation_id": job["conversation_id"], "provider_id": job["provider_id"], "provider_type": kind, "model": job["model"], "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"], "workspace_files": job_workspace.list_files()}
+        meta = {"job_id": job_id, "conversation_id": job["conversation_id"], "provider_id": job["provider_id"], "provider_type": kind, "model": job["model"], "mode": result.get("mode", job.get("mode") or "auto"), "reasoning": result["reasoning"], "reasoning_before_first_write": result.get("reasoning_before_first_write", 0), "stall_nudges": result.get("stall_nudges", 0), "searches": result["searches"], "sources": result["sources"], "usage": result["usage"], "workspace_files": job_workspace.list_files()}
         if result.get("tool_trace"):
             meta["tool_trace"] = result["tool_trace"]
         db.run(
@@ -1081,11 +1084,11 @@ async def retry_answer(
         connection.execute(
             """INSERT INTO jobs(
                    id,user_id,conversation_id,provider_id,provider_type,model,
-                   effort,timezone,status,created_at,updated_at
-               ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                   effort,mode,timezone,status,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 job_id, user["id"], conversation_id, body.provider_id, kind,
-                model, body.effort, timezone_name, "queued", created_at, created_at,
+                model, body.effort, body.mode, timezone_name, "queued", created_at, created_at,
             ),
         )
         connection.execute("UPDATE conversations SET updated_at=? WHERE id=?", (created_at, conversation_id))
@@ -1167,8 +1170,8 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
     db.run("UPDATE conversations SET updated_at=? WHERE id=?", (now(), conversation_id))
     job_id = uuid.uuid4().hex
     db.run(
-        "INSERT INTO jobs(id,user_id,conversation_id,provider_id,provider_type,model,effort,timezone,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        (job_id, user["id"], conversation_id, body.provider_id, kind, model, body.effort, timezone_name, "queued", now(), now()),
+        "INSERT INTO jobs(id,user_id,conversation_id,provider_id,provider_type,model,effort,mode,timezone,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (job_id, user["id"], conversation_id, body.provider_id, kind, model, body.effort, body.mode, timezone_name, "queued", now(), now()),
     )
     if attachment_ids and not db.claim_attachments(user["id"], attachment_ids, conversation_id, job_id):
         db.run("DELETE FROM jobs WHERE id=? AND user_id=?", (job_id, user["id"]))

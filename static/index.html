@@ -97,6 +97,7 @@
         <button id="openSidebar" class="icon-btn mobile-only" aria-label="菜单">☰</button>
         <div class="title-block"><h2 id="conversationTitle">新对话</h2><span class="status-dot">外部搜索工具已就绪</span></div>
         <div class="top-actions">
+          <label class="compact-select" title="自动识别任务，也可强制使用聊天或编码流程"><span>模式</span><select id="agentMode" aria-label="任务模式"><option value="auto" selected>自动</option><option value="chat">聊天</option><option value="coding">编码</option></select></label>
           <label class="compact-select" title="控制模型的 reasoning effort"><span id="effortLabel">推理</span><select id="effort" aria-label="推理档位"><option value="low">低</option><option value="medium">中</option><option value="high" selected>高</option><option value="xhigh">很高</option><option value="max">最大</option></select></label>
           <button id="workspaceButton" class="soft-btn hidden" type="button">文件 <span id="workspaceCount">0</span></button>
           <button id="providerButton" class="soft-btn">API</button>
@@ -216,6 +217,6 @@
 
   <div id="toast" class="toast"></div>
   <script src="/assets/vendor/katex/katex.min.js" defer></script>
-  <script src="/assets/app.js?v=20260815-web-syntax" defer></script>
+  <script src="/assets/app.js?v=20260815-agent-mode" defer></script>
 </body>
 </html>

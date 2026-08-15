@@ -29,7 +29,6 @@ from .mimo import (
     JINA_BROWSER_HEADERS,
     MIMO_MAX_SEARCHES,
     MIMO_MAX_SEARCH_RESULTS,
-    MIMO_MAX_TOOL_ROUNDS,
     LEGACY_CUSTOM_SYSTEM_PROMPT,
     PARALLEL_CUSTOM_SYSTEM_PROMPT,
     PARALLEL_FETCH_WEBPAGE_TOOL,
@@ -64,11 +63,8 @@ from .inkling_tool_compat import (
     recover_tool_calls as recover_inkling_tool_calls,
 )
 from .reasoning_effort import normalize as normalize_reasoning_effort
-from .workspace import (
-    WORKSPACE_SYSTEM_PROMPT,
-    WORKSPACE_TOOL_NAMES,
-    ConversationWorkspace,
-)
+from .mode import CODING_SYSTEM_PROMPT, STALL_NUDGE_PROMPT, WORKSPACE_TOOL_PROMPT, resolve_profile
+from .workspace import WORKSPACE_TOOL_NAMES, ConversationWorkspace
 
 
 class ToolQuotaExceeded(RuntimeError):
@@ -76,7 +72,6 @@ class ToolQuotaExceeded(RuntimeError):
 
 
 FINAL_ANSWER_ATTEMPTS = 2
-MAX_AGENT_TOOL_ROUNDS = 12
 PARALLEL_MAX_SEARCH_EXCERPT_CHARS = 1200
 FINAL_ANSWER_PROMPT = (
     "CRITICAL FINALIZATION INSTRUCTION: The tool-call budget is completely exhausted. No search, webpage-reading, "
@@ -98,13 +93,14 @@ NEMOTRON_LANGUAGE_PROMPT = (
 def _tool_quota_message(
     exhausted_tool: str,
     *,
-    tool_rounds_used: int,
+    web_rounds_used: int,
+    max_web_rounds: int,
     search_count: int,
     fetch_count: int,
     fetch_available: bool,
 ) -> str:
     """Explain a per-tool limit without implying that every tool is exhausted."""
-    total_left = max(0, MIMO_MAX_TOOL_ROUNDS - tool_rounds_used)
+    total_left = max(0, max_web_rounds - web_rounds_used)
     search_left = max(0, MIMO_MAX_SEARCHES - search_count)
     fetch_left = max(0, JINA_MAX_FETCHES_PER_RESPONSE - fetch_count)
     status = (
@@ -114,7 +110,7 @@ def _tool_quota_message(
 
     if total_left <= 0:
         return (
-            f"总工具调用轮次已达到上限（最多 {MIMO_MAX_TOOL_ROUNDS} 次），搜索和网页读取均不可再调用；"
+            f"联网工具调用轮次已达到上限（最多 {max_web_rounds} 次），搜索和网页读取均不可再调用；"
             f"必须立即根据已有资料回答原问题。{status}"
         )
 
@@ -251,6 +247,7 @@ async def stream_response(
     user_timezone: str = "UTC",
     effort: str = "high",
     workspace: ConversationWorkspace | None = None,
+    mode: str = "auto",
 ) -> dict[str, Any]:
     """Run a custom OpenAI-compatible model with local web tools.
 
@@ -267,6 +264,12 @@ async def stream_response(
     )
     minimax_fallback_active = minimax_fallback_applies(model)
     inkling_compat_active = inkling_compat_applies(model)
+    latest_user_text = next(
+        (str(item.get("content") or "") for item in reversed(messages) if item.get("role") == "user"),
+        "",
+    )
+    initial_workspace_files = workspace.list_files() if workspace is not None else []
+    profile = resolve_profile(mode, latest_user_text, bool(initial_workspace_files))
     web_tool_backend = str(config.get("web_tool_backend") or "parallel")
     parallel_mode = web_tool_backend == "parallel"
     legacy_mode = web_tool_backend == "legacy"
@@ -280,12 +283,17 @@ async def stream_response(
         base_prompt = LEGACY_CUSTOM_SYSTEM_PROMPT
     else:
         base_prompt = KEYLESS_CUSTOM_SYSTEM_PROMPT
+    if profile.coding:
+        # Coding and web research share the same loop. Keep the selected web
+        # backend's safety/routing instructions, then add the action-oriented
+        # workspace policy instead of replacing search guidance.
+        base_prompt = f"{base_prompt}\n\n{CODING_SYSTEM_PROMPT}"
     system_prompt = _apply_model_system_prompt(
         _dated_system_prompt(base_prompt, user_timezone),
         model,
     )
-    if workspace is not None:
-        system_prompt = f"{system_prompt}\n\n{WORKSPACE_SYSTEM_PROMPT}"
+    if profile.workspace_tools_enabled and workspace is not None:
+        system_prompt = f"{system_prompt}\n\n{WORKSPACE_TOOL_PROMPT}"
     conversation: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}, *[dict(message) for message in messages]]
     answer = ""
     reasoning = ""
@@ -297,13 +305,19 @@ async def stream_response(
     tool_trace: list[dict[str, Any]] = []
     search_count = 0
     fetch_count = 0
-    tool_rounds_used = 0
+    web_rounds_used = 0
+    workspace_rounds_used = 0
     searched_queries: set[str] = set()
     known_urls = _user_urls(messages)
     attempted_urls: set[str] = set()
     reader_enabled = bool(known_urls)
     final_answer_attempts = 0
     force_final_answer = False
+    force_tool_now = False
+    stall_nudges = 0
+    reasoning_before_first_write = 0
+    first_write_seen = False
+    required_tool_choice_supported = True
     workspace_reads: set[str] = set()
     parallel_session_id = (f"conversation_{conversation_id}" if conversation_id else f"response_{uuid.uuid4().hex}")[:100]
     last_search_objective = ""
@@ -329,31 +343,28 @@ async def stream_response(
         parallel_context as parallel_client,
         keyless_context as keyless_client,
     ):
-        # Web calls keep their existing six-round budget. Coding workspaces
-        # may use more rounds because multi-file edits commonly require several
-        # reads and patches. Two answer-only attempts remain reserved after all
-        # tools have been removed.
-        for round_number in range(MAX_AGENT_TOOL_ROUNDS + FINAL_ANSWER_ATTEMPTS):
+        total_round_limit = profile.max_web_rounds + profile.max_workspace_rounds + FINAL_ANSWER_ATTEMPTS + profile.max_stall_nudges
+        for round_number in range(total_round_limit):
             if stopped():
                 raise asyncio.CancelledError
             round_tools: list[dict[str, Any]] = []
             inkling_patch_bindings: dict[str, tuple[str, str]] = {}
             if not force_final_answer:
-                if tool_rounds_used < MIMO_MAX_TOOL_ROUNDS and search_count < MIMO_MAX_SEARCHES:
+                if profile.web_tools_enabled and web_rounds_used < profile.max_web_rounds and search_count < MIMO_MAX_SEARCHES:
                     if parallel_mode:
                         round_tools.append(PARALLEL_SEARCH_WEB_TOOL)
                     elif legacy_mode:
                         round_tools.append(SEARCH_WEB_TOOL)
                     else:
                         round_tools.append(KEYLESS_SEARCH_WEB_TOOL)
-                if tool_rounds_used < MIMO_MAX_TOOL_ROUNDS and reader_enabled:
+                if profile.web_tools_enabled and web_rounds_used < profile.max_web_rounds and reader_enabled:
                     if parallel_mode:
                         round_tools.append(PARALLEL_FETCH_WEBPAGE_TOOL)
                     elif legacy_mode:
                         round_tools.append(FETCH_WEBPAGE_TOOL)
                     else:
                         round_tools.append(KEYLESS_FETCH_WEBPAGE_TOOL)
-                if workspace is not None and tool_rounds_used < MAX_AGENT_TOOL_ROUNDS:
+                if profile.workspace_tools_enabled and workspace is not None and workspace_rounds_used < profile.max_workspace_rounds:
                     round_tools.extend(workspace.tool_definitions())
                     if inkling_compat_active:
                         round_tools, inkling_patch_bindings = bind_inkling_patch_tools(
@@ -373,12 +384,24 @@ async def stream_response(
                     *conversation,
                     {"role": "system", "content": FINAL_ANSWER_PROMPT + retry_note},
                 ]
+            elif force_tool_now:
+                request_messages = [*conversation, {"role": "system", "content": STALL_NUDGE_PROMPT}]
+            round_effort = profile.first_round_effort if round_number == 0 else profile.default_effort
+            if not profile.coding:
+                round_effort = effort
+            if force_tool_now:
+                round_effort = "low"
+            round_max_tokens = int(config["max_completion_tokens"])
+            if round_number == 0 and profile.first_round_max_tokens:
+                round_max_tokens = min(round_max_tokens, profile.first_round_max_tokens)
+            if force_tool_now:
+                round_max_tokens = min(round_max_tokens, 8192)
             payload: dict[str, Any] = {
                 "model": model,
                 "messages": request_messages,
                 # Older MiMo gateways use max_completion_tokens; the generic
                 # OpenAI-compatible spelling remains max_tokens.
-                "max_completion_tokens" if mimo_model else "max_tokens": int(config["max_completion_tokens"]),
+                "max_completion_tokens" if mimo_model else "max_tokens": round_max_tokens,
                 "stream": True,
             }
             _apply_thinking_options(
@@ -386,13 +409,17 @@ async def stream_response(
                 base_url,
                 model,
                 config["thinking"],
-                effort,
+                round_effort,
                 bool(config.get("reasoning_effort_enabled", True)),
-                int(config["max_completion_tokens"]),
+                round_max_tokens,
             )
             if round_tools:
                 payload["tools"] = round_tools
-                payload["tool_choice"] = "auto"
+                require_tool = required_tool_choice_supported and (
+                    force_tool_now
+                    or (round_number == 0 and profile.first_round_tool_choice == "required")
+                )
+                payload["tool_choice"] = "required" if require_tool else "auto"
             if not mimo_model or config["thinking"] == "disabled":
                 payload["temperature"] = float(config["temperature"])
                 payload["top_p"] = float(config["top_p"])
@@ -402,6 +429,7 @@ async def stream_response(
             round_reasoning = ""
             round_usage: dict[str, Any] = {}
             round_tools_by_index: dict[int, dict[str, Any]] = {}
+            stall_detected = False
             markup_stream = (
                 InklingStreamBuffer()
                 if inkling_compat_active
@@ -414,6 +442,10 @@ async def stream_response(
             async with api_client.stream("POST", _url(base_url, "/chat/completions"), headers=headers, json=payload) as response:
                 if response.status_code >= 400:
                     body = (await response.aread()).decode(errors="replace")[:2000]
+                    if payload.get("tool_choice") == "required" and response.status_code in {400, 422}:
+                        required_tool_choice_supported = False
+                        force_tool_now = True
+                        continue
                     raise RuntimeError(f"Custom API {response.status_code}: {body}")
                 async for line in response.aiter_lines():
                     if stopped():
@@ -455,6 +487,16 @@ async def stream_response(
                             _merge_tool_call(round_tools_by_index, call, index)
                         for index, call in enumerate(message.get("tool_calls") or []):
                             _merge_tool_call(round_tools_by_index, call, index)
+                    if (
+                        profile.coding
+                        and profile.reasoning_stall_chars
+                        and not force_final_answer
+                        and not round_tools_by_index
+                        and not round_answer.strip()
+                        and len(round_reasoning) >= profile.reasoning_stall_chars
+                    ):
+                        stall_detected = True
+                        break
                     preview_usage = _merge_usage(usage, round_usage)
                     await update(
                         {
@@ -466,6 +508,18 @@ async def stream_response(
                         }
                     )
 
+            if stall_detected:
+                reasoning += round_reasoning
+                if not first_write_seen:
+                    reasoning_before_first_write += len(round_reasoning)
+                stall_nudges += 1
+                if stall_nudges > profile.max_stall_nudges:
+                    raise RuntimeError("模型连续长时间思考却没有调用编码工具，已停止以避免继续消耗 token")
+                force_tool_now = True
+                await update(
+                    {"answer": answer, "reasoning": reasoning, "searches": steps, "usage": usage, "sources": list(sources.values())}
+                )
+                continue
             usage = _merge_usage(usage, round_usage)
             calls = normalize_tool_calls(_tool_calls(round_tools_by_index, round_number))
             if markup_stream is not None:
@@ -491,6 +545,15 @@ async def stream_response(
                     id_prefix=f"inkling-{round_number + 1}",
                     tools_available=bool(round_tools),
                 )
+            if profile.coding and round_tools and not calls and not round_answer.strip() and round_reasoning:
+                reasoning += round_reasoning
+                if not first_write_seen:
+                    reasoning_before_first_write += len(round_reasoning)
+                stall_nudges += 1
+                if stall_nudges > profile.max_stall_nudges:
+                    raise RuntimeError("模型反复只输出思考而不调用编码工具，已停止以避免继续消耗 token")
+                force_tool_now = True
+                continue
             invalid_answer = not round_answer.strip() or _looks_like_text_tool_call(round_answer)
             if (final_answer_only and (calls or invalid_answer)) or (not calls and invalid_answer):
                 final_answer_attempts += 1
@@ -508,6 +571,8 @@ async def stream_response(
                     continue
                 raise RuntimeError("模型在工具额度用完后仍反复输出工具调用，未生成最终答案")
 
+            if not first_write_seen:
+                reasoning_before_first_write += len(round_reasoning)
             answer += round_answer
             reasoning += round_reasoning
             if not calls or final_answer_only:
@@ -517,6 +582,7 @@ async def stream_response(
             # intentionally execute only the first; the next round decides the
             # next operation, enforcing one tool call per round.
             call = calls[0]
+            force_tool_now = False
             # Keep the model's assistant turn paired with its tool result. The
             # previous implementation appended only the `tool` message, which
             # made the next request an invalid/incomplete Chat Completions
@@ -535,13 +601,16 @@ async def stream_response(
             if round_reasoning or (mimo_model and config["thinking"] == "enabled"):
                 assistant_message["reasoning_content"] = round_reasoning
             conversation.append(assistant_message)
-            tool_rounds_used += 1
             call_id = call["id"]
             function = call.get("function") or {}
             name = str(function.get("name") or "")
             workspace_name, bound_path = inkling_patch_bindings.get(name, (name, ""))
             is_search = name == "web_search"
             is_workspace = workspace_name in WORKSPACE_TOOL_NAMES
+            if is_workspace:
+                workspace_rounds_used += 1
+            else:
+                web_rounds_used += 1
             step: dict[str, Any] = {
                 "id": call_id,
                 "status": "running",
@@ -577,7 +646,8 @@ async def stream_response(
                     raise ToolQuotaExceeded(
                         _tool_quota_message(
                             "web_search",
-                            tool_rounds_used=tool_rounds_used,
+                            web_rounds_used=web_rounds_used,
+                            max_web_rounds=profile.max_web_rounds,
                             search_count=search_count,
                             fetch_count=fetch_count,
                             fetch_available=reader_enabled,
@@ -588,7 +658,8 @@ async def stream_response(
                     raise ToolQuotaExceeded(
                         _tool_quota_message(
                             "fetch_webpage",
-                            tool_rounds_used=tool_rounds_used,
+                            web_rounds_used=web_rounds_used,
+                            max_web_rounds=profile.max_web_rounds,
                             search_count=search_count,
                             fetch_count=fetch_count,
                             fetch_available=False,
@@ -642,6 +713,8 @@ async def stream_response(
                             workspace_reads.add(normalized_path)
                         elif workspace_name in {"write_file", "apply_patch", "apply_patch_batch", "delete_file"}:
                             workspace_reads.discard(normalized_path)
+                        if workspace_name == "write_file":
+                            first_write_seen = True
                     step["status"] = "completed"
                 elif is_search:
                     if parallel_mode:
@@ -833,5 +906,13 @@ async def stream_response(
         "usage": usage,
         "tool_calls": [],
         "tool_trace": tool_trace,
-        "response": {"tool_trace": tool_trace},
+        "mode": profile.name,
+        "reasoning_before_first_write": reasoning_before_first_write,
+        "stall_nudges": stall_nudges,
+        "response": {
+            "tool_trace": tool_trace,
+            "mode": profile.name,
+            "reasoning_before_first_write": reasoning_before_first_write,
+            "stall_nudges": stall_nudges,
+        },
     }

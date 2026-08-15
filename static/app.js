@@ -533,7 +533,7 @@ async function retryAnswer(messageIndex,items){
   const promptMessageId=prompt.id;
   state.retryingAnswer=true;setRunning(false);renderMessages();
   try{
-    const data=await api(`/api/conversations/${encodeURIComponent(conversationId)}/retry`,{method:'POST',body:{prompt_message_id:promptMessageId,provider_id:provider.id,model,effort:$('#effort').value,timezone:browserTimezone()}});
+    const data=await api(`/api/conversations/${encodeURIComponent(conversationId)}/retry`,{method:'POST',body:{prompt_message_id:promptMessageId,provider_id:provider.id,model,effort:$('#effort').value,mode:$('#agentMode').value,timezone:browserTimezone()}});
     if(!state.conversation||String(state.conversation.id)!==String(conversationId)){
       toast('已在原对话中开始重新回答');loadHistory(1);return;
     }
@@ -619,7 +619,7 @@ async function submitPrompt(value) {
   state.messages.push({role:'user',content,meta:{attachments:pendingSnapshot}});state.job={status:'queued',trace_key:traceKey,provider_type:provider.provider_type,provider_id:provider.id,model,answer:'',reasoning:'',searches:[],sources:[],usage:{}};renderMessages();
   $('#chatScroll').scrollTop=$('#chatScroll').scrollHeight;setRunning(true);
   try{
-    const data=await api('/api/chat',{method:'POST',body:{conversation_id:(state.conversation&&state.conversation.id)||null,content,attachment_ids:attachmentIds,provider_id:provider.id,model,effort:$('#effort').value,timezone:browserTimezone()}});
+    const data=await api('/api/chat',{method:'POST',body:{conversation_id:(state.conversation&&state.conversation.id)||null,content,attachment_ids:attachmentIds,provider_id:provider.id,model,effort:$('#effort').value,mode:$('#agentMode').value,timezone:browserTimezone()}});
     if(!state.conversation){state.conversation={id:data.conversation_id,title:content.slice(0,36)};state.workspaceFiles=[];renderWorkspaceState()}
     state.messages[state.messages.length-1].id=data.message_id;
     state.pendingAttachments=[];state.attachmentDraftId=null;storeValue('attachment-draft',null);renderPendingAttachments();setAttachmentStatus('');
@@ -699,6 +699,8 @@ function updateProviderUi(){
   const provider=selectedProvider(), custom=provider&&normalizeProviderType(provider.provider_type)==='custom', customEffort=custom&&customSettings(provider).reasoning_effort_enabled;
   const webInfo=custom?selectedWebToolInfo(provider):null;
   $('#customSettingsButton').classList.toggle('hidden',!custom);
+  $('#agentMode').disabled=!custom;
+  $('#agentMode').title=custom?'自动识别任务，也可强制使用聊天或编码流程':'任务模式仅用于带本地工具的 Custom 模型';
   $('#effort').disabled=!!custom&&!customEffort;
   $('#effort').title=custom?(customEffort?'控制发送给 Custom 模型的 reasoning_effort':'Custom 参数中已关闭 reasoning_effort'):'控制 DeepSeek 模型推理投入';
   $('#nativePill').textContent=custom?`● ${webInfo.label}`:'● Native Web';
@@ -818,7 +820,7 @@ async function loadUsers(){const users=await api('/api/users');$('#userList').in
 function resizePrompt(){const p=$('#prompt');p.style.height='auto';p.style.height=Math.min(p.scrollHeight,180)+'px'}
 function openSidebar(){$('#sidebar').classList.add('open')}function closeSidebar(){$('#sidebar').classList.remove('open')}
 
-async function boot(){try{state.me=await api('/api/me');$('#loginView').classList.add('hidden');$('#appView').classList.remove('hidden');$('#accountName').textContent=state.me.username;$('#accountRole').textContent=state.me.is_admin?'管理员':'用户';$('#avatar').textContent=state.me.username[0].toUpperCase();$('#usersButton').classList.toggle('hidden',!state.me.is_admin);const savedEffort=storedValue('reasoning-effort');if(['low','medium','high','xhigh','max'].includes(savedEffort))$('#effort').value=savedEffort;await Promise.all([loadProviders(),loadHistory(1)]);const stored=storedValue('active-conversation');const activeId=stored==='__new__'?null:(stored||state.latestConversationId);const restored=activeId?await openConversation(activeId):false;if(!restored){renderMessages();await loadPendingAttachments()}}catch{$('#loginView').classList.remove('hidden');$('#appView').classList.add('hidden')}}
+async function boot(){try{state.me=await api('/api/me');$('#loginView').classList.add('hidden');$('#appView').classList.remove('hidden');$('#accountName').textContent=state.me.username;$('#accountRole').textContent=state.me.is_admin?'管理员':'用户';$('#avatar').textContent=state.me.username[0].toUpperCase();$('#usersButton').classList.toggle('hidden',!state.me.is_admin);const savedEffort=storedValue('reasoning-effort');if(['low','medium','high','xhigh','max'].includes(savedEffort))$('#effort').value=savedEffort;const savedMode=storedValue('agent-mode');if(['auto','chat','coding'].includes(savedMode))$('#agentMode').value=savedMode;await Promise.all([loadProviders(),loadHistory(1)]);const stored=storedValue('active-conversation');const activeId=stored==='__new__'?null:(stored||state.latestConversationId);const restored=activeId?await openConversation(activeId):false;if(!restored){renderMessages();await loadPendingAttachments()}}catch{$('#loginView').classList.remove('hidden');$('#appView').classList.add('hidden')}}
 
 $('#loginForm').onsubmit=async e=>{e.preventDefault();$('#loginError').textContent='';try{await api('/api/login',{method:'POST',body:{username:$('#loginUser').value,password:$('#loginPass').value}});await boot()}catch(err){$('#loginError').textContent=err.message}};
 $('#logout').onclick=async()=>{await api('/api/logout',{method:'POST'});location.reload()};
@@ -826,6 +828,7 @@ $('#newChat').onclick=()=>{newConversation();closeSidebar()};$('#composer').onsu
 $('#workspaceButton').onclick=async()=>{await loadWorkspaceFiles(true);$('#workspaceModal').showModal()};
 $('#clearHistory').onclick=clearAllHistory;
 $('#effort').onchange=()=>storeValue('reasoning-effort',$('#effort').value);
+$('#agentMode').onchange=()=>storeValue('agent-mode',$('#agentMode').value);
 // Enter always inserts a newline. Sending is explicit via the send button.
 $('#prompt').oninput=resizePrompt;
 $('#attachButton').onclick=()=>{if(!state.uploadingAttachments&&!state.retryingAnswer&&!(state.job&&['queued','running'].includes(state.job.status)))$('#fileInput').click()};
