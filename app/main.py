@@ -771,7 +771,7 @@ async def test_custom_model(base_url: str, api_key: str, model: str) -> None:
         async with httpx.AsyncClient(timeout=httpx.Timeout(30, connect=5), follow_redirects=True) as client:
             response = await client.post(
                 base_url.rstrip("/") + "/chat/completions",
-                headers=custom_auth_headers(api_key),
+                headers=custom_auth_headers(api_key, base_url=base_url),
                 json=payload,
             )
     except Exception as exc:

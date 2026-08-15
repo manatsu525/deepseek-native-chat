@@ -130,7 +130,15 @@ def _settings(value: dict[str, Any] | None) -> dict[str, Any]:
     return result
 
 
-def custom_auth_headers(api_key: str, *, stream: bool = False) -> dict[str, str]:
+def is_opencode_base_url(base_url: str) -> bool:
+    try:
+        hostname = (urlsplit(str(base_url or "")).hostname or "").casefold()
+    except ValueError:
+        return False
+    return hostname == "opencode.ai" or hostname.endswith(".opencode.ai")
+
+
+def custom_auth_headers(api_key: str, *, base_url: str = "", stream: bool = False) -> dict[str, str]:
     """Headers accepted by standard OpenAI-compatible gateways.
 
     `Authorization` is the standard form. Keeping `api-key` as an additional
@@ -144,12 +152,14 @@ def custom_auth_headers(api_key: str, *, stream: bool = False) -> dict[str, str]
     }
     if stream:
         headers["Accept"] = "text/event-stream"
+    if is_opencode_base_url(base_url):
+        headers["User-Agent"] = "opencode/1.18.16"
     return headers
 
 
 async def list_models(base_url: str, api_key: str, timeout: int = 30) -> list[str]:
     async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.get(_url(base_url, "/models"), headers=custom_auth_headers(api_key))
+        response = await client.get(_url(base_url, "/models"), headers=custom_auth_headers(api_key, base_url=base_url))
         response.raise_for_status()
         data = response.json().get("data", [])
     return sorted({str(item.get("id")) for item in data if item.get("id")})[:500]

@@ -273,7 +273,7 @@ async def stream_response(
     keyless_mode = web_tool_backend in KEYLESS_PROVIDERS
     if not (parallel_mode or legacy_mode or keyless_mode):
         raise ValueError(f"不支持的搜索/抓取工具方案：{web_tool_backend}")
-    headers = custom_auth_headers(api_key, stream=True)
+    headers = custom_auth_headers(api_key, base_url=base_url, stream=True)
     if parallel_mode:
         base_prompt = PARALLEL_CUSTOM_SYSTEM_PROMPT
     elif legacy_mode:
