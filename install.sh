@@ -84,7 +84,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now deepseek-native-chat.service
+systemctl enable deepseek-native-chat.service
+systemctl restart deepseek-native-chat.service
 sleep 2
 systemctl is-active --quiet deepseek-native-chat.service
 
