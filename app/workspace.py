@@ -17,7 +17,7 @@ MAX_TOTAL_BYTES = 10 * 1024 * 1024
 MAX_READ_CHARS = 120_000
 MAX_SEARCH_RESULTS = 50
 
-WORKSPACE_SYSTEM_PROMPT = """A persistent, isolated coding workspace is available for this conversation. When the user asks you to create code or a multi-file project, use the workspace tools to save the actual files instead of only printing complete files in chat. On later requests, inspect the existing workspace files and patch only what needs to change. Do not recreate or overwrite unrelated files. Every workspace tool call must include every field marked required in its JSON schema. In particular, read_file, write_file, apply_patch, and delete_file must always include a non-empty workspace-relative path exactly as listed by list_files (or the intended new relative path for write_file). Before emitting a tool call, verify its arguments against the schema; never omit path and never repeat an unchanged read_file call. After editing, briefly summarize changed files; the UI supplies download links automatically. This workspace cannot run commands or execute code, so do not claim that files were executed or tests passed."""
+WORKSPACE_SYSTEM_PROMPT = """A persistent, isolated coding workspace is available for this conversation. When the user asks you to create code or a multi-file project, use the workspace tools to save the actual files instead of only printing complete files in chat. On later requests, inspect the existing workspace files and patch only what needs to change. Do not recreate or overwrite unrelated files. Every workspace tool call must include every field marked required in its JSON schema. In particular, file tools must always include a non-empty workspace-relative path exactly as listed by list_files (or the intended new relative path for write_file). Before emitting a tool call, verify its arguments against the schema; never omit path and never repeat an unchanged read_file call. When making multiple edits from one read, submit one apply_patch_batch call instead of sequential apply_patch calls, because earlier edits invalidate the old snapshot. Saved Python programs can be verified with run_python when that tool is available; it runs without network in a disposable resource-limited copy. Treat a nonzero exit or ok=false as a real failure and fix it before claiming success. Other languages cannot currently be executed, so do not claim they were tested. After editing, briefly summarize changed files; the UI supplies download links automatically."""
 
 
 def _function(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -60,7 +60,7 @@ WORKSPACE_TOOLS = [
     ),
     _function(
         "apply_patch",
-        "Modify an existing text file by replacing exact text. Read the file first. The old_text must match exactly.",
+        "Modify an existing text file with one exact replacement. Read the file first. For multiple edits based on one read, prefer apply_patch_batch.",
         {
             "path": {"type": "string", "description": "Workspace-relative path"},
             "old_text": {"type": "string", "description": "Exact existing text to replace"},
@@ -68,6 +68,29 @@ WORKSPACE_TOOLS = [
             "replace_all": {"type": "boolean", "description": "Replace every exact match; defaults to false"},
         },
         ["path", "old_text", "new_text"],
+    ),
+    _function(
+        "apply_patch_batch",
+        "Atomically apply several non-overlapping exact replacements to one file, all matched against the same file snapshot. Prefer this over sequential apply_patch calls.",
+        {
+            "path": {"type": "string", "description": "Workspace-relative path"},
+            "patches": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 20,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "old_text": {"type": "string", "description": "Exact text from the current file snapshot"},
+                        "new_text": {"type": "string", "description": "Replacement text"},
+                        "replace_all": {"type": "boolean", "description": "Replace all exact matches; defaults to false"},
+                    },
+                    "required": ["old_text", "new_text"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        ["path", "patches"],
     ),
     _function(
         "search_files",
@@ -86,7 +109,22 @@ WORKSPACE_TOOLS = [
     ),
 ]
 
-WORKSPACE_TOOL_NAMES = {item["function"]["name"] for item in WORKSPACE_TOOLS}
+RUN_PYTHON_TOOL = _function(
+    "run_python",
+    "Run one saved Python file in an isolated disposable copy of the workspace. Network is disabled and time/memory/process limits apply. Use the real output to verify and fix code; never claim success when ok is false.",
+    {
+        "path": {"type": "string", "description": "Existing .py file to execute"},
+        "arguments": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 20,
+            "description": "Optional command-line arguments passed directly to the Python file",
+        },
+    },
+    ["path"],
+)
+
+WORKSPACE_TOOL_NAMES = {item["function"]["name"] for item in [*WORKSPACE_TOOLS, RUN_PYTHON_TOOL]}
 
 
 class WorkspaceError(ValueError):
@@ -143,12 +181,17 @@ class ConversationWorkspace:
         for tool in tools:
             function = tool.get("function") or {}
             name = str(function.get("name") or "")
-            if name not in {"read_file", "apply_patch", "delete_file"} or not paths:
+            if name not in {"read_file", "apply_patch", "apply_patch_batch", "delete_file"} or not paths:
                 continue
             path_schema = ((function.get("parameters") or {}).get("properties") or {}).get("path")
             if isinstance(path_schema, dict):
                 path_schema["enum"] = paths
                 path_schema["description"] = "Required existing workspace file path. Choose exactly one value from this list."
+        python_paths = [path for path in paths if path.casefold().endswith(".py")]
+        if python_paths:
+            run_tool = deepcopy(RUN_PYTHON_TOOL)
+            run_tool["function"]["parameters"]["properties"]["path"]["enum"] = python_paths
+            tools.append(run_tool)
         return tools
 
     def _read_text(self, path: Any) -> tuple[str, str]:
@@ -211,6 +254,50 @@ class ConversationWorkspace:
         result["replacements"] = matches if bool(replace_all) else 1
         return result
 
+    def apply_patch_batch(self, path: Any, patches: Any) -> dict[str, Any]:
+        if not isinstance(patches, list) or not patches or len(patches) > 20:
+            raise WorkspaceError("patches 必须是包含 1 到 20 项的数组")
+        content, _ = self._read_text(path)
+        replacements: list[tuple[int, int, str, int]] = []
+        for patch_index, patch in enumerate(patches):
+            if not isinstance(patch, dict):
+                raise WorkspaceError(f"第 {patch_index + 1} 个补丁不是对象")
+            old = str(patch.get("old_text") or "")
+            if not old:
+                raise WorkspaceError(f"第 {patch_index + 1} 个补丁的 old_text 不能为空")
+            starts: list[int] = []
+            offset = 0
+            while True:
+                found = content.find(old, offset)
+                if found < 0:
+                    break
+                starts.append(found)
+                offset = found + len(old)
+            if not starts:
+                raise WorkspaceError(f"第 {patch_index + 1} 个补丁的 old_text 与当前文件不匹配；整个批次未修改")
+            replace_all = bool(patch.get("replace_all", False))
+            if len(starts) > 1 and not replace_all:
+                raise WorkspaceError(f"第 {patch_index + 1} 个补丁的 old_text 出现 {len(starts)} 次；请提供更精确上下文")
+            for start in starts if replace_all else starts[:1]:
+                replacements.append((start, start + len(old), str(patch.get("new_text") or ""), patch_index))
+        ordered = sorted(replacements, key=lambda item: (item[0], item[1]))
+        for previous, current in zip(ordered, ordered[1:]):
+            if current[0] < previous[1]:
+                raise WorkspaceError(f"第 {previous[3] + 1} 和第 {current[3] + 1} 个补丁范围重叠；整个批次未修改")
+        updated = content
+        for start, end, new_text, _ in reversed(ordered):
+            updated = updated[:start] + new_text + updated[end:]
+        result = self.write_file(path, updated)
+        result["changes"] = len(patches)
+        result["replacements"] = len(replacements)
+        return result
+
+    def run_python(self, path: Any, arguments: Any = None) -> dict[str, Any]:
+        from .code_runner import run_python
+
+        _, relative = self.resolve(path)
+        return run_python(self.root, relative, arguments)
+
     def search_files(self, query: Any, path: Any = "") -> dict[str, Any]:
         needle = str(query or "")
         if not needle:
@@ -255,10 +342,14 @@ class ConversationWorkspace:
             result = self.write_file(arguments.get("path"), arguments.get("content"))
         elif name == "apply_patch":
             result = self.apply_patch(arguments.get("path"), arguments.get("old_text"), arguments.get("new_text"), arguments.get("replace_all", False))
+        elif name == "apply_patch_batch":
+            result = self.apply_patch_batch(arguments.get("path"), arguments.get("patches"))
         elif name == "search_files":
             result = self.search_files(arguments.get("query"), arguments.get("path", ""))
         elif name == "delete_file":
             result = self.delete_file(arguments.get("path"))
+        elif name == "run_python":
+            result = self.run_python(arguments.get("path"), arguments.get("arguments", []))
         else:
             raise WorkspaceError(f"不支持的工作区工具：{name}")
         return json.dumps(result, ensure_ascii=False)

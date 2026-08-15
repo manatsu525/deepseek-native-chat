@@ -63,12 +63,41 @@ class WorkspaceTests(unittest.TestCase):
     def test_existing_file_tools_are_constrained_to_real_paths(self) -> None:
         self.workspace.write_file("index.html", "<h1>Hi</h1>")
         self.workspace.write_file("src/app.js", "start()")
+        self.workspace.write_file("tests/test_app.py", "print('ok')")
         tools = {item["function"]["name"]: item for item in self.workspace.tool_definitions()}
-        expected = ["index.html", "src/app.js"]
-        for name in ("read_file", "apply_patch", "delete_file"):
+        expected = ["index.html", "src/app.js", "tests/test_app.py"]
+        for name in ("read_file", "apply_patch", "apply_patch_batch", "delete_file"):
             schema = tools[name]["function"]["parameters"]["properties"]["path"]
             self.assertEqual(schema["enum"], expected)
+        self.assertEqual(
+            tools["run_python"]["function"]["parameters"]["properties"]["path"]["enum"],
+            ["tests/test_app.py"],
+        )
         self.assertNotIn("enum", tools["write_file"]["function"]["parameters"]["properties"]["path"])
+
+    def test_batch_patch_is_atomic_and_uses_one_snapshot(self) -> None:
+        original = "alpha = 1\nbeta = 2\ngamma = 3\n"
+        self.workspace.write_file("app.py", original)
+        result = self.workspace.apply_patch_batch(
+            "app.py",
+            [
+                {"old_text": "alpha = 1", "new_text": "alpha = 10"},
+                {"old_text": "gamma = 3", "new_text": "gamma = 30"},
+            ],
+        )
+        self.assertEqual(result["changes"], 2)
+        self.assertEqual(self.workspace.read_file("app.py"), "alpha = 10\nbeta = 2\ngamma = 30\n")
+
+        before_failure = self.workspace.read_file("app.py")
+        with self.assertRaises(WorkspaceError):
+            self.workspace.apply_patch_batch(
+                "app.py",
+                [
+                    {"old_text": "beta = 2", "new_text": "beta = 20"},
+                    {"old_text": "missing", "new_text": "value"},
+                ],
+            )
+        self.assertEqual(self.workspace.read_file("app.py"), before_failure)
 
 
 if __name__ == "__main__":

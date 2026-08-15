@@ -582,8 +582,10 @@ async def stream_response(
                         "read_file": ("path",),
                         "write_file": ("path", "content"),
                         "apply_patch": ("path", "old_text", "new_text"),
+                        "apply_patch_batch": ("path", "patches"),
                         "search_files": ("query",),
                         "delete_file": ("path",),
+                        "run_python": ("path",),
                     }.get(name, ())
                     non_empty_arguments = {"path", "query", "old_text"}
                     missing = [
@@ -609,10 +611,10 @@ async def stream_response(
                             ensure_ascii=False,
                         )
                     else:
-                        result_text = workspace.execute(name, arguments)
+                        result_text = await asyncio.to_thread(workspace.execute, name, arguments)
                         if name == "read_file":
                             workspace_reads.add(normalized_path)
-                        elif name in {"write_file", "apply_patch", "delete_file"}:
+                        elif name in {"write_file", "apply_patch", "apply_patch_batch", "delete_file"}:
                             workspace_reads.discard(normalized_path)
                     step["status"] = "completed"
                 elif is_search:
