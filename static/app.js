@@ -41,12 +41,20 @@ function currentAttachmentDraftId(){
 }
 function formatBytes(value){const bytes=Number(value)||0;if(bytes<1024)return `${bytes}B`;if(bytes<1024*1024)return `${(bytes/1024).toFixed(1)}KB`;return `${(bytes/1024/1024).toFixed(1)}MB`}
 function workspaceFileUrl(conversationId,path){return `/api/conversations/${encodeURIComponent(conversationId)}/workspace/files/${String(path).split('/').map(encodeURIComponent).join('/')}`}
+function openWorkspaceDownload(event){
+  const link=event.currentTarget,url=link&&link.href;
+  if(!url)return;
+  event.preventDefault();event.stopPropagation();
+  const opened=window.open(url,'_blank');
+  if(opened)opened.opener=null;else window.location.assign(url);
+}
+function wireWorkspaceDownloads(root=document){$$('[data-workspace-download]',root).forEach(link=>link.onclick=openWorkspaceDownload)}
 function renderWorkspaceState(){
   const hasConversation=!!(state.conversation&&state.conversation.id),files=state.workspaceFiles||[];
   $('#workspaceButton').classList.toggle('hidden',!hasConversation);$('#workspaceCount').textContent=files.length;
   $('#workspaceSummary').textContent=files.length?`${files.length} 个文件 · ${formatBytes(files.reduce((sum,item)=>sum+(Number(item.size)||0),0))}`:'当前还没有文件。让模型编写项目时，它会把代码保存到这里。';
-  $('#workspaceFiles').innerHTML=files.length?files.map(item=>`<a class="workspace-file" href="${workspaceFileUrl(state.conversation.id,item.path)}"><span aria-hidden="true">▤</span><span class="workspace-file-name" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</span><span class="workspace-file-size">${escapeHtml(formatBytes(item.size))}</span></a>`).join(''):'<div class="workspace-empty">暂无工作区文件</div>';
-  $('#workspaceZip').classList.toggle('hidden',!files.length);$('#workspaceZip').href=hasConversation?`/api/conversations/${encodeURIComponent(state.conversation.id)}/workspace.zip`:'#';
+  $('#workspaceFiles').innerHTML=files.length?files.map(item=>`<a class="workspace-file" data-workspace-download href="${workspaceFileUrl(state.conversation.id,item.path)}" target="_blank" rel="noopener"><span aria-hidden="true">▤</span><span class="workspace-file-name" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</span><span class="workspace-file-size">${escapeHtml(formatBytes(item.size))}</span></a>`).join(''):'<div class="workspace-empty">暂无工作区文件</div>';
+  $('#workspaceZip').classList.toggle('hidden',!files.length);$('#workspaceZip').href=hasConversation?`/api/conversations/${encodeURIComponent(state.conversation.id)}/workspace.zip`:'#';wireWorkspaceDownloads($('#workspaceModal'));
 }
 async function loadWorkspaceFiles(showError=false){
   if(!state.conversation||!state.conversation.id){state.workspaceFiles=[];renderWorkspaceState();return}
@@ -392,8 +400,8 @@ function sourcesHtml(meta={}, detailKey='trace') {
 function workspaceArtifactsHtml(meta={}) {
   const files=Array.isArray(meta.workspace_files)?meta.workspace_files:[],conversationId=meta.conversation_id||'';
   if(!files.length||!conversationId)return '';
-  const links=files.map(item=>`<a class="message-workspace-file" href="${workspaceFileUrl(conversationId,item.path)}"><span>▤ ${escapeHtml(item.path)}</span><small>${escapeHtml(formatBytes(item.size))}</small></a>`).join('');
-  return `<div class="message-workspace"><div class="message-workspace-head"><span>工作区文件 · ${files.length}</span><a href="/api/conversations/${encodeURIComponent(conversationId)}/workspace.zip">下载全部 ZIP</a></div><div class="message-workspace-files">${links}</div></div>`;
+  const links=files.map(item=>`<a class="message-workspace-file" data-workspace-download href="${workspaceFileUrl(conversationId,item.path)}" target="_blank" rel="noopener"><span>▤ ${escapeHtml(item.path)}</span><small>${escapeHtml(formatBytes(item.size))}</small></a>`).join('');
+  return `<div class="message-workspace"><div class="message-workspace-head"><span>工作区文件 · ${files.length}</span><a data-workspace-download href="/api/conversations/${encodeURIComponent(conversationId)}/workspace.zip" target="_blank" rel="noopener">下载全部 ZIP</a></div><div class="message-workspace-files">${links}</div></div>`;
 }
 
 function messageHtml(message, index, live=false, retryable=false) {
@@ -494,6 +502,7 @@ function wireMessageActions(items) {
     $('[data-action="copy"]', node).onclick = async () => { await navigator.clipboard.writeText(msg.content || ''); toast('已复制'); };
     const retryButton = $('[data-action="retry"]', node);
     if(retryButton)retryButton.onclick=()=>retryAnswer(index,items);
+    wireWorkspaceDownloads(node);
     $$('.code-download', node).forEach(button => button.onclick = () => {
       const wrap = button.closest('.code-wrap');
       const codeNode = $('pre code', wrap);
