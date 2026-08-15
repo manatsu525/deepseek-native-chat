@@ -73,6 +73,10 @@ class WorkspaceTests(unittest.TestCase):
             tools["run_python"]["function"]["parameters"]["properties"]["path"]["enum"],
             ["tests/test_app.py"],
         )
+        self.assertEqual(
+            tools["check_web_syntax"]["function"]["parameters"]["properties"]["path"]["enum"],
+            ["index.html", "src/app.js"],
+        )
         self.assertNotIn("enum", tools["write_file"]["function"]["parameters"]["properties"]["path"])
 
     def test_batch_patch_is_atomic_and_uses_one_snapshot(self) -> None:

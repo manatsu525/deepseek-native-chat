@@ -586,6 +586,7 @@ async def stream_response(
                         "search_files": ("query",),
                         "delete_file": ("path",),
                         "run_python": ("path",),
+                        "check_web_syntax": ("path",),
                     }.get(name, ())
                     non_empty_arguments = {"path", "query", "old_text"}
                     missing = [

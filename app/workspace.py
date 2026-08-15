@@ -17,7 +17,7 @@ MAX_TOTAL_BYTES = 10 * 1024 * 1024
 MAX_READ_CHARS = 120_000
 MAX_SEARCH_RESULTS = 50
 
-WORKSPACE_SYSTEM_PROMPT = """A persistent, isolated coding workspace is available for this conversation. When the user asks you to create code or a multi-file project, use the workspace tools to save the actual files instead of only printing complete files in chat. On later requests, inspect the existing workspace files and patch only what needs to change. Do not recreate or overwrite unrelated files. Every workspace tool call must include every field marked required in its JSON schema. In particular, file tools must always include a non-empty workspace-relative path exactly as listed by list_files (or the intended new relative path for write_file). Before emitting a tool call, verify its arguments against the schema; never omit path and never repeat an unchanged read_file call. When making multiple edits from one read, submit one apply_patch_batch call instead of sequential apply_patch calls, because earlier edits invalidate the old snapshot. Saved Python programs can be verified with run_python when that tool is available; it runs without network in a disposable resource-limited copy. Treat a nonzero exit or ok=false as a real failure and fix it before claiming success. Other languages cannot currently be executed, so do not claim they were tested. After editing, briefly summarize changed files; the UI supplies download links automatically."""
+WORKSPACE_SYSTEM_PROMPT = """A persistent, isolated coding workspace is available for this conversation. When the user asks you to create code or a multi-file project, use the workspace tools to save the actual files instead of only printing complete files in chat. On later requests, inspect the existing workspace files and patch only what needs to change. Do not recreate or overwrite unrelated files. Every workspace tool call must include every field marked required in its JSON schema. In particular, file tools must always include a non-empty workspace-relative path exactly as listed by list_files (or the intended new relative path for write_file). Before emitting a tool call, verify its arguments against the schema; never omit path and never repeat an unchanged read_file call. When making multiple edits from one read, submit one apply_patch_batch call instead of sequential apply_patch calls, because earlier edits invalidate the old snapshot. Saved Python programs can be verified with run_python. Saved HTML and JavaScript must be checked with check_web_syntax when that tool is available; it parses HTML and runs Node.js syntax checks on inline, event-handler, and local JavaScript without executing it. These tools run without network in disposable resource-limited copies. Treat a nonzero exit or ok=false as a real failure and fix it before claiming success. Syntax success does not prove browser behavior is correct, so state that limitation. After editing, briefly summarize changed files; the UI supplies download links automatically."""
 
 
 def _function(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -124,7 +124,14 @@ RUN_PYTHON_TOOL = _function(
     ["path"],
 )
 
-WORKSPACE_TOOL_NAMES = {item["function"]["name"] for item in [*WORKSPACE_TOOLS, RUN_PYTHON_TOOL]}
+CHECK_WEB_SYNTAX_TOOL = _function(
+    "check_web_syntax",
+    "Check one saved HTML or JavaScript file in an isolated disposable copy. HTML parsing includes inline scripts, inline event handlers, and referenced local JS files. JavaScript is checked with node --check but not executed. Fix every reported syntax error before claiming success.",
+    {"path": {"type": "string", "description": "Existing .html, .htm, .js, .mjs, or .cjs file"}},
+    ["path"],
+)
+
+WORKSPACE_TOOL_NAMES = {item["function"]["name"] for item in [*WORKSPACE_TOOLS, RUN_PYTHON_TOOL, CHECK_WEB_SYNTAX_TOOL]}
 
 
 class WorkspaceError(ValueError):
@@ -192,6 +199,11 @@ class ConversationWorkspace:
             run_tool = deepcopy(RUN_PYTHON_TOOL)
             run_tool["function"]["parameters"]["properties"]["path"]["enum"] = python_paths
             tools.append(run_tool)
+        web_paths = [path for path in paths if Path(path).suffix.casefold() in {".html", ".htm", ".js", ".mjs", ".cjs"}]
+        if web_paths:
+            check_tool = deepcopy(CHECK_WEB_SYNTAX_TOOL)
+            check_tool["function"]["parameters"]["properties"]["path"]["enum"] = web_paths
+            tools.append(check_tool)
         return tools
 
     def _read_text(self, path: Any) -> tuple[str, str]:
@@ -298,6 +310,12 @@ class ConversationWorkspace:
         _, relative = self.resolve(path)
         return run_python(self.root, relative, arguments)
 
+    def check_web_syntax(self, path: Any) -> dict[str, Any]:
+        from .code_runner import check_web_syntax
+
+        _, relative = self.resolve(path)
+        return check_web_syntax(self.root, relative)
+
     def search_files(self, query: Any, path: Any = "") -> dict[str, Any]:
         needle = str(query or "")
         if not needle:
@@ -350,6 +368,8 @@ class ConversationWorkspace:
             result = self.delete_file(arguments.get("path"))
         elif name == "run_python":
             result = self.run_python(arguments.get("path"), arguments.get("arguments", []))
+        elif name == "check_web_syntax":
+            result = self.check_web_syntax(arguments.get("path"))
         else:
             raise WorkspaceError(f"不支持的工作区工具：{name}")
         return json.dumps(result, ensure_ascii=False)

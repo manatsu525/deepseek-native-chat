@@ -362,7 +362,7 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
   if (!reasoning && !searches.length && !active) return '';
   const status = active ? '进行中' : (meta.stopped ? '已停止' : '已完成');
   const searchHtml = searches.map((s,i) => {
-    const workspaceLabels={list_files:'列出文件',read_file:'读取文件',write_file:'写入文件',apply_patch:'修改文件',apply_patch_batch:'批量修改文件',search_files:'搜索文件',delete_file:'删除文件',run_python:'运行 Python'};
+    const workspaceLabels={list_files:'列出文件',read_file:'读取文件',write_file:'写入文件',apply_patch:'修改文件',apply_patch_batch:'批量修改文件',search_files:'搜索文件',delete_file:'删除文件',run_python:'运行 Python',check_web_syntax:'检查网页语法'};
     const label=s.action==='workspace'?(workspaceLabels[s.tool]||'工作区操作'):s.action==='open_page'?'读取网页':'联网搜索';
     const searchKey=`${detailKey}-search-${s.id || i}`;
     const searchOpen=detailState.get(searchKey) ? ' open' : '';

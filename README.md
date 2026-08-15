@@ -27,7 +27,7 @@
 - NVIDIA Build 的 DeepSeek V4 Flash/Pro 会按官方协议发送 `chat_template_kwargs.thinking` 与所选 `reasoning_effort` 档位，并兼容解析 `reasoning`/`reasoning_content`
 - OpenCode Zen 的 `deepseek-v4-flash(-free)` 可选用独立 DSML fallback：新配置默认不勾选，用户可在任意 Custom 配置中手动开关；仅匹配 OpenCode host + 对应模型时生效，并且只在原生 `tool_calls` 为空时恢复工具调用，也可用 `OPENCODE_DSML_FALLBACK=0` 全局停用
 - NVIDIA Nemotron 3 Ultra 使用 `enable_thinking`、工具兼容标志和 16K reasoning budget；GLM-5.2 使用 `thinking.enabled` 与所选 `reasoning_effort` 档位
-- 每个对话拥有隔离且持久的编码工作区。Custom 模型可列出、读取、搜索、创建、原子批量修改和删除 UTF-8 文本文件；网页端支持单文件和 ZIP 下载。Python 文件可在 systemd 动态用户、断网、限时限内存的一次性副本中运行验证，运行产生的文件不会写回持久工作区；其他语言暂不执行。删除对话时同步清理
+- 每个对话拥有隔离且持久的编码工作区。Custom 模型可列出、读取、搜索、创建、原子批量修改和删除 UTF-8 文本文件；网页端支持单文件和 ZIP 下载。Python 文件可在 systemd 动态用户、断网、限时限内存的一次性副本中运行验证；HTML 会解析并用 Node.js 检查内联脚本、事件处理器和本地 JS，独立 JavaScript 文件也可做语法检查。运行产生的文件不会写回持久工作区。删除对话时同步清理
 - 模型名包含 `minimax` 时启用私有工具标记 fallback：标准 `tool_calls` 始终优先，泄露到正文的 `]<]minimax[>[` 调用会被隐藏并恢复；可用 `MINIMAX_TOOL_FALLBACK=0` 整体关闭
 
 ## 资源占用
