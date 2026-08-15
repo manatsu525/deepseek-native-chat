@@ -74,6 +74,8 @@ json_module = json
 class AgentModeTests(unittest.TestCase):
     def test_auto_detects_obvious_chinese_and_english_coding_tasks(self) -> None:
         self.assertTrue(looks_like_coding_request("帮我写一个 HTML 贪吃蛇游戏"))
+        self.assertTrue(looks_like_coding_request("用html写一个触屏人机对战国际象棋"))
+        self.assertTrue(looks_like_coding_request("用 Python 帮我做个批量改名脚本"))
         self.assertTrue(looks_like_coding_request("Fix the Python script and save the file"))
         self.assertIs(resolve_profile("auto", "创建一个网页", False), CODING_PROFILE)
 

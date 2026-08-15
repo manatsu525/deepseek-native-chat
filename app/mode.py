@@ -87,18 +87,26 @@ CODING_PROFILE = ModeProfile(
 )
 
 
-_CODING_RE = re.compile(
-    r"(?:写|创建|生成|实现|开发|修改|修复|调试|重构).{0,18}"
-    r"(?:代码|程序|脚本|网页|网站|html|css|javascript|typescript|python|项目|文件|游戏|组件|接口)"
-    r"|(?:write|create|build|implement|fix|debug|refactor).{0,24}"
-    r"(?:code|program|script|app|website|html|javascript|typescript|python|project|file|component)",
-    re.I | re.S,
+_CODING_ACTION_RE = re.compile(
+    r"写|做|制作|创建|生成|实现|开发|修改|改一下|修复|调试|重构|补全|优化|运行|检查"
+    r"|write|create|build|make|implement|develop|modify|change|fix|debug|refactor|complete|optimi[sz]e|run|test",
+    re.I,
+)
+_CODING_SUBJECT_RE = re.compile(
+    r"代码|程序|脚本|网页|网站|页面|项目|文件|游戏|组件|接口|前端|后端|数据库|插件|爬虫|机器人"
+    r"|html|css|java\s*script|typescript|python|node(?:\.js)?|react|vue|svelte|sql|shell|bash"
+    r"|code|program|script|app|website|webpage|project|file|component|api|frontend|backend|database|plugin|bot"
+    r"|\.(?:html?|css|m?js|cjs|tsx?|jsx|py|sql|sh|json)\b",
+    re.I,
 )
 
 
 def looks_like_coding_request(text: str) -> bool:
     value = str(text or "")
-    return bool(_CODING_RE.search(value) or re.search(r"```(?:py|python|js|javascript|ts|html|css)\b", value, re.I))
+    return bool(
+        (_CODING_ACTION_RE.search(value) and _CODING_SUBJECT_RE.search(value))
+        or re.search(r"```(?:py|python|js|javascript|ts|html|css)\b", value, re.I)
+    )
 
 
 def resolve_profile(requested: ModeName | str, latest_user_text: str, workspace_has_files: bool) -> ModeProfile:
