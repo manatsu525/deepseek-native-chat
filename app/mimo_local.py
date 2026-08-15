@@ -647,6 +647,7 @@ async def stream_response(
             result_text = ""
             target_url = ""
             normalized_path = ""
+            automatic_validation_step: dict[str, Any] | None = None
             try:
                 # Quota errors must take precedence over argument validation. If
                 # the model calls an exhausted tool with malformed arguments,
@@ -723,6 +724,41 @@ async def stream_response(
                             workspace_reads.discard(normalized_path)
                         if workspace_name == "write_file":
                             first_write_seen = True
+                        if (
+                            workspace_name in {"write_file", "apply_patch", "apply_patch_batch"}
+                            and normalized_path.casefold().endswith((".html", ".htm", ".js", ".mjs", ".cjs"))
+                        ):
+                            validation_id = f"{call_id}-auto-syntax"
+                            automatic_validation_step = {
+                                "id": validation_id,
+                                "status": "running",
+                                "action": "workspace",
+                                "query": "",
+                                "url": "",
+                                "path": normalized_path,
+                                "tool": "check_web_syntax",
+                                "error": "",
+                                "automatic": True,
+                            }
+                            steps.append(automatic_validation_step)
+                            try:
+                                validation_text = await asyncio.to_thread(
+                                    workspace.execute,
+                                    "check_web_syntax",
+                                    {"path": normalized_path},
+                                )
+                                validation = json.loads(validation_text)
+                                validation_ok = bool(validation.get("ok")) if isinstance(validation, dict) else False
+                                automatic_validation_step["status"] = "completed" if validation_ok else "failed"
+                                if not validation_ok:
+                                    automatic_validation_step["error"] = str(
+                                        validation.get("error") if isinstance(validation, dict) else "语法检查未通过"
+                                    )[:1000]
+                                result_text += f"\n\n[后端自动语法检查]\n{validation_text}"
+                            except Exception as validation_error:
+                                automatic_validation_step["status"] = "failed"
+                                automatic_validation_step["error"] = str(validation_error)[:1000]
+                                result_text += f"\n\n[后端自动语法检查失败]\n{str(validation_error)[:1000]}"
                     step["status"] = "completed"
                 elif is_search:
                     if parallel_mode:
@@ -923,6 +959,18 @@ async def stream_response(
                         ensure_ascii=False,
                     )
             tool_trace.append({"id": call_id, "name": workspace_name if is_workspace else name, "url": target_url, "path": step.get("path", ""), "backend": "workspace" if is_workspace else web_tool_backend, "status": step["status"], "error": step["error"]})
+            if automatic_validation_step is not None:
+                tool_trace.append(
+                    {
+                        "id": automatic_validation_step["id"],
+                        "name": "check_web_syntax",
+                        "url": "",
+                        "path": automatic_validation_step["path"],
+                        "backend": "workspace-auto",
+                        "status": automatic_validation_step["status"],
+                        "error": automatic_validation_step["error"],
+                    }
+                )
             tool_message = {"role": "tool", "tool_call_id": call_id, "content": result_text}
             conversation.append(tool_message)
             if is_workspace and step["status"] == "completed" and workspace_name == "read_file":
