@@ -45,7 +45,7 @@ function renderWorkspaceState(){
   const hasConversation=!!(state.conversation&&state.conversation.id),files=state.workspaceFiles||[];
   $('#workspaceButton').classList.toggle('hidden',!hasConversation);$('#workspaceCount').textContent=files.length;
   $('#workspaceSummary').textContent=files.length?`${files.length} 个文件 · ${formatBytes(files.reduce((sum,item)=>sum+(Number(item.size)||0),0))}`:'当前还没有文件。让模型编写项目时，它会把代码保存到这里。';
-  $('#workspaceFiles').innerHTML=files.length?files.map(item=>`<a class="workspace-file" href="${workspaceFileUrl(state.conversation.id,item.path)}" download><span aria-hidden="true">▤</span><span class="workspace-file-name" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</span><span class="workspace-file-size">${escapeHtml(formatBytes(item.size))}</span></a>`).join(''):'<div class="workspace-empty">暂无工作区文件</div>';
+  $('#workspaceFiles').innerHTML=files.length?files.map(item=>`<a class="workspace-file" href="${workspaceFileUrl(state.conversation.id,item.path)}"><span aria-hidden="true">▤</span><span class="workspace-file-name" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</span><span class="workspace-file-size">${escapeHtml(formatBytes(item.size))}</span></a>`).join(''):'<div class="workspace-empty">暂无工作区文件</div>';
   $('#workspaceZip').classList.toggle('hidden',!files.length);$('#workspaceZip').href=hasConversation?`/api/conversations/${encodeURIComponent(state.conversation.id)}/workspace.zip`:'#';
 }
 async function loadWorkspaceFiles(showError=false){
@@ -392,8 +392,8 @@ function sourcesHtml(meta={}, detailKey='trace') {
 function workspaceArtifactsHtml(meta={}) {
   const files=Array.isArray(meta.workspace_files)?meta.workspace_files:[],conversationId=meta.conversation_id||'';
   if(!files.length||!conversationId)return '';
-  const links=files.map(item=>`<a class="message-workspace-file" href="${workspaceFileUrl(conversationId,item.path)}" download><span>▤ ${escapeHtml(item.path)}</span><small>${escapeHtml(formatBytes(item.size))}</small></a>`).join('');
-  return `<div class="message-workspace"><div class="message-workspace-head"><span>工作区文件 · ${files.length}</span><a href="/api/conversations/${encodeURIComponent(conversationId)}/workspace.zip" download>下载全部 ZIP</a></div><div class="message-workspace-files">${links}</div></div>`;
+  const links=files.map(item=>`<a class="message-workspace-file" href="${workspaceFileUrl(conversationId,item.path)}"><span>▤ ${escapeHtml(item.path)}</span><small>${escapeHtml(formatBytes(item.size))}</small></a>`).join('');
+  return `<div class="message-workspace"><div class="message-workspace-head"><span>工作区文件 · ${files.length}</span><a href="/api/conversations/${encodeURIComponent(conversationId)}/workspace.zip">下载全部 ZIP</a></div><div class="message-workspace-files">${links}</div></div>`;
 }
 
 function messageHtml(message, index, live=false, retryable=false) {
