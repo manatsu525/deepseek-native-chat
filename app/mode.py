@@ -21,6 +21,12 @@ It may contain TODOs or known bugs. Then inspect real results with run_python or
 check_web_syntax, patch what failed, and check again. For an existing project, inspect
 the relevant saved file and modify it locally instead of regenerating every file.
 
+run_python executes only saved .py files. There is no JavaScript or browser runtime
+execution tool. For HTML/JavaScript, use check_web_syntax on the actual project file;
+do not create a separate Node/test harness that cannot be executed, do not call
+run_python for JavaScript, and do not claim runtime or browser testing. Review logic
+carefully and state the runtime-testing limitation briefly.
+
 Using many workspace tools is expected. A nonzero exit or ok=false is a real failure;
 fix it before claiming success. A syntax check proves syntax only, not browser behavior.
 When finished, briefly summarize changed files. The UI supplies download links."""

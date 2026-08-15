@@ -14,6 +14,7 @@ from app import workspace as workspace_module
 from app.db import Database
 from app.mimo_local import stream_response
 from app.mode import CHAT_PROFILE, CODING_PROFILE, looks_like_coding_request, resolve_profile
+from app.mode import CODING_SYSTEM_PROMPT
 from app.workspace import ConversationWorkspace
 
 
@@ -98,6 +99,7 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(CODING_PROFILE.first_round_tool_choice, "required")
         self.assertEqual(CODING_PROFILE.first_round_effort, "low")
         self.assertEqual(CODING_PROFILE.first_round_max_tokens, 8192)
+        self.assertIn("no JavaScript or browser runtime", CODING_SYSTEM_PROMPT)
 
     def test_coding_loop_requires_an_early_tool_then_allows_final_answer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

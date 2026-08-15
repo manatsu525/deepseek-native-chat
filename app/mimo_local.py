@@ -321,6 +321,7 @@ async def stream_response(
     first_write_seen = False
     required_tool_choice_supported = True
     workspace_reads: set[str] = set()
+    workspace_read_messages: dict[str, dict[str, Any]] = {}
     parallel_session_id = (f"conversation_{conversation_id}" if conversation_id else f"response_{uuid.uuid4().hex}")[:100]
     last_search_objective = ""
     last_search_queries: list[str] = []
@@ -903,9 +904,29 @@ async def stream_response(
                 # calls and prior read results remain byte-stable so automatic
                 # provider prefix caching can continue to hit.
                 function["arguments"] = "{}"
+            if is_workspace and step["status"] == "completed" and workspace_name in WORKSPACE_MUTATION_TOOLS:
+                stale_read = workspace_read_messages.pop(normalized_path, None)
+                if stale_read is not None and len(str(stale_read.get("content") or "")) > WORKSPACE_ARGUMENT_COMPACT_THRESHOLD:
+                    # A full-file read has now served its purpose and the file
+                    # changed. Replacing this large stale suffix costs one
+                    # cache-prefix transition, but prevents it from being sent
+                    # on every remaining tool round. The compact checkpoint is
+                    # stable afterwards, while the system/user prefix remains
+                    # cacheable.
+                    stale_read["content"] = json.dumps(
+                        {
+                            "ok": True,
+                            "path": normalized_path,
+                            "stale": True,
+                            "message": "该完整读取已用于后续修改并过期；为控制上下文已压缩，需要当前内容时重新读取。",
+                        },
+                        ensure_ascii=False,
+                    )
             tool_trace.append({"id": call_id, "name": workspace_name if is_workspace else name, "url": target_url, "path": step.get("path", ""), "backend": "workspace" if is_workspace else web_tool_backend, "status": step["status"], "error": step["error"]})
             tool_message = {"role": "tool", "tool_call_id": call_id, "content": result_text}
             conversation.append(tool_message)
+            if is_workspace and step["status"] == "completed" and workspace_name == "read_file":
+                workspace_read_messages[normalized_path] = tool_message
             await update(
                 {
                     "answer": answer,
