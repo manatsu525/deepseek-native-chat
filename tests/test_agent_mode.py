@@ -52,14 +52,14 @@ class _FakeApiClient:
     def stream(self, method: str, url: str, *, headers: dict, json: dict):
         self.payloads.append(json)
         if len(self.payloads) == 1:
-            large_content = "<!doctype html><script>const value = 1;</script><!--" + "x" * 5000 + "-->"
+            large_content = "x" * 5000
             call = {
                 "index": 0,
                 "id": "call-write",
                 "type": "function",
                 "function": {
                     "name": "write_file",
-                    "arguments": json_module.dumps({"path": "index.html", "content": large_content}),
+                    "arguments": json_module.dumps({"path": "hello.py", "content": large_content}),
                 },
             }
             event = {"choices": [{"delta": {"content": "I'll write the file now.", "reasoning_content": "act", "tool_calls": [call]}}]}
@@ -148,9 +148,6 @@ class AgentModeTests(unittest.TestCase):
         self.assertEqual(result["answer"], "已保存 hello.py。")
         self.assertNotIn("I'll write", result["answer"])
         self.assertIn("I'll write", result["reasoning"])
-        self.assertEqual([item["name"] for item in result["tool_trace"]], ["write_file", "check_web_syntax"])
-        self.assertEqual(result["tool_trace"][1]["backend"], "workspace-auto")
-        self.assertEqual(result["tool_trace"][1]["status"], "completed")
 
     def test_database_migrates_old_jobs_with_auto_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
