@@ -77,7 +77,6 @@ class Database:
                     provider_type TEXT NOT NULL DEFAULT 'deepseek',
                     model TEXT NOT NULL,
                     effort TEXT NOT NULL,
-                    mode TEXT NOT NULL DEFAULT 'auto',
                     timezone TEXT NOT NULL DEFAULT 'UTC',
                     status TEXT NOT NULL,
                     answer TEXT NOT NULL DEFAULT '',
@@ -126,8 +125,6 @@ class Database:
                 db.execute("ALTER TABLE jobs ADD COLUMN provider_type TEXT NOT NULL DEFAULT 'deepseek'")
             if "timezone" not in job_columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'")
-            if "mode" not in job_columns:
-                db.execute("ALTER TABLE jobs ADD COLUMN mode TEXT NOT NULL DEFAULT 'auto'")
             # Older releases called the OpenAI-compatible provider "mimo".
             # Keep existing API configurations and job history, but expose the
             # new generic name everywhere after the next startup.

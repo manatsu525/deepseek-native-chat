@@ -20,7 +20,6 @@
 - 前端测试 API、读取 `/models` 全部模型并勾选、手动填写模型名、重新编辑已保存 API 的模型列表、删除 API
 - Custom 参数：所有模型均可开关 `thinking`，可独立开关 `reasoning_effort` 并使用顶部 Low/Medium/High/Extra High/Max 五档，另有普通采样参数、默认 65,536 的生成上限和联网方案切换
 - Custom 匿名联网方案：Parallel Search + Fetch、Keenable Search + Live Fetch、Tavily Keyless Search + Extract、Firecrawl Keyless Search + Scrape、You Search + Jina Fetch、DDG Search + Jina Fetch
-- 顶部任务模式支持“自动 / 聊天 / 编码”。编码模式仍保留搜索与网页抓取，并要求模型尽早把代码写入持久工作区；聊天模式不向模型暴露文件工具
 - SQLite 单文件数据库、自签 HTTPS、systemd 守护
 - 手机和桌面端响应式界面
 - 浏览器自动上报 IANA 时区；Custom/MiMo 每次回答都会获得对应的当前本地日期，并要求按绝对日期核对“今天/最新”等时效性问题
@@ -84,7 +83,7 @@ DeepSeek 使用官方 `/responses` 路由，当前原生 `web_search` 适配 `de
 
 新增匿名 MCP 由独立的轻量客户端适配：Keenable 调用 `https://api.keenable.ai/mcp` 的 `search_web_pages` / `fetch_page_content`，抓取固定发送 `live=true`；Tavily 调用 `https://mcp.tavily.com/mcp/` 的 `tavily_search` / `tavily_extract`，每次请求固定发送 `X-Tavily-Access-Mode: keyless`；Firecrawl 调用 `https://mcp.firecrawl.dev/v2/mcp`，只使用 `firecrawl_search` / `firecrawl_scrape`；You.com 调用 `https://api.you.com/mcp?profile=free` 的 `you-search`，抓取则直接复用原来的 Jina Reader。四种服务的原始响应都会归一化为相同的标题、URL、摘要和正文格式，再作为 `tool` 消息回传给 LLM。
 
-Custom 每个工具轮最多执行 1 个工具。聊天模式有 6 个联网工具轮；编码模式的联网工具和工作区工具分别计数，最多 4 个联网轮和 30 个工作区轮，因此搜索、抓取不会挤占文件修改额度。每个回答仍最多搜索 3 次、最多读取 3 个网页，每次搜索最多向模型返回 10 条结果。编码模式首轮使用低推理档位和 8,192 输出上限并要求调用工具，后续回到中档；不支持 `tool_choice: required` 的接口会自动退回 `auto`。模型连续输出约 12,000 字符思考却不操作文件时，后端会中止该轮并临时催促其调用工具，最多纠正两次，防止再次烧出数万 token 却不落盘。模型可以在资料足够时直接停止联网工具调用。搜索查询按标准化文本去重，不会重复请求同一组查询。`fetch_webpage` 只能读取用户提供或当前搜索方案返回的 URL，搜索引擎结果页、编造 URL、本机和内网地址都会被拒绝；同一个 URL 也不会重复注入正文。Parallel 搜索每条摘录最多保留约 1,200 字符，读取默认使用相关摘录而非完整页面，每页最多约 8,000 字符，以限制上下文增长。
+Custom 每个工具轮最多执行 1 个工具，最多 6 个工具轮；每个回答最多搜索 3 次、最多读取 3 个网页，每次搜索最多向模型返回 10 条结果。模型可以在资料足够时直接停止工具调用。搜索查询按标准化文本去重，不会重复请求同一组查询。`fetch_webpage` 只能读取用户提供或当前搜索方案返回的 URL，搜索引擎结果页、编造 URL、本机和内网地址都会被拒绝；同一个 URL 也不会重复注入正文。Parallel 搜索每条摘录最多保留约 1,200 字符，读取默认使用相关摘录而非完整页面，每页最多约 8,000 字符，以限制上下文增长。
 
 前端发起问题时会同时提交浏览器的 IANA 时区（如 `Asia/Shanghai`）。后端只把“当前本地日期 + 时区”追加到 Custom 的固定系统提示词末尾，并要求模型把“今天、昨天、明天、目前、最新”等相对时间转换为绝对日期，核对来源的发布/事件日期，禁止把搜索返回的最新一篇误当作当天资料。日期每天只变化一次，且放在静态提示之后，以尽量保留固定前缀的缓存价值；旧客户端未提交时区时使用 UTC。
 
