@@ -138,7 +138,13 @@ def is_opencode_base_url(base_url: str) -> bool:
     return hostname == "opencode.ai" or hostname.endswith(".opencode.ai")
 
 
-def custom_auth_headers(api_key: str, *, base_url: str = "", stream: bool = False) -> dict[str, str]:
+def custom_auth_headers(
+    api_key: str,
+    *,
+    base_url: str = "",
+    stream: bool = False,
+    conversation_id: str = "",
+) -> dict[str, str]:
     """Headers accepted by standard OpenAI-compatible gateways.
 
     `Authorization` is the standard form. Keeping `api-key` as an additional
@@ -154,6 +160,15 @@ def custom_auth_headers(api_key: str, *, base_url: str = "", stream: bool = Fals
         headers["Accept"] = "text/event-stream"
     if is_opencode_base_url(base_url):
         headers["User-Agent"] = "opencode/1.18.16"
+    try:
+        hostname = (urlsplit(str(base_url or "")).hostname or "").casefold()
+    except ValueError:
+        hostname = ""
+    if hostname == "api.x.ai" and conversation_id:
+        # xAI documents this sticky-routing header for Chat Completions.  A
+        # stable conversation ID keeps successive tool rounds on the server
+        # that owns the reusable prompt prefix.
+        headers["x-grok-conv-id"] = str(conversation_id)[:128]
     return headers
 
 

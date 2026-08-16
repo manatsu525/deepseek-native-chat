@@ -14,8 +14,8 @@ WORKSPACES_DIR = settings.data_dir / "workspaces"
 MAX_FILES = 200
 MAX_FILE_BYTES = 512 * 1024
 MAX_TOTAL_BYTES = 10 * 1024 * 1024
-MAX_READ_CHARS = 120_000
-MAX_SEARCH_RESULTS = 50
+MAX_READ_CHARS = 60_000
+MAX_SEARCH_RESULTS = 20
 
 WORKSPACE_SYSTEM_PROMPT = """A persistent, isolated coding workspace is available for this conversation. When the user asks you to create code or a multi-file project, use the workspace tools to save the actual files instead of only printing complete files in chat. On later requests, inspect the existing workspace files and patch only what needs to change. Do not recreate or overwrite unrelated files. Every workspace tool call must include every field marked required in its JSON schema. File tools must include a non-empty workspace-relative path exactly as listed by list_files (or the intended new relative path for write_file), except when a tool's own description explicitly says its path is already bound; a pre-bound tool must not receive path. Before emitting a tool call, verify its arguments against the schema and never repeat an unchanged read_file call. When making multiple edits from one read, submit one apply_patch_batch call instead of sequential apply_patch calls, because earlier edits invalidate the old snapshot. Saved Python programs can be verified with run_python. Saved HTML and JavaScript must be checked with check_web_syntax when that tool is available; it parses HTML and runs Node.js syntax checks on inline, event-handler, and local JavaScript without executing it. These tools run without network in disposable resource-limited copies. Treat a nonzero exit or ok=false as a real failure and fix it before claiming success. Syntax success does not prove browser behavior is correct, so state that limitation. After editing, briefly summarize changed files; the UI supplies download links automatically."""
 
@@ -182,29 +182,14 @@ class ConversationWorkspace:
         ]
 
     def tool_definitions(self) -> list[dict[str, Any]]:
-        """Return schemas constrained to the files that actually exist now."""
-        tools = deepcopy(WORKSPACE_TOOLS)
-        paths = [item["path"] for item in self.list_files()]
-        for tool in tools:
-            function = tool.get("function") or {}
-            name = str(function.get("name") or "")
-            if name not in {"read_file", "apply_patch", "apply_patch_batch", "delete_file"} or not paths:
-                continue
-            path_schema = ((function.get("parameters") or {}).get("properties") or {}).get("path")
-            if isinstance(path_schema, dict):
-                path_schema["enum"] = paths
-                path_schema["description"] = "Required existing workspace file path. Choose exactly one value from this list."
-        python_paths = [path for path in paths if path.casefold().endswith(".py")]
-        if python_paths:
-            run_tool = deepcopy(RUN_PYTHON_TOOL)
-            run_tool["function"]["parameters"]["properties"]["path"]["enum"] = python_paths
-            tools.append(run_tool)
-        web_paths = [path for path in paths if Path(path).suffix.casefold() in {".html", ".htm", ".js", ".mjs", ".cjs"}]
-        if web_paths:
-            check_tool = deepcopy(CHECK_WEB_SYNTAX_TOOL)
-            check_tool["function"]["parameters"]["properties"]["path"]["enum"] = web_paths
-            tools.append(check_tool)
-        return tools
+        """Return a byte-stable schema so provider prefix caches stay reusable.
+
+        Existing paths are runtime state, not part of a tool's contract.  Putting
+        them into JSON-schema enums made the entire tool prefix change after every
+        write, invalidating provider prompt caches.  ``list_files`` remains the
+        authoritative way for the model to discover paths.
+        """
+        return deepcopy([*WORKSPACE_TOOLS, RUN_PYTHON_TOOL, CHECK_WEB_SYNTAX_TOOL])
 
     def _read_text(self, path: Any) -> tuple[str, str]:
         target, relative = self.resolve(path)
@@ -335,7 +320,7 @@ class ConversationWorkspace:
                 continue
             for number, line in enumerate(lines, 1):
                 if folded in line.casefold():
-                    matches.append({"path": file_path.relative_to(self.root).as_posix(), "line": number, "text": line[:500]})
+                    matches.append({"path": file_path.relative_to(self.root).as_posix(), "line": number, "text": line[:300]})
                     if len(matches) >= MAX_SEARCH_RESULTS:
                         return {"matches": matches, "truncated": True}
         return {"matches": matches, "truncated": False}

@@ -60,24 +60,20 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn('"ok": true', result)
         self.assertIn('"path": "index.html"', result)
 
-    def test_existing_file_tools_are_constrained_to_real_paths(self) -> None:
+    def test_tool_schema_is_stable_as_files_change(self) -> None:
+        before = self.workspace.tool_definitions()
         self.workspace.write_file("index.html", "<h1>Hi</h1>")
         self.workspace.write_file("src/app.js", "start()")
         self.workspace.write_file("tests/test_app.py", "print('ok')")
-        tools = {item["function"]["name"]: item for item in self.workspace.tool_definitions()}
-        expected = ["index.html", "src/app.js", "tests/test_app.py"]
-        for name in ("read_file", "apply_patch", "apply_patch_batch", "delete_file"):
-            schema = tools[name]["function"]["parameters"]["properties"]["path"]
-            self.assertEqual(schema["enum"], expected)
-        self.assertEqual(
-            tools["run_python"]["function"]["parameters"]["properties"]["path"]["enum"],
-            ["tests/test_app.py"],
-        )
-        self.assertEqual(
-            tools["check_web_syntax"]["function"]["parameters"]["properties"]["path"]["enum"],
-            ["index.html", "src/app.js"],
-        )
-        self.assertNotIn("enum", tools["write_file"]["function"]["parameters"]["properties"]["path"])
+        after = self.workspace.tool_definitions()
+        self.assertEqual(before, after)
+        names = {item["function"]["name"] for item in after}
+        self.assertIn("run_python", names)
+        self.assertIn("check_web_syntax", names)
+        for tool in after:
+            path_schema = tool["function"]["parameters"]["properties"].get("path")
+            if path_schema:
+                self.assertNotIn("enum", path_schema)
 
     def test_batch_patch_is_atomic_and_uses_one_snapshot(self) -> None:
         original = "alpha = 1\nbeta = 2\ngamma = 3\n"

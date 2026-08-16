@@ -78,6 +78,9 @@ class ToolQuotaExceeded(RuntimeError):
 FINAL_ANSWER_ATTEMPTS = 2
 MAX_AGENT_TOOL_ROUNDS = 12
 PARALLEL_MAX_SEARCH_EXCERPT_CHARS = 1200
+WORKSPACE_ARGUMENT_COMPACT_THRESHOLD = 4096
+AGENT_CONTEXT_COMPACT_THRESHOLD = 80_000
+WORKSPACE_MUTATION_TOOLS = {"write_file", "apply_patch", "apply_patch_batch", "delete_file"}
 FINAL_ANSWER_PROMPT = (
     "CRITICAL FINALIZATION INSTRUCTION: The tool-call budget is completely exhausted. No search, webpage-reading, "
     "or workspace tool is available now, and requesting another tool cannot succeed. You MUST stop using tools and answer the "
@@ -165,6 +168,103 @@ def _looks_like_text_tool_call(value: str) -> bool:
         return False
     head = stripped[:2000]
     return "fetch_webpage" in head or "web_search" in head
+
+
+def _serialized_chars(messages: list[dict[str, Any]]) -> int:
+    return sum(len(json.dumps(message, ensure_ascii=False, separators=(",", ":"))) for message in messages)
+
+
+def _compact_workspace_call_arguments(
+    function: dict[str, Any],
+    *,
+    name: str,
+    path: str,
+    succeeded: bool,
+) -> bool:
+    """Remove large mutation bodies before they enter the next request.
+
+    The persisted workspace is authoritative after a successful mutation.  A
+    full file body or large exact-replacement pair only needs to cross the
+    provider boundary once, when the model emits it.  Keeping it verbatim in
+    every later tool round multiplies input tokens without adding current
+    state.  Small calls remain untouched for maximum prefix fidelity.
+    """
+    raw = str(function.get("arguments") or "")
+    if not succeeded:
+        if len(raw) > WORKSPACE_ARGUMENT_COMPACT_THRESHOLD:
+            function["arguments"] = "{}"
+            return True
+        return False
+    if name not in WORKSPACE_MUTATION_TOOLS or len(raw) <= WORKSPACE_ARGUMENT_COMPACT_THRESHOLD:
+        return False
+    compact: dict[str, Any] = {"path": path}
+    if name == "write_file":
+        compact["content"] = "[successful write body omitted from repeated context]"
+    elif name == "apply_patch":
+        compact.update({"old_text": "[omitted]", "new_text": "[omitted]"})
+    elif name == "apply_patch_batch":
+        compact["patches"] = [{"old_text": "[omitted]", "new_text": "[omitted]"}]
+    function["arguments"] = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    return True
+
+
+def _maybe_compact_agent_context(
+    conversation: list[dict[str, Any]],
+    *,
+    base_message_count: int,
+    workspace: ConversationWorkspace | None,
+    sources: dict[str, dict[str, str]],
+    tool_trace: list[dict[str, Any]],
+) -> bool:
+    """Checkpoint oversized internal tool history without another model call.
+
+    This deliberately triggers only at a high-water mark.  Between checkpoints
+    history is append-only for prompt-cache hits.  At a checkpoint the durable
+    workspace and compact source metadata replace verbose stale tool traffic,
+    while the newest assistant/tool pair is kept verbatim for continuity.
+    """
+    internal = conversation[base_message_count:]
+    if _serialized_chars(internal) <= AGENT_CONTEXT_COMPACT_THRESHOLD:
+        return False
+    keep = internal[-2:] if len(internal) >= 2 else internal
+    files = workspace.list_files() if workspace is not None else []
+    source_state = [
+        {
+            "url": item.get("url", ""),
+            "title": item.get("title", ""),
+            "summary": str(item.get("summary") or "")[:240],
+        }
+        for item in list(sources.values())[:30]
+    ]
+    operations = [
+        {
+            "name": item.get("name", ""),
+            "path": item.get("path", ""),
+            "url": item.get("url", ""),
+            "status": item.get("status", ""),
+            "error": str(item.get("error") or "")[:240],
+        }
+        for item in tool_trace[-30:]
+    ]
+    checkpoint = {
+        "context_checkpoint": True,
+        "instruction": (
+            "Verbose older tool traffic was compacted. The workspace files below are authoritative; "
+            "read a file again only when its current contents are needed. Do not repeat completed searches or operations."
+        ),
+        "workspace_files": files,
+        "sources": source_state,
+        "recent_operations": operations,
+    }
+    base = [dict(message) for message in conversation[:base_message_count]]
+    checkpoint_text = json.dumps(checkpoint, ensure_ascii=False, separators=(",", ":"))
+    if base and base[0].get("role") == "system":
+        original_system = str(base[0].get("content") or "").split("\n\nCONTEXT CHECKPOINT:\n", 1)[0]
+        base[0]["content"] = f"{original_system}\n\nCONTEXT CHECKPOINT:\n{checkpoint_text}"
+    else:
+        base.insert(0, {"role": "system", "content": f"CONTEXT CHECKPOINT:\n{checkpoint_text}"})
+    conversation[:] = [*base, *keep]
+    return True
 
 
 def _dated_system_prompt(base_prompt: str, user_timezone: str) -> str:
@@ -273,7 +373,12 @@ async def stream_response(
     keyless_mode = web_tool_backend in KEYLESS_PROVIDERS
     if not (parallel_mode or legacy_mode or keyless_mode):
         raise ValueError(f"不支持的搜索/抓取工具方案：{web_tool_backend}")
-    headers = custom_auth_headers(api_key, base_url=base_url, stream=True)
+    headers = custom_auth_headers(
+        api_key,
+        base_url=base_url,
+        stream=True,
+        conversation_id=conversation_id,
+    )
     if parallel_mode:
         base_prompt = PARALLEL_CUSTOM_SYSTEM_PROMPT
     elif legacy_mode:
@@ -287,6 +392,7 @@ async def stream_response(
     if workspace is not None:
         system_prompt = f"{system_prompt}\n\n{WORKSPACE_SYSTEM_PROMPT}"
     conversation: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}, *[dict(message) for message in messages]]
+    base_message_count = len(conversation)
     answer = ""
     reasoning = ""
     usage: dict[str, Any] = {}
@@ -305,6 +411,7 @@ async def stream_response(
     final_answer_attempts = 0
     force_final_answer = False
     workspace_reads: set[str] = set()
+    workspace_searches: set[str] = set()
     parallel_session_id = (f"conversation_{conversation_id}" if conversation_id else f"response_{uuid.uuid4().hex}")[:100]
     last_search_objective = ""
     last_search_queries: list[str] = []
@@ -346,7 +453,10 @@ async def stream_response(
                         round_tools.append(SEARCH_WEB_TOOL)
                     else:
                         round_tools.append(KEYLESS_SEARCH_WEB_TOOL)
-                if tool_rounds_used < MIMO_MAX_TOOL_ROUNDS and reader_enabled:
+                # Keep the initial web-tool schema stable. Public URL safety is
+                # enforced by fetch_webpage itself, so it need not appear only
+                # after the first search result changes runtime state.
+                if tool_rounds_used < MIMO_MAX_TOOL_ROUNDS:
                     if parallel_mode:
                         round_tools.append(PARALLEL_FETCH_WEBPAGE_TOOL)
                     elif legacy_mode:
@@ -636,11 +746,29 @@ async def stream_response(
                             },
                             ensure_ascii=False,
                         )
+                    elif workspace_name == "search_files":
+                        search_key = json.dumps(
+                            [str(arguments.get("query") or "").strip().casefold(), normalized_path.casefold()],
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                        if search_key in workspace_searches:
+                            result_text = json.dumps(
+                                {
+                                    "ok": True,
+                                    "unchanged": True,
+                                    "message": "相同文件搜索已执行过，不再重复返回结果；请使用已有结果继续。",
+                                },
+                                ensure_ascii=False,
+                            )
+                        else:
+                            workspace_searches.add(search_key)
+                            result_text = await asyncio.to_thread(workspace.execute, workspace_name, arguments)
                     else:
                         result_text = await asyncio.to_thread(workspace.execute, workspace_name, arguments)
                         if workspace_name == "read_file":
                             workspace_reads.add(normalized_path)
-                        elif workspace_name in {"write_file", "apply_patch", "apply_patch_batch", "delete_file"}:
+                        elif workspace_name in WORKSPACE_MUTATION_TOOLS:
                             workspace_reads.discard(normalized_path)
                     step["status"] = "completed"
                 elif is_search:
@@ -806,14 +934,25 @@ async def stream_response(
                     result_text = f"工作区操作失败：{str(exc)[:1000]}。请先读取当前文件并修正参数后重试。"
                 else:
                     result_text = f"读取网页失败：{str(exc)[:1000]}。请根据已有搜索结果继续回答，必要时选择其他来源。"
-            if is_workspace and step["status"] == "failed":
-                # Failed patches can contain many kilobytes of old/new text.
-                # Keeping those unusable arguments in every later request
-                # multiplies input-token cost without giving the model useful
-                # state. The paired tool result below retains the exact error.
-                function["arguments"] = "{}"
+            compacted_arguments = False
+            if is_workspace:
+                compacted_arguments = _compact_workspace_call_arguments(
+                    function,
+                    name=workspace_name,
+                    path=step.get("path", ""),
+                    succeeded=step["status"] == "completed",
+                )
+                if compacted_arguments:
+                    result_text += "\n[上下文优化：大型操作参数已执行并从后续重复请求中省略；当前工作区文件是权威状态。]"
             tool_trace.append({"id": call_id, "name": workspace_name if is_workspace else name, "url": target_url, "path": step.get("path", ""), "backend": "workspace" if is_workspace else web_tool_backend, "status": step["status"], "error": step["error"]})
             conversation.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
+            _maybe_compact_agent_context(
+                conversation,
+                base_message_count=base_message_count,
+                workspace=workspace,
+                sources=sources,
+                tool_trace=tool_trace,
+            )
             await update(
                 {
                     "answer": answer,
