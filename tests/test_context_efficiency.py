@@ -60,6 +60,30 @@ class ContextEfficiencyTests(unittest.TestCase):
         )
         self.assertEqual(function["arguments"], raw)
 
+    def test_large_line_edit_is_compacted_after_success(self) -> None:
+        function = {
+            "name": "apply_line_edits",
+            "arguments": json.dumps(
+                {
+                    "path": "app.js",
+                    "revision": "a" * 64,
+                    "edits": [{"start_line": 1, "end_line": 20, "new_text": "x" * 10_000}],
+                }
+            ),
+        }
+        self.assertTrue(
+            _compact_workspace_call_arguments(
+                function,
+                name="apply_line_edits",
+                path="app.js",
+                succeeded=True,
+            )
+        )
+        compact = json.loads(function["arguments"])
+        self.assertEqual(compact["path"], "app.js")
+        self.assertIn("edits", compact)
+        self.assertLess(len(function["arguments"]), 250)
+
     def test_high_water_mark_keeps_base_and_latest_tool_pair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             original = workspace_module.WORKSPACES_DIR

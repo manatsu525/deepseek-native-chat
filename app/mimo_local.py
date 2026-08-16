@@ -80,7 +80,7 @@ MAX_AGENT_TOOL_ROUNDS = 12
 PARALLEL_MAX_SEARCH_EXCERPT_CHARS = 1200
 WORKSPACE_ARGUMENT_COMPACT_THRESHOLD = 4096
 AGENT_CONTEXT_COMPACT_THRESHOLD = 80_000
-WORKSPACE_MUTATION_TOOLS = {"write_file", "apply_patch", "apply_patch_batch", "delete_file"}
+WORKSPACE_MUTATION_TOOLS = {"write_file", "apply_line_edits", "apply_patch", "apply_patch_batch", "delete_file"}
 FINAL_ANSWER_PROMPT = (
     "CRITICAL FINALIZATION INSTRUCTION: The tool-call budget is completely exhausted. No search, webpage-reading, "
     "or workspace tool is available now, and requesting another tool cannot succeed. You MUST stop using tools and answer the "
@@ -204,6 +204,13 @@ def _compact_workspace_call_arguments(
         compact.update({"old_text": "[omitted]", "new_text": "[omitted]"})
     elif name == "apply_patch_batch":
         compact["patches"] = [{"old_text": "[omitted]", "new_text": "[omitted]"}]
+    elif name == "apply_line_edits":
+        compact.update(
+            {
+                "revision": "[consumed]",
+                "edits": [{"start_line": 1, "end_line": 0, "new_text": "[omitted]"}],
+            }
+        )
     function["arguments"] = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
     return True
 
@@ -410,7 +417,7 @@ async def stream_response(
     reader_enabled = bool(known_urls)
     final_answer_attempts = 0
     force_final_answer = False
-    workspace_reads: set[str] = set()
+    workspace_reads: set[tuple[str, int, int | None]] = set()
     workspace_searches: set[str] = set()
     parallel_session_id = (f"conversation_{conversation_id}" if conversation_id else f"response_{uuid.uuid4().hex}")[:100]
     last_search_objective = ""
@@ -716,6 +723,7 @@ async def stream_response(
                     required_arguments = {
                         "read_file": ("path",),
                         "write_file": ("path", "content"),
+                        "apply_line_edits": ("path", "revision", "edits"),
                         "apply_patch": ("path", "old_text", "new_text"),
                         "apply_patch_batch": ("path", "patches"),
                         "search_files": ("query",),
@@ -723,7 +731,7 @@ async def stream_response(
                         "run_python": ("path",),
                         "check_web_syntax": ("path",),
                     }.get(workspace_name, ())
-                    non_empty_arguments = {"path", "query", "old_text"}
+                    non_empty_arguments = {"path", "query", "old_text", "revision"}
                     missing = [
                         key
                         for key in required_arguments
@@ -736,7 +744,12 @@ async def stream_response(
                     normalized_path = ""
                     if "path" in arguments:
                         _, normalized_path = workspace.resolve(arguments["path"], allow_root=workspace_name == "search_files")
-                    if workspace_name == "read_file" and normalized_path in workspace_reads:
+                    read_key = (
+                        normalized_path,
+                        int(arguments.get("start_line", 1) or 1),
+                        int(arguments["end_line"]) if arguments.get("end_line") is not None else None,
+                    )
+                    if workspace_name == "read_file" and read_key in workspace_reads:
                         result_text = json.dumps(
                             {
                                 "ok": True,
@@ -767,9 +780,9 @@ async def stream_response(
                     else:
                         result_text = await asyncio.to_thread(workspace.execute, workspace_name, arguments)
                         if workspace_name == "read_file":
-                            workspace_reads.add(normalized_path)
+                            workspace_reads.add(read_key)
                         elif workspace_name in WORKSPACE_MUTATION_TOOLS:
-                            workspace_reads.discard(normalized_path)
+                            workspace_reads = {item for item in workspace_reads if item[0] != normalized_path}
                     step["status"] = "completed"
                 elif is_search:
                     if parallel_mode:

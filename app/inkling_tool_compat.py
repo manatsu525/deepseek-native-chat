@@ -96,7 +96,7 @@ def bind_patch_tools(
     for tool in tools:
         function = tool.get("function") or {}
         original_name = str(function.get("name") or "")
-        if original_name not in {"apply_patch", "apply_patch_batch"}:
+        if original_name not in {"apply_line_edits", "apply_patch", "apply_patch_batch"}:
             result.append(tool)
             continue
         for path in paths:

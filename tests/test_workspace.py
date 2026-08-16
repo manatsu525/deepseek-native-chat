@@ -60,6 +60,10 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn('"ok": true', result)
         self.assertIn('"path": "index.html"', result)
 
+        snapshot = self.workspace.execute("read_file", {"path": "index.html"})
+        self.assertIn('"revision":', snapshot)
+        self.assertIn('"numbered_content": "1|<h1>Hi</h1>"', snapshot)
+
     def test_tool_schema_is_stable_as_files_change(self) -> None:
         before = self.workspace.tool_definitions()
         self.workspace.write_file("index.html", "<h1>Hi</h1>")
@@ -68,12 +72,75 @@ class WorkspaceTests(unittest.TestCase):
         after = self.workspace.tool_definitions()
         self.assertEqual(before, after)
         names = {item["function"]["name"] for item in after}
+        self.assertIn("apply_line_edits", names)
+        self.assertNotIn("apply_patch", names)
+        self.assertNotIn("apply_patch_batch", names)
         self.assertIn("run_python", names)
         self.assertIn("check_web_syntax", names)
         for tool in after:
             path_schema = tool["function"]["parameters"]["properties"].get("path")
             if path_schema:
                 self.assertNotIn("enum", path_schema)
+
+    def test_revisioned_line_edits_are_atomic_and_do_not_match_old_text(self) -> None:
+        self.workspace.write_file("app.js", "one\ntwo\nthree\nfour\n")
+        snapshot = self.workspace.read_snapshot("app.js")
+        self.assertEqual(snapshot["numbered_content"], "1|one\n2|two\n3|three\n4|four")
+        result = self.workspace.apply_line_edits(
+            "app.js",
+            snapshot["revision"],
+            [
+                {"start_line": 2, "end_line": 2, "new_text": "TWO"},
+                {"start_line": 4, "end_line": 3, "new_text": "inserted"},
+            ],
+        )
+        self.assertNotEqual(result["revision"], snapshot["revision"])
+        self.assertEqual(self.workspace.read_file("app.js"), "one\nTWO\nthree\ninserted\nfour\n")
+
+        latest = self.workspace.read_snapshot("app.js")
+        self.workspace.apply_line_edits(
+            "app.js",
+            latest["revision"],
+            [{"start_line": 5, "end_line": 5, "new_text": "FOUR"}],
+        )
+        self.assertTrue(self.workspace.read_file("app.js").endswith("FOUR\n"))
+
+    def test_snapshot_can_read_a_numbered_line_range(self) -> None:
+        self.workspace.write_file("app.js", "one\ntwo\nthree\nfour\n")
+        snapshot = self.workspace.read_snapshot("app.js", 2, 3)
+        self.assertEqual(snapshot["returned_from_line"], 2)
+        self.assertEqual(snapshot["returned_through_line"], 3)
+        self.assertEqual(snapshot["line_count"], 4)
+        self.assertEqual(snapshot["numbered_content"], "2|two\n3|three")
+        self.assertFalse(snapshot["truncated"])
+
+    def test_line_edits_reject_stale_revision_without_changing_file(self) -> None:
+        self.workspace.write_file("app.js", "one\ntwo\n")
+        stale = self.workspace.read_snapshot("app.js")
+        self.workspace.write_file("app.js", "one\nchanged\n")
+        before = self.workspace.read_file("app.js")
+        with self.assertRaisesRegex(WorkspaceError, "文件版本已经变化"):
+            self.workspace.apply_line_edits(
+                "app.js",
+                stale["revision"],
+                [{"start_line": 2, "end_line": 2, "new_text": "TWO"}],
+            )
+        self.assertEqual(self.workspace.read_file("app.js"), before)
+
+    def test_line_edits_reject_overlapping_ranges_atomically(self) -> None:
+        original = "one\ntwo\nthree\n"
+        self.workspace.write_file("app.js", original)
+        snapshot = self.workspace.read_snapshot("app.js")
+        with self.assertRaisesRegex(WorkspaceError, "范围重叠"):
+            self.workspace.apply_line_edits(
+                "app.js",
+                snapshot["revision"],
+                [
+                    {"start_line": 1, "end_line": 2, "new_text": "first"},
+                    {"start_line": 2, "end_line": 3, "new_text": "second"},
+                ],
+            )
+        self.assertEqual(self.workspace.read_file("app.js"), original)
 
     def test_batch_patch_is_atomic_and_uses_one_snapshot(self) -> None:
         original = "alpha = 1\nbeta = 2\ngamma = 3\n"
