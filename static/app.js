@@ -639,7 +639,8 @@ function startPolling(id){
       const job=await api(`/api/jobs/${id}`);if(!current())return;
       job.trace_key=traceKey;if(job.provider_id)selectProvider(job.provider_id,false,job.model);state.job=job;
       if(job.status==='completed'){stopPolling();setRunning(false);finalizeLiveMessage(job);loadWorkspaceFiles();return}
-      if(['failed','stopped'].includes(job.status)){stopPolling();setRunning(false);renderMessages();loadWorkspaceFiles();return}
+      if(job.status==='failed'){stopPolling();setRunning(false);finalizeLiveMessage(job);loadWorkspaceFiles();return}
+      if(job.status==='stopped'){stopPolling();setRunning(false);renderMessages();loadWorkspaceFiles();return}
       updateLiveMessage();
     }catch(err){if(current()){toast(err.message);setRunning(false)}return}
     if(current())state.poll=setTimeout(tick,700);
