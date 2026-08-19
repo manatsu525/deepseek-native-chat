@@ -65,6 +65,8 @@ from .inkling_tool_compat import (
 )
 from .reasoning_effort import normalize as normalize_reasoning_effort
 from .workspace import (
+    READ_ONLY_WORKSPACE_SYSTEM_PROMPT,
+    READ_ONLY_WORKSPACE_TOOL_NAMES,
     WORKSPACE_SYSTEM_PROMPT,
     WORKSPACE_TOOL_NAMES,
     ConversationWorkspace,
@@ -358,6 +360,9 @@ async def stream_response(
     user_timezone: str = "UTC",
     effort: str = "high",
     workspace: ConversationWorkspace | None = None,
+    web_enabled: bool = True,
+    workspace_access: str = "full",
+    system_addendum: str = "",
 ) -> dict[str, Any]:
     """Run a custom OpenAI-compatible model with local web tools.
 
@@ -386,7 +391,9 @@ async def stream_response(
         stream=True,
         conversation_id=conversation_id,
     )
-    if parallel_mode:
+    if not web_enabled:
+        base_prompt = "You are an AI assistant. No web-search or webpage-reading tool is available in this role."
+    elif parallel_mode:
         base_prompt = PARALLEL_CUSTOM_SYSTEM_PROMPT
     elif legacy_mode:
         base_prompt = LEGACY_CUSTOM_SYSTEM_PROMPT
@@ -396,8 +403,11 @@ async def stream_response(
         _dated_system_prompt(base_prompt, user_timezone),
         model,
     )
-    if workspace is not None:
-        system_prompt = f"{system_prompt}\n\n{WORKSPACE_SYSTEM_PROMPT}"
+    if workspace is not None and workspace_access != "none":
+        workspace_prompt = READ_ONLY_WORKSPACE_SYSTEM_PROMPT if workspace_access == "read_only" else WORKSPACE_SYSTEM_PROMPT
+        system_prompt = f"{system_prompt}\n\n{workspace_prompt}"
+    if system_addendum.strip():
+        system_prompt = f"{system_prompt}\n\n{system_addendum.strip()}"
     conversation: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}, *[dict(message) for message in messages]]
     base_message_count = len(conversation)
     answer = ""
@@ -428,14 +438,18 @@ async def stream_response(
         timeout=(DDG_CONNECT_TIMEOUT, DDG_SEARCH_TIMEOUT),
         allow_redirects=True,
         headers=DDG_BROWSER_HEADERS,
-    ) if legacy_mode else _AsyncNullContext()
+    ) if web_enabled and legacy_mode else _AsyncNullContext()
     jina_context = curl_requests.AsyncSession(
         timeout=(15, 90),
         allow_redirects=True,
         headers=JINA_BROWSER_HEADERS,
-    ) if legacy_mode or web_tool_backend == "you" else _AsyncNullContext()
-    parallel_context = ParallelMCPClient() if parallel_mode else _AsyncNullContext()
-    keyless_context = KeylessWebProvider(web_tool_backend) if keyless_mode else _AsyncNullContext()
+    ) if web_enabled and (legacy_mode or web_tool_backend == "you") else _AsyncNullContext()
+    parallel_context = ParallelMCPClient() if web_enabled and parallel_mode else _AsyncNullContext()
+    keyless_context = KeylessWebProvider(web_tool_backend) if web_enabled and keyless_mode else _AsyncNullContext()
+    tools_expected = web_enabled or (workspace is not None and workspace_access != "none")
+    allowed_workspace_tools = (
+        READ_ONLY_WORKSPACE_TOOL_NAMES if workspace_access == "read_only" else WORKSPACE_TOOL_NAMES
+    )
     async with (
         httpx.AsyncClient(timeout=api_limits) as api_client,
         search_context as search_client,
@@ -453,7 +467,7 @@ async def stream_response(
             round_tools: list[dict[str, Any]] = []
             inkling_patch_bindings: dict[str, tuple[str, str]] = {}
             if not force_final_answer:
-                if tool_rounds_used < MIMO_MAX_TOOL_ROUNDS and search_count < MIMO_MAX_SEARCHES:
+                if web_enabled and tool_rounds_used < MIMO_MAX_TOOL_ROUNDS and search_count < MIMO_MAX_SEARCHES:
                     if parallel_mode:
                         round_tools.append(PARALLEL_SEARCH_WEB_TOOL)
                     elif legacy_mode:
@@ -463,21 +477,21 @@ async def stream_response(
                 # Keep the initial web-tool schema stable. Public URL safety is
                 # enforced by fetch_webpage itself, so it need not appear only
                 # after the first search result changes runtime state.
-                if tool_rounds_used < MIMO_MAX_TOOL_ROUNDS:
+                if web_enabled and tool_rounds_used < MIMO_MAX_TOOL_ROUNDS:
                     if parallel_mode:
                         round_tools.append(PARALLEL_FETCH_WEBPAGE_TOOL)
                     elif legacy_mode:
                         round_tools.append(FETCH_WEBPAGE_TOOL)
                     else:
                         round_tools.append(KEYLESS_FETCH_WEBPAGE_TOOL)
-                if workspace is not None and tool_rounds_used < MAX_AGENT_TOOL_ROUNDS:
-                    round_tools.extend(workspace.tool_definitions())
+                if workspace is not None and workspace_access != "none" and tool_rounds_used < MAX_AGENT_TOOL_ROUNDS:
+                    round_tools.extend(workspace.tool_definitions(workspace_access))
                     if inkling_compat_active:
                         round_tools, inkling_patch_bindings = bind_inkling_patch_tools(
                             round_tools,
                             [item["path"] for item in workspace.list_files()],
                         )
-            final_answer_only = force_final_answer or not round_tools
+            final_answer_only = force_final_answer or (tools_expected and not round_tools)
             mimo_model = is_mimo_model(model)
             request_messages = conversation
             if final_answer_only:
@@ -717,6 +731,8 @@ async def stream_response(
                 if is_workspace:
                     if workspace is None:
                         raise ValueError("当前对话没有可用的编码工作区")
+                    if workspace_name not in allowed_workspace_tools:
+                        raise ValueError(f"当前智能体无权调用工作区工具：{workspace_name}")
                     if bound_path:
                         arguments["path"] = bound_path
                     step["path"] = str(arguments.get("path") or "")[:300]

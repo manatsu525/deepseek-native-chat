@@ -28,6 +28,7 @@ from .deepseek import stream_response as deepseek_stream_response
 from .mimo import DEFAULT_SETTINGS as CUSTOM_DEFAULT_SETTINGS
 from .mimo import MIMO_MAX_COMPLETION_TOKENS, custom_auth_headers, is_mimo_model, list_models as custom_list_models
 from .mimo_local import stream_response as custom_stream_response
+from .multi_agent import run_collaboration
 from .reasoning_effort import DEFAULT as DEFAULT_REASONING_EFFORT
 from .reasoning_effort import LEVELS as REASONING_EFFORT_LEVELS
 from .security import load_secret, make_token, password_hash, password_ok, read_token
@@ -107,6 +108,7 @@ class ChatBody(BaseModel):
     model: str = ""
     effort: str = DEFAULT_REASONING_EFFORT
     timezone: str = Field(default="UTC", min_length=1, max_length=64)
+    chat_mode: Literal["standard", "multi_agent"] = "standard"
 
 
 class RetryBody(BaseModel):
@@ -115,6 +117,7 @@ class RetryBody(BaseModel):
     model: str = ""
     effort: str = DEFAULT_REASONING_EFFORT
     timezone: str = Field(default="UTC", min_length=1, max_length=64)
+    chat_mode: Literal["standard", "multi_agent"] = "standard"
 
 
 class PinBody(BaseModel):
@@ -311,8 +314,8 @@ def public_provider(row: dict[str, Any]) -> dict[str, Any]:
 
 def public_job(row: dict[str, Any]) -> dict[str, Any]:
     row = dict(row)
-    for name, fallback in (("searches_json", []), ("sources_json", []), ("usage_json", {})):
-        row[name.removesuffix("_json")] = db.decode(row.pop(name), fallback)
+    for name, fallback in (("searches_json", []), ("sources_json", []), ("usage_json", {}), ("agents_json", [])):
+        row[name.removesuffix("_json")] = db.decode(row.pop(name, ""), fallback)
     row["stop_requested"] = bool(row["stop_requested"])
     if row.get("provider_type") == "mimo":
         row["provider_type"] = "custom"
@@ -411,6 +414,7 @@ async def run_job(job_id: str) -> None:
             searches_json=json.dumps(state["searches"], ensure_ascii=False),
             sources_json=json.dumps(state["sources"], ensure_ascii=False),
             usage_json=json.dumps(state["usage"], ensure_ascii=False),
+            agents_json=json.dumps(state.get("agents", []), ensure_ascii=False),
         )
 
     try:
@@ -423,7 +427,23 @@ async def run_job(job_id: str) -> None:
                 attachment_records,
                 kind == "custom",
             )
-        if kind == "custom":
+        if kind == "custom" and job.get("chat_mode") == "multi_agent":
+            provider_settings = custom_settings_for_model(provider, job["model"])
+            result = await run_collaboration(
+                base_url=provider["base_url"],
+                api_key=provider["api_key"],
+                model=job["model"],
+                messages=history,
+                timeout=settings.request_timeout,
+                stopped=stopped,
+                update=update,
+                settings=provider_settings,
+                conversation_id=job["conversation_id"],
+                user_timezone=job.get("timezone") or "UTC",
+                effort=job["effort"],
+                workspace=job_workspace,
+            )
+        elif kind == "custom":
             provider_settings = custom_settings_for_model(provider, job["model"])
             result = await custom_stream_response(
                 base_url=provider["base_url"],
@@ -450,7 +470,7 @@ async def run_job(job_id: str) -> None:
                 stopped=stopped,
                 update=update,
             )
-        meta = {"job_id": job_id, "conversation_id": job["conversation_id"], "provider_id": job["provider_id"], "provider_type": kind, "model": job["model"], "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"], "workspace_files": job_workspace.list_files()}
+        meta = {"job_id": job_id, "conversation_id": job["conversation_id"], "provider_id": job["provider_id"], "provider_type": kind, "model": job["model"], "chat_mode": job.get("chat_mode") or "standard", "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"], "agents": result.get("agents", []), "workspace_files": job_workspace.list_files()}
         if result.get("tool_trace"):
             meta["tool_trace"] = result["tool_trace"]
         db.run(
@@ -466,30 +486,34 @@ async def run_job(job_id: str) -> None:
             searches_json=json.dumps(result["searches"], ensure_ascii=False),
             sources_json=json.dumps(result["sources"], ensure_ascii=False),
             usage_json=json.dumps(result["usage"], ensure_ascii=False),
+            agents_json=json.dumps(result.get("agents", []), ensure_ascii=False),
         )
     except asyncio.CancelledError:
-        partial = db.one("SELECT answer, reasoning, searches_json, sources_json, usage_json FROM jobs WHERE id=?", (job_id,)) or {}
-        if partial.get("answer"):
+        partial = db.one("SELECT answer, reasoning, searches_json, sources_json, usage_json, agents_json FROM jobs WHERE id=?", (job_id,)) or {}
+        partial_agents = db.decode(partial.get("agents_json", "[]"), [])
+        if partial.get("answer") or partial_agents:
             meta = {
                 "job_id": job_id,
                 "stopped": True,
                 "provider_id": job["provider_id"],
                 "provider_type": provider_type(provider),
                 "model": job["model"],
+                "chat_mode": job.get("chat_mode") or "standard",
                 "reasoning": partial.get("reasoning", ""),
                 "searches": db.decode(partial.get("searches_json", "[]"), []),
                 "sources": db.decode(partial.get("sources_json", "[]"), []),
                 "usage": db.decode(partial.get("usage_json", "{}"), {}),
+                "agents": partial_agents,
             }
             db.run(
                 "INSERT INTO messages(conversation_id, role, content, meta_json, created_at) VALUES(?,?,?,?,?)",
-                (job["conversation_id"], "assistant", partial["answer"] + "\n\n_已停止生成_", json.dumps(meta, ensure_ascii=False), now()),
+                (job["conversation_id"], "assistant", str(partial.get("answer") or "") + "\n\n_已停止生成_", json.dumps(meta, ensure_ascii=False), now()),
             )
         db.update_job(job_id, status="stopped", error="")
     except Exception as exc:
         error = str(exc)[:3000]
         partial = db.one(
-            "SELECT answer,reasoning,searches_json,sources_json,usage_json FROM jobs WHERE id=?",
+            "SELECT answer,reasoning,searches_json,sources_json,usage_json,agents_json FROM jobs WHERE id=?",
             (job_id,),
         ) or {}
         meta = {
@@ -501,10 +525,12 @@ async def run_job(job_id: str) -> None:
             "provider_id": job["provider_id"],
             "provider_type": kind,
             "model": job["model"],
+            "chat_mode": job.get("chat_mode") or "standard",
             "reasoning": partial.get("reasoning", ""),
             "searches": db.decode(partial.get("searches_json", "[]"), []),
             "sources": db.decode(partial.get("sources_json", "[]"), []),
             "usage": db.decode(partial.get("usage_json", "{}"), {}),
+            "agents": db.decode(partial.get("agents_json", "[]"), []),
             "workspace_files": job_workspace.list_files(),
         }
         failed_at = now()
@@ -1046,6 +1072,8 @@ async def retry_answer(
     if kind == "deepseek" and model != provider["model"]:
         raise HTTPException(400, "当前回答使用的模型与 API 配置不一致，请重新选择模型配置")
     validate_provider_selection(kind, model, provider)
+    if body.chat_mode == "multi_agent" and kind != "custom":
+        raise HTTPException(400, "多智能体协作模式仅支持 Custom 模型")
     validate_effort(body.effort)
     timezone_name = clean_timezone(body.timezone)
     job_id = uuid.uuid4().hex
@@ -1081,11 +1109,11 @@ async def retry_answer(
         connection.execute(
             """INSERT INTO jobs(
                    id,user_id,conversation_id,provider_id,provider_type,model,
-                   effort,timezone,status,created_at,updated_at
-               ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                   effort,timezone,chat_mode,status,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 job_id, user["id"], conversation_id, body.provider_id, kind,
-                model, body.effort, timezone_name, "queued", created_at, created_at,
+                model, body.effort, timezone_name, body.chat_mode, "queued", created_at, created_at,
             ),
         )
         connection.execute("UPDATE conversations SET updated_at=? WHERE id=?", (created_at, conversation_id))
@@ -1132,6 +1160,8 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
     if kind == "deepseek" and model != provider["model"]:
         raise HTTPException(400, "当前回答使用的模型与 API 配置不一致，请重新选择模型配置")
     validate_provider_selection(kind, model, provider)
+    if body.chat_mode == "multi_agent" and kind != "custom":
+        raise HTTPException(400, "多智能体协作模式仅支持 Custom 模型")
     validate_effort(body.effort)
     content = body.content.strip()
     attachment_ids = list(dict.fromkeys(body.attachment_ids))
@@ -1167,8 +1197,8 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
     db.run("UPDATE conversations SET updated_at=? WHERE id=?", (now(), conversation_id))
     job_id = uuid.uuid4().hex
     db.run(
-        "INSERT INTO jobs(id,user_id,conversation_id,provider_id,provider_type,model,effort,timezone,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        (job_id, user["id"], conversation_id, body.provider_id, kind, model, body.effort, timezone_name, "queued", now(), now()),
+        "INSERT INTO jobs(id,user_id,conversation_id,provider_id,provider_type,model,effort,timezone,chat_mode,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (job_id, user["id"], conversation_id, body.provider_id, kind, model, body.effort, timezone_name, body.chat_mode, "queued", now(), now()),
     )
     if attachment_ids and not db.claim_attachments(user["id"], attachment_ids, conversation_id, job_id):
         db.run("DELETE FROM jobs WHERE id=? AND user_id=?", (job_id, user["id"]))

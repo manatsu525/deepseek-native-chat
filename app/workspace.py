@@ -20,6 +20,8 @@ MAX_SEARCH_RESULTS = 20
 
 WORKSPACE_SYSTEM_PROMPT = """A persistent, isolated coding workspace is available for this conversation. When the user asks you to create code or a multi-file project, use the workspace tools to save the actual files instead of only printing complete files in chat. On later requests, inspect the existing workspace files and modify only what needs to change. Do not recreate or overwrite unrelated files. Every workspace tool call must include every field marked required in its JSON schema. File tools must include a non-empty workspace-relative path exactly as listed by list_files (or the intended new relative path for write_file), except when a tool's own description explicitly says its path is already bound; a pre-bound tool must not receive path. read_file returns numbered lines and an opaque revision. For an existing file, use one apply_line_edits call with that exact revision and all non-overlapping edits from the same read; do not use write_file to replace the whole file for a local change. If the revision is stale, read the file again. Saved Python programs can be verified with run_python. Saved HTML and JavaScript must be checked with check_web_syntax when that tool is available; it parses HTML and runs Node.js syntax checks on inline, event-handler, and local JavaScript without executing it. These tools run without network in disposable resource-limited copies. Treat a nonzero exit or ok=false as a real failure and fix it before claiming success. Syntax success does not prove browser behavior is correct, so state that limitation. After editing, briefly summarize changed files; the UI supplies download links automatically."""
 
+READ_ONLY_WORKSPACE_SYSTEM_PROMPT = """A persistent coding workspace is available in read-only review mode. You may list, read, and search files and run the supplied validation tools, but you must not create, edit, replace, or delete files. Report concrete findings with file paths and test evidence. If a change is needed, describe it for the programmer instead of attempting the mutation yourself."""
+
 
 def _function(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
     return {
@@ -130,6 +132,13 @@ LEGACY_PATCH_TOOL_NAMES = {"apply_patch", "apply_patch_batch"}
 WORKSPACE_TOOL_NAMES = {
     item["function"]["name"] for item in [*WORKSPACE_TOOLS, RUN_PYTHON_TOOL, CHECK_WEB_SYNTAX_TOOL]
 } | LEGACY_PATCH_TOOL_NAMES
+READ_ONLY_WORKSPACE_TOOL_NAMES = {
+    "list_files",
+    "read_file",
+    "search_files",
+    "run_python",
+    "check_web_syntax",
+}
 
 
 class WorkspaceError(ValueError):
@@ -179,7 +188,7 @@ class ConversationWorkspace:
             for path in self._files()
         ]
 
-    def tool_definitions(self) -> list[dict[str, Any]]:
+    def tool_definitions(self, access: str = "full") -> list[dict[str, Any]]:
         """Return a byte-stable schema so provider prefix caches stay reusable.
 
         Existing paths are runtime state, not part of a tool's contract.  Putting
@@ -187,7 +196,12 @@ class ConversationWorkspace:
         write, invalidating provider prompt caches.  ``list_files`` remains the
         authoritative way for the model to discover paths.
         """
-        return deepcopy([*WORKSPACE_TOOLS, RUN_PYTHON_TOOL, CHECK_WEB_SYNTAX_TOOL])
+        tools = [*WORKSPACE_TOOLS, RUN_PYTHON_TOOL, CHECK_WEB_SYNTAX_TOOL]
+        if access == "read_only":
+            tools = [item for item in tools if item["function"]["name"] in READ_ONLY_WORKSPACE_TOOL_NAMES]
+        elif access != "full":
+            raise WorkspaceError("无效的工作区访问模式")
+        return deepcopy(tools)
 
     def _read_text(self, path: Any) -> tuple[str, str]:
         target, relative = self.resolve(path)

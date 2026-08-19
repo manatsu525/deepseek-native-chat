@@ -1,6 +1,6 @@
 const $ = (s, root=document) => root.querySelector(s);
 const $$ = (s, root=document) => [...root.querySelectorAll(s)];
-const state = {me:null, providers:[], conversation:null, messages:[], job:null, page:1, pages:1, poll:null, latestConversationId:null, editingProviderId:null, pendingAttachments:[], attachmentDraftId:null, uploadingAttachments:false,retryingAnswer:false,workspaceFiles:[]};
+const state = {me:null, providers:[], conversation:null, messages:[], job:null, page:1, pages:1, poll:null, latestConversationId:null, editingProviderId:null, pendingAttachments:[], attachmentDraftId:null, uploadingAttachments:false,retryingAnswer:false,workspaceFiles:[],chatMode:'standard'};
 const detailState = new Map();
 const nestedScrollState = new Map();
 const MAX_ATTACHMENT_FILES = 10;
@@ -28,6 +28,13 @@ function storeValue(name, value) {
     if (value == null || value === '') localStorage.removeItem(storageKey(name));
     else localStorage.setItem(storageKey(name), String(value));
   } catch {}
+}
+function setChatMode(value,persist=true){
+  const mode=value==='multi_agent'?'multi_agent':'standard';
+  if(state.job&&['queued','running'].includes(state.job.status)){toast('请先停止当前回答再切换模式');return false}
+  state.chatMode=mode;if(persist)storeValue('chat-mode',mode);
+  $$('[data-chat-mode]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.chatMode===mode)));
+  updateProviderUi();return true;
 }
 function browserTimezone(){try{return Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC'}catch{return 'UTC'}}
 function newAttachmentDraftId(){return globalThis.crypto&&globalThis.crypto.randomUUID?globalThis.crypto.randomUUID().replace(/-/g,''):`${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`.padEnd(32,'0').slice(0,32)}
@@ -404,6 +411,23 @@ function workspaceArtifactsHtml(meta={}) {
   return `<div class="message-workspace"><div class="message-workspace-head"><span>工作区文件 · ${files.length}</span><a data-workspace-download href="/api/conversations/${encodeURIComponent(conversationId)}/workspace.zip" target="_blank" rel="noopener">下载全部 ZIP</a></div><div class="message-workspace-files">${links}</div></div>`;
 }
 
+function agentRunsHtml(meta={},active=false,detailKey='trace'){
+  if(meta.chat_mode!=='multi_agent')return '';
+  const agents=Array.isArray(meta.agents)?meta.agents:[];
+  const statusLabels={running:'工作中',completed:'已完成',failed:'失败',stopped:'已停止'};
+  const actionLabels={research:'调研',program:'编程',inspect:'检查',finish:'结束'};
+  const toolLabels={list_files:'列出文件',read_file:'读取文件',write_file:'写入文件',apply_line_edits:'局部修改',apply_patch:'修改文件',apply_patch_batch:'批量修改',search_files:'搜索文件',delete_file:'删除文件',run_python:'运行 Python',check_web_syntax:'检查网页语法',web_search:'联网搜索',fetch_webpage:'读取网页'};
+  const runs=agents.map((agent,index)=>{
+    const status=agent.status||'completed',verdict=String(agent.verdict||'').toUpperCase();
+    const activities=(agent.searches||[]).map(step=>`<span>${escapeHtml(toolLabels[step.tool]||(step.action==='search'?'联网搜索':step.action==='open_page'?'读取网页':'工具'))} · ${escapeHtml(step.status||'完成')}</span>`).join('');
+    const decision=agent.decision_action?`<div class="agent-decision">决策：${escapeHtml(actionLabels[agent.decision_action]||agent.decision_action)}${agent.decision_reason?` · ${escapeHtml(agent.decision_reason)}`:''}</div>`:'';
+    return `<article class="agent-run" data-agent-id="${escapeHtml(agent.id||String(index))}"><div class="agent-run-head"><strong>${escapeHtml(agent.label||agent.role||'Agent')}</strong>${verdict?`<span class="agent-verdict ${verdict.toLowerCase()}">${escapeHtml(verdict)}</span>`:''}<span class="agent-status ${escapeHtml(status)}">${escapeHtml(statusLabels[status]||status)}</span></div>${agent.task?`<p class="agent-task">${escapeHtml(agent.task)}</p>`:''}${decision}${agent.reasoning?`<div class="agent-reasoning" data-scroll-key="${escapeHtml(detailKey)}-agent-${index}-reasoning">${escapeHtml(agent.reasoning)}</div>`:''}${activities?`<div class="agent-activity">${activities}</div>`:''}${agent.answer?`<div class="agent-output" data-scroll-key="${escapeHtml(detailKey)}-agent-${index}-output">${escapeHtml(agent.answer)}</div>`:''}${agent.error?`<div class="agent-error">${escapeHtml(agent.error)}</div>`:''}</article>`;
+  }).join('');
+  const running=agents.find(agent=>agent.status==='running');
+  const summary=running?`${running.label||running.role}正在工作`:(active?'Leader 正在决定下一步':'协作已结束');
+  return `<section class="agent-team"><div class="agent-team-head"><strong>四智能体协作</strong><span>${escapeHtml(summary)}</span></div>${runs?`<div class="agent-runs">${runs}</div>`:'<div class="agent-team-waiting">正在启动 Leader…</div>'}</section>`;
+}
+
 function messageHtml(message, index, live=false, retryable=false) {
   const assistant = message.role === 'assistant';
   const meta = message.meta || {};
@@ -411,11 +435,12 @@ function messageHtml(message, index, live=false, retryable=false) {
   const detailKey = meta.trace_key || `trace-${meta.job_id || `message-${index}`}`;
   const messageAttachments = Array.isArray(meta.attachments) && meta.attachments.length ? `<div class="message-attachments">${attachmentChips(meta.attachments)}</div>` : '';
   const custom = normalizeProviderType(meta.provider_type)==='custom';
-  const assistantName = custom ? 'Custom' : 'DeepSeek';
+  const collaborative=meta.chat_mode==='multi_agent';
+  const assistantName = collaborative ? '协作 Leader' : custom ? 'Custom' : 'DeepSeek';
   return `<article class="message ${assistant ? 'assistant' : 'user'}${live ? ' live-message' : ''}" data-index="${index}">
     <div class="message-icon">${assistant ? (custom ? 'CU' : 'DS') : escapeHtml(((state.me && state.me.username) || 'U')[0].toUpperCase())}</div>
     <div class="message-body"><div class="message-head"><strong>${assistant ? assistantName : escapeHtml((state.me && state.me.username) || '你')}</strong></div>
-    ${assistant ? traceHtml(meta, live, detailKey) : ''}${messageAttachments}<div class="message-content">${assistant ? (content ? markdown(content, detailKey) : live ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div>${assistant ? sourcesHtml(meta,detailKey) : ''}${assistant && !live ? workspaceArtifactsHtml(meta) : ''}${assistant && !live ? usageHtml(meta.usage || {}) : ''}<div class="message-actions"><button type="button" data-action="copy">复制</button>${retryable ? `<button type="button" data-action="retry" ${state.retryingAnswer ? 'disabled' : ''}>重新回答</button>` : ''}</div>
+    ${assistant ? (collaborative ? agentRunsHtml(meta,live,detailKey) : traceHtml(meta, live, detailKey)) : ''}${messageAttachments}<div class="message-content">${assistant ? (content ? markdown(content, detailKey) : live ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div>${assistant ? sourcesHtml(meta,detailKey) : ''}${assistant && !live ? workspaceArtifactsHtml(meta) : ''}${assistant && !live ? usageHtml(meta.usage || {}) : ''}<div class="message-actions"><button type="button" data-action="copy">复制</button>${retryable ? `<button type="button" data-action="retry" ${state.retryingAnswer ? 'disabled' : ''}>重新回答</button>` : ''}</div>
     ${meta.error ? `<p class="job-error">${escapeHtml(meta.error)}</p>` : ''}</div></article>`;
 }
 
@@ -425,7 +450,7 @@ function renderMessages() {
   rememberNestedScroll($('#messages'));
   const items = [...state.messages];
   if (state.job && ['queued','running','failed','stopped'].includes(state.job.status)) {
-    items.push({role:'assistant', content:state.job.answer || '', meta:{job_id:state.job.id,trace_key:state.job.trace_key,conversation_id:state.job.conversation_id||(state.conversation&&state.conversation.id),provider_id:state.job.provider_id,provider_type:state.job.provider_type,model:state.job.model,reasoning:state.job.reasoning,searches:state.job.searches,sources:state.job.sources,usage:state.job.usage,workspace_files:state.job.workspace_files||[],error:state.job.error,stopped:state.job.status==='stopped'}, live:['queued','running'].includes(state.job.status)});
+    items.push({role:'assistant', content:state.job.answer || '', meta:{job_id:state.job.id,trace_key:state.job.trace_key,conversation_id:state.job.conversation_id||(state.conversation&&state.conversation.id),provider_id:state.job.provider_id,provider_type:state.job.provider_type,model:state.job.model,chat_mode:state.job.chat_mode||'standard',agents:state.job.agents||[],reasoning:state.job.reasoning,searches:state.job.searches,sources:state.job.sources,usage:state.job.usage,workspace_files:state.job.workspace_files||[],error:state.job.error,stopped:state.job.status==='stopped'}, live:['queued','running'].includes(state.job.status)});
   }
   const retryBlocked = state.retryingAnswer || (state.job && ['queued','running'].includes(state.job.status));
   $('#welcome').classList.toggle('hidden', items.length > 0);
@@ -447,6 +472,8 @@ function replaceJobMessage(job, liveState) {
       provider_id: job.provider_id,
       provider_type: job.provider_type || (selectedProvider() && selectedProvider().provider_type),
       model: job.model,
+      chat_mode: job.chat_mode || 'standard',
+      agents: job.agents || [],
       reasoning: job.reasoning,
       searches: job.searches,
       sources: job.sources,
@@ -529,17 +556,18 @@ async function retryAnswer(messageIndex,items){
   if(!prompt||!prompt.id){toast('找不到这条消息对应的问题，请刷新后重试');return}
   const provider=selectedProvider();if(!provider){$('#providerModal').showModal();toast('请先添加 API 配置');return}
   const model=selectedModel();if(!model){$('#providerModal').showModal();toast('请先选择模型');return}
+  if(state.chatMode==='multi_agent'&&normalizeProviderType(provider.provider_type)!=='custom'){toast('多智能体协作模式仅支持 Custom 模型');return}
   const conversationId=state.conversation.id;
   const promptMessageId=prompt.id;
   state.retryingAnswer=true;setRunning(false);renderMessages();
   try{
-    const data=await api(`/api/conversations/${encodeURIComponent(conversationId)}/retry`,{method:'POST',body:{prompt_message_id:promptMessageId,provider_id:provider.id,model,effort:$('#effort').value,timezone:browserTimezone()}});
+    const data=await api(`/api/conversations/${encodeURIComponent(conversationId)}/retry`,{method:'POST',body:{prompt_message_id:promptMessageId,provider_id:provider.id,model,effort:$('#effort').value,timezone:browserTimezone(),chat_mode:state.chatMode}});
     if(!state.conversation||String(state.conversation.id)!==String(conversationId)){
       toast('已在原对话中开始重新回答');loadHistory(1);return;
     }
     const promptIndex=state.messages.findIndex(message=>String(message.id)===String(promptMessageId));
     if(promptIndex>=0)state.messages=state.messages.slice(0,promptIndex+1);
-    state.job={id:data.job_id,status:'queued',trace_key:`trace-${data.job_id}`,provider_type:provider.provider_type,provider_id:provider.id,model,answer:'',reasoning:'',searches:[],sources:[],usage:{}};
+    state.job={id:data.job_id,status:'queued',trace_key:`trace-${data.job_id}`,provider_type:provider.provider_type,provider_id:provider.id,model,chat_mode:state.chatMode,agents:[],answer:'',reasoning:'',searches:[],sources:[],usage:{}};
     state.retryingAnswer=false;renderMessages();startPolling(data.job_id);loadHistory(1);
   }catch(err){toast(err.message)}finally{
     if(state.retryingAnswer){state.retryingAnswer=false;setRunning(false);renderMessages()}
@@ -611,15 +639,16 @@ async function submitPrompt(value) {
   const content=rawContent||'请分析这些附件。';
   const provider=selectedProvider(); if(!provider){$('#providerModal').showModal();toast('请先添加 API 配置');return}
   const model=selectedModel(); if(!model){$('#providerModal').showModal();toast('请先选择模型');return}
+  if(state.chatMode==='multi_agent'&&normalizeProviderType(provider.provider_type)!=='custom'){toast('多智能体协作模式仅支持 Custom 模型');return}
   if(state.job && ['queued','running'].includes(state.job.status)){toast('请先停止当前回答');return}
   const pendingSnapshot=state.pendingAttachments.map(item=>({...item}));
   const attachmentIds=pendingSnapshot.map(item=>item.id);
   if(fromComposer){prompt.value='';resizePrompt()}
   const traceKey=`trace-live-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
-  state.messages.push({role:'user',content,meta:{attachments:pendingSnapshot}});state.job={status:'queued',trace_key:traceKey,provider_type:provider.provider_type,provider_id:provider.id,model,answer:'',reasoning:'',searches:[],sources:[],usage:{}};renderMessages();
+  state.messages.push({role:'user',content,meta:{attachments:pendingSnapshot}});state.job={status:'queued',trace_key:traceKey,provider_type:provider.provider_type,provider_id:provider.id,model,chat_mode:state.chatMode,agents:[],answer:'',reasoning:'',searches:[],sources:[],usage:{}};renderMessages();
   $('#chatScroll').scrollTop=$('#chatScroll').scrollHeight;setRunning(true);
   try{
-    const data=await api('/api/chat',{method:'POST',body:{conversation_id:(state.conversation&&state.conversation.id)||null,content,attachment_ids:attachmentIds,provider_id:provider.id,model,effort:$('#effort').value,timezone:browserTimezone()}});
+    const data=await api('/api/chat',{method:'POST',body:{conversation_id:(state.conversation&&state.conversation.id)||null,content,attachment_ids:attachmentIds,provider_id:provider.id,model,effort:$('#effort').value,timezone:browserTimezone(),chat_mode:state.chatMode}});
     if(!state.conversation){state.conversation={id:data.conversation_id,title:content.slice(0,36)};state.workspaceFiles=[];renderWorkspaceState()}
     state.messages[state.messages.length-1].id=data.message_id;
     state.pendingAttachments=[];state.attachmentDraftId=null;storeValue('attachment-draft',null);renderPendingAttachments();setAttachmentStatus('');
@@ -628,7 +657,7 @@ async function submitPrompt(value) {
   }catch(err){state.messages.pop();state.job=null;if(fromComposer){const newerDraft=prompt.value;prompt.value=newerDraft?`${originalPrompt}\n\n${newerDraft}`:originalPrompt;resizePrompt()}setRunning(false);renderMessages();toast(err.message)}
 }
 
-function setRunning(on){const locked=on||state.uploadingAttachments||state.retryingAnswer;$('#stopButton').classList.toggle('hidden',!on);$('#sendButton').disabled=locked;$('#attachButton').disabled=locked;$('#providerSelect').disabled=on||state.retryingAnswer}
+function setRunning(on){const locked=on||state.uploadingAttachments||state.retryingAnswer;$('#stopButton').classList.toggle('hidden',!on);$('#sendButton').disabled=locked;$('#attachButton').disabled=locked;$('#providerSelect').disabled=on||state.retryingAnswer;$$('[data-chat-mode]').forEach(button=>button.disabled=on||state.retryingAnswer)}
 function stopPolling(){if(state.poll)clearTimeout(state.poll);state.poll=null}
 function startPolling(id){
   stopPolling();setRunning(true);
@@ -699,14 +728,17 @@ function selectedWebToolInfo(provider=selectedProvider()){const key=customSettin
 function updateProviderUi(){
   const provider=selectedProvider(), custom=provider&&normalizeProviderType(provider.provider_type)==='custom', customEffort=custom&&customSettings(provider).reasoning_effort_enabled;
   const webInfo=custom?selectedWebToolInfo(provider):null;
+  const collaborative=state.chatMode==='multi_agent';
   $('#customSettingsButton').classList.toggle('hidden',!custom);
   $('#effort').disabled=!!custom&&!customEffort;
   $('#effort').title=custom?(customEffort?'控制发送给 Custom 模型的 reasoning_effort':'Custom 参数中已关闭 reasoning_effort'):'控制 DeepSeek 模型推理投入';
-  $('#nativePill').textContent=custom?`● ${webInfo.label}`:'● Native Web';
-  $('#welcomeOrbitMark').textContent=custom?'CU':'DS';
-  $('#welcomeEyebrow').textContent=custom?'CUSTOM · OPENAI CHAT': 'DEEPSEEK V4 FLASH';
-  $('#welcomeTitle').textContent=custom?'使用 Custom 本地联网':'问点需要查证的问题';
-  $('#welcomeDescription').textContent=custom?`模型通过标准 Chat Completions 调用 ${webInfo.label} 搜索与读取真实来源。`:'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
+  $('#nativePill').textContent=collaborative?(custom?'● 4 Agents':'⚠ 仅 Custom'):custom?`● ${webInfo.label}`:'● Native Web';
+  $('#welcomeOrbitMark').textContent=collaborative?'4A':custom?'CU':'DS';
+  $('#welcomeEyebrow').textContent=collaborative?'LEADER · RESEARCH · CODE · REVIEW':custom?'CUSTOM · OPENAI CHAT': 'DEEPSEEK V4 FLASH';
+  $('#welcomeTitle').textContent=collaborative?'让四个智能体协同完成任务':custom?'使用 Custom 本地联网':'问点需要查证的问题';
+  $('#welcomeDescription').textContent=collaborative?(custom?'Leader 动态决定调研、编程、检查和返修；所有角色使用当前 Custom 模型及共享工作区。':'多智能体协作仅支持 Custom 模型，请先切换下方 API。'):custom?`模型通过标准 Chat Completions 调用 ${webInfo.label} 搜索与读取真实来源。`:'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
+  if($('#statusText'))$('#statusText').textContent=collaborative?(custom?'多智能体协作 · Leader 动态调度':'多智能体协作 · 等待 Custom 模型'):'标准模式 · 外部搜索工具已就绪';
+  if($('#footnote'))$('#footnote').textContent=collaborative?'多智能体协作仅用于 Custom 模型；Leader 决策，调研员按需联网，程序员执行，检查员只读审查并触发返修。':'标准模式：Custom API 使用你选择的搜索与网页抓取方案；DeepSeek 使用服务端原生联网。';
 }
 
 async function loadProviders(){
@@ -819,11 +851,12 @@ async function loadUsers(){const users=await api('/api/users');$('#userList').in
 function resizePrompt(){const p=$('#prompt');p.style.height='auto';p.style.height=Math.min(p.scrollHeight,180)+'px'}
 function openSidebar(){$('#sidebar').classList.add('open')}function closeSidebar(){$('#sidebar').classList.remove('open')}
 
-async function boot(){try{state.me=await api('/api/me');$('#loginView').classList.add('hidden');$('#appView').classList.remove('hidden');$('#accountName').textContent=state.me.username;$('#accountRole').textContent=state.me.is_admin?'管理员':'用户';$('#avatar').textContent=state.me.username[0].toUpperCase();$('#usersButton').classList.toggle('hidden',!state.me.is_admin);const savedEffort=storedValue('reasoning-effort');if(['low','medium','high','xhigh','max'].includes(savedEffort))$('#effort').value=savedEffort;await Promise.all([loadProviders(),loadHistory(1)]);const stored=storedValue('active-conversation');const activeId=stored==='__new__'?null:(stored||state.latestConversationId);const restored=activeId?await openConversation(activeId):false;if(!restored){renderMessages();await loadPendingAttachments()}}catch{$('#loginView').classList.remove('hidden');$('#appView').classList.add('hidden')}}
+async function boot(){try{state.me=await api('/api/me');$('#loginView').classList.add('hidden');$('#appView').classList.remove('hidden');$('#accountName').textContent=state.me.username;$('#accountRole').textContent=state.me.is_admin?'管理员':'用户';$('#avatar').textContent=state.me.username[0].toUpperCase();$('#usersButton').classList.toggle('hidden',!state.me.is_admin);const savedEffort=storedValue('reasoning-effort');if(['low','medium','high','xhigh','max'].includes(savedEffort))$('#effort').value=savedEffort;state.chatMode=storedValue('chat-mode')==='multi_agent'?'multi_agent':'standard';$$('[data-chat-mode]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.chatMode===state.chatMode)));await Promise.all([loadProviders(),loadHistory(1)]);const stored=storedValue('active-conversation');const activeId=stored==='__new__'?null:(stored||state.latestConversationId);const restored=activeId?await openConversation(activeId):false;if(!restored){renderMessages();await loadPendingAttachments()}}catch{$('#loginView').classList.remove('hidden');$('#appView').classList.add('hidden')}}
 
 $('#loginForm').onsubmit=async e=>{e.preventDefault();$('#loginError').textContent='';try{await api('/api/login',{method:'POST',body:{username:$('#loginUser').value,password:$('#loginPass').value}});await boot()}catch(err){$('#loginError').textContent=err.message}};
 $('#logout').onclick=async()=>{await api('/api/logout',{method:'POST'});location.reload()};
 $('#newChat').onclick=()=>{newConversation();closeSidebar()};$('#composer').onsubmit=e=>{e.preventDefault();submitPrompt()};
+$$('[data-chat-mode]').forEach(button=>button.onclick=()=>setChatMode(button.dataset.chatMode));
 $('#workspaceButton').onclick=async()=>{await loadWorkspaceFiles(true);$('#workspaceModal').showModal()};
 $('#clearHistory').onclick=clearAllHistory;
 $('#effort').onchange=()=>storeValue('reasoning-effort',$('#effort').value);

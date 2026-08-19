@@ -78,12 +78,14 @@ class Database:
                     model TEXT NOT NULL,
                     effort TEXT NOT NULL,
                     timezone TEXT NOT NULL DEFAULT 'UTC',
+                    chat_mode TEXT NOT NULL DEFAULT 'standard',
                     status TEXT NOT NULL,
                     answer TEXT NOT NULL DEFAULT '',
                     reasoning TEXT NOT NULL DEFAULT '',
                     searches_json TEXT NOT NULL DEFAULT '[]',
                     sources_json TEXT NOT NULL DEFAULT '[]',
                     usage_json TEXT NOT NULL DEFAULT '{}',
+                    agents_json TEXT NOT NULL DEFAULT '[]',
                     error TEXT NOT NULL DEFAULT '',
                     stop_requested INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL,
@@ -125,6 +127,10 @@ class Database:
                 db.execute("ALTER TABLE jobs ADD COLUMN provider_type TEXT NOT NULL DEFAULT 'deepseek'")
             if "timezone" not in job_columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'")
+            if "chat_mode" not in job_columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN chat_mode TEXT NOT NULL DEFAULT 'standard'")
+            if "agents_json" not in job_columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN agents_json TEXT NOT NULL DEFAULT '[]'")
             # Older releases called the OpenAI-compatible provider "mimo".
             # Keep existing API configurations and job history, but expose the
             # new generic name everywhere after the next startup.
