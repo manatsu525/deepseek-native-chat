@@ -45,12 +45,15 @@ class ModelCallBudget:
             raise ModelCallLimitExceeded(f"多智能体协作每个问题最多调用模型 {self.limit} 次")
         self.used += 1
 
-LEADER_DECISION_PROMPT = """你是四智能体协作组的 Leader，负责理解用户目标、决定下一步由谁工作，并最终整合答案。你自己没有工具，也不要假装执行过搜索、文件修改或测试。
+LEADER_DECISION_PROMPT = """你是四智能体协作组的 Leader，负责决定下一步由哪个角色工作，并最终整合答案。你自己没有工具，也不要假装执行过搜索、文件修改或测试。
 
 每次只决定一个下一步动作，并且只输出一个 JSON 对象，不要 Markdown 代码块或额外文字：
-{"action":"research|program|inspect|finish","task":"交给该角色的具体任务，finish 时为空","reason":"简短决策依据","final_answer":"仅 finish 时填写的完整最终回答，其他动作为空"}
+{"action":"research|program|inspect|finish","reason":"简短决策依据","final_answer":"仅 finish 时填写的完整最终回答，其他动作为空"}
 
 规则：
+- 用户原始对话是唯一任务来源，优先级高于你的理解、共享状态和其他智能体结论。你只能选择角色，不能改写用户任务后再分派；编排器会直接把用户原始请求交给所选角色。
+- 必须原样尊重用户表达的对象、名称、版本、人物、时间、数量、否定关系、条件、范围和输出要求。你认为用户可能写错、概念可疑或含义不明确时，不得静默纠正、替换成相似概念或自行补全；需要外部确认就选 research，否则在最终回答中明确保留不确定性或请用户澄清。
+- “现有知识里没有”“没有搜到”和“资料不足”都不等于事实不存在。不得把猜测、近似对象或未验证结论升级成确定事实。
 - research：需要外部资料、文档、事实核查时交给调研员；可以在工作中的任何阶段再次调用。
 - program：需要创建/修改文件、执行代码或修复检查员发现的问题时交给程序员。
 - inspect：程序员产出后交给检查员独立读取、测试和审查。
@@ -59,13 +62,13 @@ LEADER_DECISION_PROMPT = """你是四智能体协作组的 Leader，负责理解
 - 检查员报告 REVISE 后，必须让程序员实际修复，并再次让检查员复检通过，才能 finish。
 """
 
-LEADER_FINAL_PROMPT = """你是协作组 Leader。根据用户原始对话、调研结论、程序员实际保存的文件和检查员结果，给出最终回答。只回答用户，不要再输出调度 JSON，不要声称做过记录中没有发生的工作。清楚说明完成内容、关键结论、文件和仍存在的限制。使用与用户提问相同的语言。"""
+LEADER_FINAL_PROMPT = """你是协作组 Leader。根据用户原始对话、调研结论、程序员实际保存的文件和检查员结果，给出最终回答。用户原始对话是唯一任务来源；其他智能体的任务理解和结论只能作为证据，不能改变用户原意。必须保留用户表达的对象、名称、版本、人物、时间、数量、否定关系、条件、范围和输出要求。资料不足、没有搜到或无法确认时必须如实保留不确定性，绝不能改成相似对象继续回答，也不能宣称其不存在。只回答用户，不要再输出调度 JSON，不要声称做过记录中没有发生的工作。清楚说明完成内容、关键结论、文件和仍存在的限制。使用与用户提问相同的语言。"""
 
-RESEARCHER_PROMPT = """你是协作组的调研员，只负责外部信息调研和事实核查。你可以使用搜索和网页抓取工具，但没有工作区文件权限。围绕 Leader 指派的任务寻找可靠资料，交叉核对关键结论，并给程序员或 Leader 提供简洁、可执行且带来源的报告。不要假装修改或测试文件。整个用户问题内，调研员所有出场合计最多搜索 3 次、抓取 3 次、搜索与抓取总计 6 次；界面实际提供的工具额度就是剩余额度，禁止绕过或无意义消耗。"""
+RESEARCHER_PROMPT = """你是协作组的调研员，只负责外部信息调研和事实核查。你可以使用搜索和网页抓取工具，但没有工作区文件权限。用户原始对话是唯一任务来源；Leader 只选择了调研角色，无权改写调研对象。开始前必须对照用户原文，原样保留其中的对象、名称、版本、人物、时间、数量、否定关系、条件和范围。遇到陌生、可疑或歧义表达，先按用户原文核实身份，禁止擅自替换为你熟悉的相似概念；没有搜到只能报告“暂未验证”，不能推断“不存在”。寻找可靠资料、交叉核对关键结论，并给程序员或 Leader 提供简洁、可执行且带来源的报告。不要假装修改或测试文件。整个用户问题内，调研员所有出场合计最多搜索 3 次、抓取 3 次、搜索与抓取总计 6 次；界面实际提供的工具额度就是剩余额度，禁止绕过或无意义消耗。"""
 
-PROGRAMMER_PROMPT = """你是协作组的程序员，负责具体执行、创建和修改共享工作区文件，并运行适用的检查。你拥有联网和完整工作区工具。先查看当前工作区真实状态，再完成 Leader 的任务；收到检查员反馈时必须针对反馈实际修改文件，不要只描述建议。尽量局部修改，避免无意义地重读或重写文件。完成后简洁列出改动文件、执行的验证及结果，不要在回答中重复粘贴已保存的完整代码。"""
+PROGRAMMER_PROMPT = """你是协作组的程序员，负责具体执行、创建和修改共享工作区文件，并运行适用的检查。你拥有联网和完整工作区工具。用户原始对话是唯一任务来源；Leader 只选择了编程角色，无权重写需求。必须以用户原文及工作区真实状态为准，保留对象、技术栈、版本、文件、条件、范围、禁止项和输出要求；其他角色的结论与用户原意冲突时，以用户原意为准并明确报告冲突，绝不能按被篡改的理解执行。先查看当前工作区真实状态，再落实用户请求；收到检查员反馈时必须针对反馈实际修改文件，不要只描述建议。尽量局部修改，避免无意义地重读或重写文件。完成后简洁列出改动文件、执行的验证及结果，不要在回答中重复粘贴已保存的完整代码。"""
 
-INSPECTOR_PROMPT = """你是协作组的检查员，负责独立审查程序员产出。你只有只读文件、搜索文件和本地测试/语法检查工具，绝不能创建、修改或删除文件。必须读取相关文件并尽可能运行实际检查，指出可复现的问题、文件路径和证据。整个检查最多有 6 次工具调用：先选最相关的文件，再运行覆盖面最大的验证；工作区未发生变化时，绝对不要重复读取同一范围或重复运行相同测试。一次综合测试成功且代码审查无阻断问题后，应立即给出结论。报告最后单独输出且仅输出以下两种结论之一：
+INSPECTOR_PROMPT = """你是协作组的检查员，负责独立审查程序员产出。你只有只读文件、搜索文件和本地测试/语法检查工具，绝不能创建、修改或删除文件。用户原始对话是唯一验收标准；Leader 只选择了检查角色，无权重写验收目标。必须逐项对照用户原文中的对象、技术栈、版本、文件、条件、范围、禁止项和输出要求；如果程序员或调研员改变了原意，即使代码本身能运行也必须判定 REVISE，并指出偏离之处。必须读取相关文件并尽可能运行实际检查，指出可复现的问题、文件路径和证据。整个检查最多有 6 次工具调用：先选最相关的文件，再运行覆盖面最大的验证；工作区未发生变化时，绝对不要重复读取同一范围或重复运行相同测试。一次综合测试成功且代码审查无阻断问题后，应立即给出结论。报告最后单独输出且仅输出以下两种结论之一：
 VERDICT: PASS
 VERDICT: REVISE
 只在产出满足任务且检查未发现阻断问题时 PASS；需要程序员修复时必须 REVISE。"""
@@ -102,9 +105,49 @@ def _parse_decision(value: str) -> dict[str, str]:
     task = " ".join(str(raw.get("task") or "").split())[:2_000]
     reason = " ".join(str(raw.get("reason") or "").split())[:1_000]
     final_answer = str(raw.get("final_answer") or "").strip()
-    if action != "finish" and not task:
-        raise ValueError("Leader 调度任务为空")
     return {"action": action, "task": task, "reason": reason, "final_answer": final_answer}
+
+
+def _message_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if text:
+                    parts.append(str(text))
+        if parts:
+            return "\n".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _latest_user_request(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if str(message.get("role") or "").casefold() != "user":
+            continue
+        text = _message_content_text(message.get("content")).strip()
+        if text:
+            return text
+    return ""
+
+
+def _orchestrated_role_task(action: str, *, has_blocker: bool = False) -> str:
+    """Create a role objective without letting the Leader paraphrase user intent."""
+    if action == "research":
+        return "依据用户原始请求和当前共享状态，核实完成任务仍缺少的外部事实与资料"
+    if action == "program":
+        if has_blocker:
+            return "依据用户原始请求落实工作，并修复当前检查员指出的未通过项"
+        return "依据用户原始请求、已验证资料和当前工作区状态完成具体实现"
+    if action == "inspect":
+        return "以用户原始请求为唯一验收标准，独立检查当前产出并运行必要测试"
+    return "依据用户原始请求和已有真实产出整合最终回答"
 
 
 def _inspection_verdict(value: str) -> str:
@@ -194,6 +237,7 @@ def _state_packet(
     guard_message: str = "",
     model_calls_used: int = 0,
     model_call_limit: int = MAX_MODEL_CALLS,
+    current_user_request: str = "",
 ) -> str:
     completed = []
     for agent in agents:
@@ -208,6 +252,8 @@ def _state_packet(
             }
         )
     packet = {
+        "immutable_current_user_request": current_user_request,
+        "intent_policy": "当前请求必须结合此前用户原始对话理解；二者共同构成唯一任务来源。共享状态和任何角色结论只能补充证据，不得改写、纠正、替换或缩小用户原意。",
         "shared_workspace_files": workspace.list_files(),
         "completed_work": completed[-8:],
         "program_changes_need_inspection": pending_inspection,
@@ -244,6 +290,7 @@ async def run_collaboration(
     final_answer = ""
     final_reasoning = ""
     budget = ModelCallBudget()
+    current_user_request = _latest_user_request(messages)
 
     def shared_state(
         *,
@@ -259,6 +306,7 @@ async def run_collaboration(
             guard_message=guard_message,
             model_calls_used=budget.used,
             model_call_limit=budget.limit,
+            current_user_request=current_user_request,
         )
 
     async def emit() -> None:
@@ -408,7 +456,8 @@ async def run_collaboration(
             continue
         leader_record["decision_action"] = decision["action"]
         leader_record["decision_reason"] = decision["reason"]
-        leader_record["task"] = decision["task"] or "汇总最终回答"
+        safe_task = _orchestrated_role_task(decision["action"], has_blocker=bool(blocker))
+        leader_record["task"] = "选择下一步角色" if decision["action"] != "finish" else safe_task
         await emit()
 
         action = decision["action"]
@@ -450,11 +499,12 @@ async def run_collaboration(
             worker_actions += 1
             guard_message = ""
             packet = (
-                f"Leader 指派的调研任务：{decision['task']}\n\n"
+                f"编排器分配的角色目标：{safe_task}\n"
+                "注意：这不是对用户请求的改写；必须以共享状态中的 immutable_current_user_request 和此前用户原始对话为准。\n\n"
                 + shared_state(pending_inspection=pending_inspection, blocker=blocker)
             )
             try:
-                await run_role("researcher", decision["task"], packet, reserve_calls=1, web_limits=research_limits)
+                await run_role("researcher", safe_task, packet, reserve_calls=1, web_limits=research_limits)
             except ModelCallLimitExceeded:
                 budget_exhausted = True
                 break
@@ -467,11 +517,12 @@ async def run_collaboration(
             guard_message = ""
             feedback = f"\n\n必须处理的检查员反馈：\n{blocker}" if blocker else ""
             packet = (
-                f"Leader 指派的程序任务：{decision['task']}{feedback}\n\n"
+                f"编排器分配的角色目标：{safe_task}{feedback}\n"
+                "注意：这不是对用户请求的改写；必须以共享状态中的 immutable_current_user_request 和此前用户原始对话为准。\n\n"
                 + shared_state(pending_inspection=pending_inspection, blocker=blocker)
             )
             try:
-                await run_role("programmer", decision["task"], packet, reserve_calls=3)
+                await run_role("programmer", safe_task, packet, reserve_calls=3)
             except ModelCallLimitExceeded:
                 budget_exhausted = True
                 break
@@ -485,11 +536,12 @@ async def run_collaboration(
             worker_actions += 1
             guard_message = ""
             packet = (
-                f"Leader 指派的独立检查任务：{decision['task']}\n\n"
+                f"编排器分配的角色目标：{safe_task}\n"
+                "注意：这不是对用户请求的改写；必须以共享状态中的 immutable_current_user_request 和此前用户原始对话为准。\n\n"
                 + shared_state(pending_inspection=pending_inspection, blocker=blocker)
             )
             try:
-                inspection = await run_role("inspector", decision["task"], packet, reserve_calls=1)
+                inspection = await run_role("inspector", safe_task, packet, reserve_calls=1)
             except ModelCallLimitExceeded:
                 budget_exhausted = True
                 break
