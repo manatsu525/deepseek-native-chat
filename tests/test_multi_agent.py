@@ -183,7 +183,12 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
         inspector_calls = [item for item in calls if item["system_addendum"] == INSPECTOR_PROMPT]
         self.assertTrue(all(not item["web_enabled"] and item["workspace_access"] == "read_only" for item in inspector_calls))
         programmer_calls = [item for item in calls if item["system_addendum"] == PROGRAMMER_PROMPT]
-        self.assertTrue(all(item["web_enabled"] and item["workspace_access"] == "full" for item in programmer_calls))
+        self.assertTrue(all(not item["web_enabled"] and item["workspace_access"] == "edit" for item in programmer_calls))
+        edit_tool_names = {item["function"]["name"] for item in workspace.tool_definitions("edit")}
+        self.assertIn("write_file", edit_tool_names)
+        self.assertIn("apply_line_edits", edit_tool_names)
+        self.assertNotIn("run_python", edit_tool_names)
+        self.assertNotIn("check_web_syntax", edit_tool_names)
 
     async def test_finish_is_rejected_until_program_changes_are_inspected(self) -> None:
         temporary = tempfile.TemporaryDirectory()

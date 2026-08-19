@@ -65,6 +65,8 @@ from .inkling_tool_compat import (
 )
 from .reasoning_effort import normalize as normalize_reasoning_effort
 from .workspace import (
+    EDIT_WORKSPACE_SYSTEM_PROMPT,
+    EDIT_WORKSPACE_TOOL_NAMES,
     READ_ONLY_WORKSPACE_SYSTEM_PROMPT,
     READ_ONLY_WORKSPACE_TOOL_NAMES,
     WORKSPACE_SYSTEM_PROMPT,
@@ -412,7 +414,13 @@ async def stream_response(
         model,
     )
     if workspace is not None and workspace_access != "none":
-        workspace_prompt = READ_ONLY_WORKSPACE_SYSTEM_PROMPT if workspace_access == "read_only" else WORKSPACE_SYSTEM_PROMPT
+        workspace_prompt = (
+            READ_ONLY_WORKSPACE_SYSTEM_PROMPT
+            if workspace_access == "read_only"
+            else EDIT_WORKSPACE_SYSTEM_PROMPT
+            if workspace_access == "edit"
+            else WORKSPACE_SYSTEM_PROMPT
+        )
         system_prompt = f"{system_prompt}\n\n{workspace_prompt}"
     if system_addendum.strip():
         system_prompt = f"{system_prompt}\n\n{system_addendum.strip()}"
@@ -437,6 +445,9 @@ async def stream_response(
     force_final_answer = False
     workspace_reads: set[tuple[str, int, int | None]] = set()
     workspace_searches: set[str] = set()
+    workspace_validations: set[tuple[int, str]] = set()
+    workspace_list_generations: set[int] = set()
+    workspace_generation = 0
     parallel_session_id = (f"conversation_{conversation_id}" if conversation_id else f"response_{uuid.uuid4().hex}")[:100]
     last_search_objective = ""
     last_search_queries: list[str] = []
@@ -456,7 +467,11 @@ async def stream_response(
     keyless_context = KeylessWebProvider(web_tool_backend) if web_enabled and keyless_mode else _AsyncNullContext()
     tools_expected = web_enabled or (workspace is not None and workspace_access != "none")
     allowed_workspace_tools = (
-        READ_ONLY_WORKSPACE_TOOL_NAMES if workspace_access == "read_only" else WORKSPACE_TOOL_NAMES
+        READ_ONLY_WORKSPACE_TOOL_NAMES
+        if workspace_access == "read_only"
+        else EDIT_WORKSPACE_TOOL_NAMES
+        if workspace_access == "edit"
+        else WORKSPACE_TOOL_NAMES
     )
     role_tool_round_limit = max(0, min(MAX_AGENT_TOOL_ROUNDS, int(max_tool_rounds)))
     search_limit = max(0, min(MIMO_MAX_SEARCHES, int(web_search_limit)))
@@ -785,7 +800,24 @@ async def stream_response(
                         int(arguments.get("start_line", 1) or 1),
                         int(arguments["end_line"]) if arguments.get("end_line") is not None else None,
                     )
-                    if workspace_name == "read_file" and read_key in workspace_reads:
+                    workspace_call_skipped = False
+                    validation_key = json.dumps(
+                        [workspace_name, normalized_path, arguments.get("arguments") or []],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    if workspace_name == "list_files" and workspace_generation in workspace_list_generations:
+                        workspace_call_skipped = True
+                        result_text = json.dumps(
+                            {
+                                "ok": True,
+                                "unchanged": True,
+                                "message": "工作区自上次列出后未改变；请使用已有文件列表继续。",
+                            },
+                            ensure_ascii=False,
+                        )
+                    elif workspace_name == "read_file" and read_key in workspace_reads:
+                        workspace_call_skipped = True
                         result_text = json.dumps(
                             {
                                 "ok": True,
@@ -802,6 +834,7 @@ async def stream_response(
                             separators=(",", ":"),
                         )
                         if search_key in workspace_searches:
+                            workspace_call_skipped = True
                             result_text = json.dumps(
                                 {
                                     "ok": True,
@@ -813,13 +846,32 @@ async def stream_response(
                         else:
                             workspace_searches.add(search_key)
                             result_text = await asyncio.to_thread(workspace.execute, workspace_name, arguments)
+                    elif (
+                        workspace_name in {"run_python", "check_web_syntax"}
+                        and (workspace_generation, validation_key) in workspace_validations
+                    ):
+                        workspace_call_skipped = True
+                        result_text = json.dumps(
+                            {
+                                "skipped": True,
+                                "unchanged": True,
+                                "message": "工作区自上次相同验证后未修改；不重复运行，之前的成功或失败结果仍然有效。请使用已有结果继续修改或回答用户。",
+                            },
+                            ensure_ascii=False,
+                        )
                     else:
                         result_text = await asyncio.to_thread(workspace.execute, workspace_name, arguments)
-                        if workspace_name == "read_file":
+                        if workspace_name == "list_files":
+                            workspace_list_generations.add(workspace_generation)
+                        elif workspace_name == "read_file":
                             workspace_reads.add(read_key)
+                        elif workspace_name in {"run_python", "check_web_syntax"}:
+                            workspace_validations.add((workspace_generation, validation_key))
                         elif workspace_name in WORKSPACE_MUTATION_TOOLS:
+                            workspace_generation += 1
                             workspace_reads = {item for item in workspace_reads if item[0] != normalized_path}
-                    step["status"] = "completed"
+                            workspace_searches.clear()
+                    step["status"] = "skipped" if workspace_call_skipped else "completed"
                 elif is_search:
                     if parallel_mode:
                         objective = " ".join(str(arguments.get("objective") or "").split())[:1000]

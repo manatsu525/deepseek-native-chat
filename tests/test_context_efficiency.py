@@ -4,13 +4,16 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app import workspace as workspace_module
 from app.mimo import custom_auth_headers
+from app import mimo_local
 from app.mimo_local import (
     AGENT_CONTEXT_COMPACT_THRESHOLD,
     _compact_workspace_call_arguments,
     _maybe_compact_agent_context,
+    stream_response,
 )
 from app.workspace import ConversationWorkspace
 
@@ -119,6 +122,107 @@ class ContextEfficiencyTests(unittest.TestCase):
                 self.assertEqual(checkpoint["workspace_files"][0]["path"], "app.py")
             finally:
                 workspace_module.WORKSPACES_DIR = original
+
+
+class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_identical_validation_is_skipped_until_workspace_changes(self) -> None:
+        class CountingWorkspace(ConversationWorkspace):
+            validation_runs = 0
+
+            def execute(self, name: str, arguments: dict) -> str:
+                if name == "run_python":
+                    self.validation_runs += 1
+                    return json.dumps({"ok": True, "stdout": "ok\n"})
+                return super().execute(name, arguments)
+
+        def tool_response(call_id: str, name: str, arguments: dict) -> list[str]:
+            event = {
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": json.dumps(arguments)},
+                        }]
+                    }
+                }]
+            }
+            return ["data: " + json.dumps(event), "data: [DONE]"]
+
+        class FakeResponse:
+            status_code = 200
+
+            def __init__(self, lines: list[str]) -> None:
+                self.lines = lines
+
+            async def aiter_lines(self):
+                for line in self.lines:
+                    yield line
+
+            async def aread(self) -> bytes:
+                return b""
+
+        class FakeStreamContext:
+            def __init__(self, lines: list[str]) -> None:
+                self.response = FakeResponse(lines)
+
+            async def __aenter__(self):
+                return self.response
+
+            async def __aexit__(self, *_):
+                return False
+
+        responses = [
+            tool_response("run-1", "run_python", {"path": "app.py"}),
+            tool_response("run-2", "run_python", {"path": "app.py"}),
+            tool_response("write-1", "write_file", {"path": "app.py", "content": "print('changed')\n"}),
+            tool_response("run-3", "run_python", {"path": "app.py"}),
+            ["data: " + json.dumps({"choices": [{"delta": {"content": "完成"}}]}), "data: [DONE]"],
+        ]
+
+        class FakeAsyncClient:
+            def __init__(self, **_):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            def stream(self, *_args, **_kwargs):
+                return FakeStreamContext(responses.pop(0))
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = CountingWorkspace(1, "loop-guard")
+            workspace.root = Path(directory)
+            workspace.write_file("app.py", "print('ok')\n")
+
+            async def update(_):
+                return None
+
+            with patch.object(mimo_local.httpx, "AsyncClient", FakeAsyncClient):
+                result = await stream_response(
+                    base_url="https://example.test/v1",
+                    api_key="test-key",
+                    model="test-model",
+                    messages=[{"role": "user", "content": "修改并检查代码"}],
+                    timeout=30,
+                    stopped=lambda: False,
+                    update=update,
+                    settings={"thinking": "disabled", "max_completion_tokens": 1024},
+                    conversation_id="loop-guard",
+                    workspace=workspace,
+                    web_enabled=False,
+                )
+
+        self.assertEqual(result["answer"], "完成")
+        self.assertEqual(workspace.validation_runs, 2)
+        self.assertEqual(
+            [(item["name"], item["status"]) for item in result["tool_trace"]],
+            [("run_python", "completed"), ("run_python", "skipped"), ("write_file", "completed"), ("run_python", "completed")],
+        )
 
 
 if __name__ == "__main__":

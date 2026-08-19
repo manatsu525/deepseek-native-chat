@@ -82,6 +82,16 @@ class WorkspaceTests(unittest.TestCase):
             if path_schema:
                 self.assertNotIn("enum", path_schema)
 
+    def test_edit_access_can_modify_but_cannot_run_validation(self) -> None:
+        names = {item["function"]["name"] for item in self.workspace.tool_definitions("edit")}
+        self.assertIn("list_files", names)
+        self.assertIn("read_file", names)
+        self.assertIn("search_files", names)
+        self.assertIn("write_file", names)
+        self.assertIn("apply_line_edits", names)
+        self.assertNotIn("run_python", names)
+        self.assertNotIn("check_web_syntax", names)
+
     def test_revisioned_line_edits_are_atomic_and_do_not_match_old_text(self) -> None:
         self.workspace.write_file("app.js", "one\ntwo\nthree\nfour\n")
         snapshot = self.workspace.read_snapshot("app.js")
