@@ -28,13 +28,13 @@ ROLE_LABELS = {
 LEADER_DECISION_PROMPT = """你是四智能体协作组的 Leader，负责理解用户目标、决定下一步由谁工作，并最终整合答案。你自己没有工具，也不要假装执行过搜索、文件修改或测试。
 
 每次只决定一个下一步动作，并且只输出一个 JSON 对象，不要 Markdown 代码块或额外文字：
-{"action":"research|program|inspect|finish","task":"交给该角色的具体任务，finish 时为空","reason":"简短决策依据"}
+{"action":"research|program|inspect|finish","task":"交给该角色的具体任务，finish 时为空","reason":"简短决策依据","final_answer":"仅 finish 时填写的完整最终回答，其他动作为空"}
 
 规则：
 - research：需要外部资料、文档、事实核查时交给调研员；可以在工作中的任何阶段再次调用。
 - program：需要创建/修改文件、执行代码或修复检查员发现的问题时交给程序员。
 - inspect：程序员产出后交给检查员独立读取、测试和审查。
-- finish：证据和产出已经足够且没有待修复或待复检的问题时结束。
+- finish：证据和产出已经足够且没有待修复或待复检的问题时结束；必须同时在 final_answer 中直接写好给用户的完整回答，以免再调用一次模型。
 - 不要为了凑齐角色而调用不需要的智能体，也不要机械串联；根据共享状态作真实决策。
 - 检查员报告 REVISE 后，必须让程序员实际修复，并再次让检查员复检通过，才能 finish。
 """
@@ -45,7 +45,7 @@ RESEARCHER_PROMPT = """你是协作组的调研员，只负责外部信息调研
 
 PROGRAMMER_PROMPT = """你是协作组的程序员，负责具体执行、创建和修改共享工作区文件，并运行适用的检查。你拥有联网和完整工作区工具。先查看当前工作区真实状态，再完成 Leader 的任务；收到检查员反馈时必须针对反馈实际修改文件，不要只描述建议。尽量局部修改，避免无意义地重读或重写文件。完成后简洁列出改动文件、执行的验证及结果，不要在回答中重复粘贴已保存的完整代码。"""
 
-INSPECTOR_PROMPT = """你是协作组的检查员，负责独立审查程序员产出。你只有只读文件、搜索文件和本地测试/语法检查工具，绝不能创建、修改或删除文件。必须读取相关文件并尽可能运行实际检查，指出可复现的问题、文件路径和证据。报告最后单独输出且仅输出以下两种结论之一：
+INSPECTOR_PROMPT = """你是协作组的检查员，负责独立审查程序员产出。你只有只读文件、搜索文件和本地测试/语法检查工具，绝不能创建、修改或删除文件。必须读取相关文件并尽可能运行实际检查，指出可复现的问题、文件路径和证据。整个检查最多有 6 次工具调用：先选最相关的文件，再运行覆盖面最大的验证；工作区未发生变化时，绝对不要重复读取同一范围或重复运行相同测试。一次综合测试成功且代码审查无阻断问题后，应立即给出结论。报告最后单独输出且仅输出以下两种结论之一：
 VERDICT: PASS
 VERDICT: REVISE
 只在产出满足任务且检查未发现阻断问题时 PASS；需要程序员修复时必须 REVISE。"""
@@ -81,9 +81,10 @@ def _parse_decision(value: str) -> dict[str, str]:
         raise ValueError(f"Leader 返回了无效动作：{action or '空'}")
     task = " ".join(str(raw.get("task") or "").split())[:2_000]
     reason = " ".join(str(raw.get("reason") or "").split())[:1_000]
+    final_answer = str(raw.get("final_answer") or "").strip()
     if action != "finish" and not task:
         raise ValueError("Leader 调度任务为空")
-    return {"action": action, "task": task, "reason": reason}
+    return {"action": action, "task": task, "reason": reason, "final_answer": final_answer}
 
 
 def _inspection_verdict(value: str) -> str:
@@ -227,6 +228,7 @@ async def run_collaboration(
             "inspector": (False, "read_only", INSPECTOR_PROMPT),
         }
         web_enabled, workspace_access, system_prompt = capabilities[role]
+        tool_round_limits = {"leader": 0, "researcher": 6, "programmer": 12, "inspector": 6}
         record: dict[str, Any] = {
             "id": f"agent-{len(agents) + 1}",
             "role": role,
@@ -269,6 +271,7 @@ async def run_collaboration(
                 web_enabled=web_enabled,
                 workspace_access=workspace_access,
                 system_addendum=system_prompt,
+                max_tool_rounds=tool_round_limits[role],
             )
         except asyncio.CancelledError:
             record["status"] = "stopped"
@@ -328,17 +331,11 @@ async def run_collaboration(
             if pending_inspection or blocker:
                 guard_message = "存在尚未通过检查的程序改动或待修复问题，不能结束。请安排程序员修复或检查员复检。"
                 continue
-            final_packet = _state_packet(
-                agents,
-                workspace,
-                pending_inspection=False,
-                blocker="",
-            ) + "\n\n协作已完成。现在向用户给出最终答案。"
-            final_result = await run_role("leader", "整合并回答用户", final_packet, phase="final")
-            final_answer = str(final_result.get("answer") or "").strip()
-            final_reasoning = str(final_result.get("reasoning") or "")
+            final_answer = decision["final_answer"]
+            final_reasoning = str(leader_record.get("reasoning") or "")
             if not final_answer:
-                raise RuntimeError("Leader 未生成最终回答")
+                guard_message = "finish 缺少必填的 final_answer，不能结束。请重新返回 finish JSON，并直接写好给用户的完整最终回答。"
+                continue
             await emit()
             break
 

@@ -363,6 +363,7 @@ async def stream_response(
     web_enabled: bool = True,
     workspace_access: str = "full",
     system_addendum: str = "",
+    max_tool_rounds: int = MAX_AGENT_TOOL_ROUNDS,
 ) -> dict[str, Any]:
     """Run a custom OpenAI-compatible model with local web tools.
 
@@ -450,6 +451,7 @@ async def stream_response(
     allowed_workspace_tools = (
         READ_ONLY_WORKSPACE_TOOL_NAMES if workspace_access == "read_only" else WORKSPACE_TOOL_NAMES
     )
+    role_tool_round_limit = max(0, min(MAX_AGENT_TOOL_ROUNDS, int(max_tool_rounds)))
     async with (
         httpx.AsyncClient(timeout=api_limits) as api_client,
         search_context as search_client,
@@ -461,13 +463,13 @@ async def stream_response(
         # may use more rounds because multi-file edits commonly require several
         # reads and patches. Two answer-only attempts remain reserved after all
         # tools have been removed.
-        for round_number in range(MAX_AGENT_TOOL_ROUNDS + FINAL_ANSWER_ATTEMPTS):
+        for round_number in range(role_tool_round_limit + FINAL_ANSWER_ATTEMPTS):
             if stopped():
                 raise asyncio.CancelledError
             round_tools: list[dict[str, Any]] = []
             inkling_patch_bindings: dict[str, tuple[str, str]] = {}
             if not force_final_answer:
-                if web_enabled and tool_rounds_used < MIMO_MAX_TOOL_ROUNDS and search_count < MIMO_MAX_SEARCHES:
+                if web_enabled and tool_rounds_used < min(MIMO_MAX_TOOL_ROUNDS, role_tool_round_limit) and search_count < MIMO_MAX_SEARCHES:
                     if parallel_mode:
                         round_tools.append(PARALLEL_SEARCH_WEB_TOOL)
                     elif legacy_mode:
@@ -477,14 +479,14 @@ async def stream_response(
                 # Keep the initial web-tool schema stable. Public URL safety is
                 # enforced by fetch_webpage itself, so it need not appear only
                 # after the first search result changes runtime state.
-                if web_enabled and tool_rounds_used < MIMO_MAX_TOOL_ROUNDS:
+                if web_enabled and tool_rounds_used < min(MIMO_MAX_TOOL_ROUNDS, role_tool_round_limit):
                     if parallel_mode:
                         round_tools.append(PARALLEL_FETCH_WEBPAGE_TOOL)
                     elif legacy_mode:
                         round_tools.append(FETCH_WEBPAGE_TOOL)
                     else:
                         round_tools.append(KEYLESS_FETCH_WEBPAGE_TOOL)
-                if workspace is not None and workspace_access != "none" and tool_rounds_used < MAX_AGENT_TOOL_ROUNDS:
+                if workspace is not None and workspace_access != "none" and tool_rounds_used < role_tool_round_limit:
                     round_tools.extend(workspace.tool_definitions(workspace_access))
                     if inkling_compat_active:
                         round_tools, inkling_patch_bindings = bind_inkling_patch_tools(

@@ -43,7 +43,7 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
                 '{"action":"research","task":"核对正确算法","reason":"修复前需要资料"}',
                 '{"action":"program","task":"按检查意见修复","reason":"存在阻断问题"}',
                 '{"action":"inspect","task":"复检修复结果","reason":"确认问题已解决"}',
-                '{"action":"finish","task":"","reason":"复检通过"}',
+                '{"action":"finish","task":"","reason":"复检通过","final_answer":"程序已经修复并通过检查，可下载 app.py。"}',
             ]
         )
         calls: list[dict[str, Any]] = []
@@ -82,7 +82,7 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
                     searches=[{"id": "s1", "action": "search", "status": "completed", "query": "algorithm"}],
                 )
             if prompt == LEADER_FINAL_PROMPT:
-                return result("程序已经修复并通过检查，可下载 app.py。")
+                raise AssertionError("normal finish must not require another model call")
             raise AssertionError("unexpected role prompt")
 
         updates: list[dict[str, Any]] = []
@@ -136,9 +136,9 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
         decisions = iter(
             [
                 '{"action":"program","task":"写文件","reason":"执行"}',
-                '{"action":"finish","task":"","reason":"想直接结束"}',
+                '{"action":"finish","task":"","reason":"想直接结束","final_answer":"不应被采用"}',
                 '{"action":"inspect","task":"检查文件","reason":"需要复检"}',
-                '{"action":"finish","task":"","reason":"已经通过"}',
+                '{"action":"finish","task":"","reason":"已经通过","final_answer":"最终完成"}',
             ]
         )
         prompts: list[str] = []
@@ -154,7 +154,7 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
             if prompt == INSPECTOR_PROMPT:
                 return result("检查通过。\nVERDICT: PASS")
             if prompt == LEADER_FINAL_PROMPT:
-                return result("最终完成")
+                raise AssertionError("normal finish must not require another model call")
             raise AssertionError("unexpected role")
 
         async def update(_: dict[str, Any]) -> None:
@@ -176,8 +176,8 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
             streamer=fake_streamer,
         )
         self.assertEqual(final["answer"], "最终完成")
-        self.assertEqual(prompts.count(LEADER_FINAL_PROMPT), 1)
-        self.assertLess(prompts.index(INSPECTOR_PROMPT), prompts.index(LEADER_FINAL_PROMPT))
+        self.assertEqual(prompts.count(LEADER_FINAL_PROMPT), 0)
+        self.assertLess(prompts.index(INSPECTOR_PROMPT), len(prompts))
 
     def test_decision_parser_accepts_fenced_json(self) -> None:
         decision = _parse_decision('```json\n{"action":"research","task":"查文档","reason":"需要依据"}\n```')
