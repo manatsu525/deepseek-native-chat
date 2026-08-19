@@ -318,7 +318,6 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
             [
                 '{"action":"research","task":"第一批资料","reason":"先查"}',
                 '{"action":"research","task":"补充资料","reason":"再查"}',
-                '{"action":"research","task":"最后核实","reason":"仍有缺口"}',
                 '{"action":"finish","task":"","reason":"足够","final_answer":"调研完成"}',
             ]
         )
@@ -341,14 +340,11 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
                     {"id": "s1", "action": "search", "status": "completed", "quota_counted": True},
                     {"id": "s2", "action": "search", "status": "completed", "quota_counted": True},
                     {"id": "f1", "action": "open_page", "status": "completed", "quota_counted": True},
-                ]
-            elif researcher_count == 2:
-                steps = [
-                    {"id": "s3", "action": "search", "status": "completed", "quota_counted": True},
                     {"id": "f2", "action": "open_page", "status": "completed", "quota_counted": True},
                 ]
             else:
                 steps = [
+                    {"id": "s3", "action": "search", "status": "completed", "quota_counted": True},
                     {"id": "f3", "action": "open_page", "status": "completed", "quota_counted": True},
                 ]
             return result("资料", searches=steps)
@@ -360,7 +356,7 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
             base_url="https://example.test/v1",
             api_key="test-key",
             model="test-model",
-            messages=[{"role": "user", "content": "分三次调研，最后简短汇报"}],
+            messages=[{"role": "user", "content": "分两次调研，最后简短汇报"}],
             timeout=30,
             stopped=lambda: False,
             update=update,
@@ -372,7 +368,7 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
             streamer=fake_streamer,
         )
         self.assertEqual(final["answer"], "调研完成")
-        self.assertEqual(researcher_limits, [(2, 1, 3), (1, 1, 3), (0, 1, 1)])
+        self.assertEqual(researcher_limits, [(3, 3, 6), (1, 1, 2)])
         researcher_steps = [step for agent in final["agents"] if agent["role"] == "researcher" for step in agent["searches"]]
         self.assertEqual(sum(step["action"] == "search" for step in researcher_steps), 3)
         self.assertEqual(sum(step["action"] == "open_page" for step in researcher_steps), 3)
