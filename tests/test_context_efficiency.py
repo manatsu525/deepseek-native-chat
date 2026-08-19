@@ -174,6 +174,7 @@ class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
                 return False
 
         responses = [
+            tool_response("read-1", "read_file", {"path": "app.py", "start_line": 1, "end_line": 1}),
             tool_response("run-1", "run_python", {"path": "app.py"}),
             tool_response("run-2", "run_python", {"path": "app.py"}),
             tool_response("write-1", "write_file", {"path": "app.py", "content": "print('changed')\n"}),
@@ -221,8 +222,21 @@ class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(workspace.validation_runs, 2)
         self.assertEqual(
             [(item["name"], item["status"]) for item in result["tool_trace"]],
-            [("run_python", "completed"), ("run_python", "skipped"), ("write_file", "completed"), ("run_python", "completed")],
+            [
+                ("read_file", "completed"),
+                ("run_python", "completed"),
+                ("run_python", "skipped"),
+                ("write_file", "completed"),
+                ("run_python", "completed"),
+            ],
         )
+        read_trace = result["tool_trace"][0]
+        self.assertEqual(read_trace["requested_start_line"], 1)
+        self.assertEqual(read_trace["requested_end_line"], 1)
+        self.assertEqual(read_trace["line_count"], 1)
+        self.assertEqual(read_trace["returned_from_line"], 1)
+        self.assertEqual(read_trace["returned_through_line"], 1)
+        self.assertFalse(read_trace["truncated"])
 
 
 if __name__ == "__main__":

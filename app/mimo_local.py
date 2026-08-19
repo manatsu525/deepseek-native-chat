@@ -800,6 +800,13 @@ async def stream_response(
                         int(arguments.get("start_line", 1) or 1),
                         int(arguments["end_line"]) if arguments.get("end_line") is not None else None,
                     )
+                    if workspace_name == "read_file":
+                        # Persist the requested range so repeated reads can be
+                        # diagnosed after the live model/tool context is gone.
+                        # A null end means the model requested the file through
+                        # EOF rather than supplying an explicit last line.
+                        step["requested_start_line"] = read_key[1]
+                        step["requested_end_line"] = read_key[2]
                     workspace_call_skipped = False
                     validation_key = json.dumps(
                         [workspace_name, normalized_path, arguments.get("arguments") or []],
@@ -871,6 +878,20 @@ async def stream_response(
                             workspace_generation += 1
                             workspace_reads = {item for item in workspace_reads if item[0] != normalized_path}
                             workspace_searches.clear()
+                    if workspace_name == "read_file" and not workspace_call_skipped:
+                        try:
+                            read_result = json.loads(result_text)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            read_result = {}
+                        if isinstance(read_result, dict):
+                            for field in (
+                                "line_count",
+                                "returned_from_line",
+                                "returned_through_line",
+                                "truncated",
+                            ):
+                                if field in read_result:
+                                    step[field] = read_result[field]
                     step["status"] = "skipped" if workspace_call_skipped else "completed"
                 elif is_search:
                     if parallel_mode:
@@ -1047,7 +1068,27 @@ async def stream_response(
                 )
                 if compacted_arguments:
                     result_text += "\n[上下文优化：大型操作参数已执行并从后续重复请求中省略；当前工作区文件是权威状态。]"
-            tool_trace.append({"id": call_id, "name": workspace_name if is_workspace else name, "url": target_url, "path": step.get("path", ""), "backend": "workspace" if is_workspace else web_tool_backend, "status": step["status"], "error": step["error"]})
+            trace_item = {
+                "id": call_id,
+                "name": workspace_name if is_workspace else name,
+                "url": target_url,
+                "path": step.get("path", ""),
+                "backend": "workspace" if is_workspace else web_tool_backend,
+                "status": step["status"],
+                "error": step["error"],
+            }
+            if is_workspace and workspace_name == "read_file":
+                for field in (
+                    "requested_start_line",
+                    "requested_end_line",
+                    "line_count",
+                    "returned_from_line",
+                    "returned_through_line",
+                    "truncated",
+                ):
+                    if field in step:
+                        trace_item[field] = step[field]
+            tool_trace.append(trace_item)
             conversation.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
             _maybe_compact_agent_context(
                 conversation,
