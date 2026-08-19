@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,9 +14,7 @@ from app.multi_agent import (
     ModelCallLimitExceeded,
     PROGRAMMER_PROMPT,
     RESEARCHER_PROMPT,
-    _explicitly_requests_concise,
     _parse_decision,
-    _required_final_answer_chars,
     run_collaboration,
 )
 from app.workspace import ConversationWorkspace
@@ -35,69 +32,6 @@ def result(answer: str, *, searches: list[dict[str, Any]] | None = None) -> dict
 
 
 class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
-    def test_concise_request_detection_does_not_confuse_scope_with_brevity(self) -> None:
-        self.assertTrue(_explicitly_requests_concise("只给一句结论，不要展开"))
-        self.assertTrue(_explicitly_requests_concise("Please give a concise answer"))
-        self.assertFalse(_explicitly_requests_concise("只给我详细分析，不要写代码"))
-
-    def test_collaboration_defaults_to_detailed_final_after_worker_output(self) -> None:
-        agents = [{"role": "programmer", "status": "completed", "answer": "已完成实现和验证。"}]
-        self.assertGreaterEqual(_required_final_answer_chars("实现并测试这个功能", agents), 600)
-        self.assertEqual(_required_final_answer_chars("实现并测试，最后简短汇报", agents), 0)
-
-    async def test_rich_research_is_not_collapsed_into_a_thin_final_answer(self) -> None:
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        workspace = ConversationWorkspace(1, "answer-depth")
-        workspace.root = Path(temporary.name)
-        rich_report = "关键证据、对比数据、反面反馈、局限和来源。" * 120
-        thin_answer = "结论：整体不错。"
-        detailed_answer = "综合结论：整体能力很强，但并非没有条件。\n\n" + "关键证据与局限需要完整保留。" * 60
-        decisions = iter(
-            [
-                '{"action":"research","reason":"需要完整评估"}',
-                json.dumps({"action": "finish", "reason": "完成", "final_answer": thin_answer}, ensure_ascii=False),
-                json.dumps({"action": "finish", "reason": "补足证据", "final_answer": detailed_answer}, ensure_ascii=False),
-            ]
-        )
-        research_calls = 0
-        leader_calls = 0
-
-        async def fake_streamer(**kwargs: Any) -> dict[str, Any]:
-            nonlocal research_calls, leader_calls
-            kwargs["before_model_call"]()
-            prompt = kwargs["system_addendum"]
-            if prompt == LEADER_DECISION_PROMPT:
-                leader_calls += 1
-                return result(next(decisions))
-            if prompt == RESEARCHER_PROMPT:
-                research_calls += 1
-                return result(rich_report)
-            raise AssertionError("unexpected role")
-
-        async def update(_: dict[str, Any]) -> None:
-            return None
-
-        final = await run_collaboration(
-            base_url="https://example.test/v1",
-            api_key="test-key",
-            model="test-model",
-            messages=[{"role": "user", "content": "请详细评估这个方案的真实水平、优缺点和适用条件。"}],
-            timeout=30,
-            stopped=lambda: False,
-            update=update,
-            settings={"max_completion_tokens": 65_536},
-            conversation_id="answer-depth",
-            user_timezone="UTC",
-            effort="high",
-            workspace=workspace,
-            streamer=fake_streamer,
-        )
-
-        self.assertEqual(final["answer"], detailed_answer)
-        self.assertEqual(research_calls, 1)
-        self.assertEqual(leader_calls, 3)
-
     async def test_leader_paraphrase_cannot_replace_user_request_for_worker(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

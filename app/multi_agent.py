@@ -21,7 +21,6 @@ MAX_STATE_OUTPUT_CHARS = 5_000
 MAX_RESEARCH_SEARCHES_PER_ENTRY = 1
 MAX_RESEARCH_FETCHES_PER_ENTRY = 2
 MAX_RESEARCH_TOOLS_PER_ENTRY = 3
-MAX_FINAL_QUALITY_RETRIES = 1
 
 ROLE_LABELS = {
     "leader": "Nexus",
@@ -162,35 +161,6 @@ def _research_entry_limits(remaining: tuple[int, int, int]) -> tuple[int, int, i
         min(fetches, MAX_RESEARCH_FETCHES_PER_ENTRY),
         min(total, MAX_RESEARCH_TOOLS_PER_ENTRY),
     )
-
-
-def _explicitly_requests_concise(user_request: str) -> bool:
-    text = str(user_request or "").casefold()
-    return bool(re.search(
-        r"(?:一句(?:话|结论)|只(?:需|要)?回答|只给(?:一句|结论|答案|要点)|简短|简要|精简|简单说|不要展开|无需展开|直接回答|"
-        r"brief|concise|short answer|one sentence|just (?:answer|the answer)|tldr only)",
-        text,
-    ))
-
-
-def _required_final_answer_chars(user_request: str, agents: list[dict[str, Any]]) -> int:
-    if _explicitly_requests_concise(user_request):
-        return 0
-    research_chars = sum(
-        len(str(agent.get("answer") or "").strip())
-        for agent in agents
-        if agent.get("role") == "researcher" and agent.get("status") == "completed"
-    )
-    if research_chars:
-        return min(1_800, max(800, research_chars // 5))
-    worker_chars = sum(
-        len(str(agent.get("answer") or "").strip())
-        for agent in agents
-        if agent.get("role") in {"programmer", "inspector"} and agent.get("status") == "completed"
-    )
-    if worker_chars:
-        return min(1_200, max(600, worker_chars // 6))
-    return 0
 
 
 def _inspection_verdict(value: str) -> str:
@@ -467,7 +437,6 @@ async def run_collaboration(
     decisions = 0
     role_counts = {"research": 0, "program": 0, "inspect": 0}
     budget_exhausted = False
-    final_quality_retries = 0
 
     while decisions < MAX_LEADER_DECISIONS and worker_actions < MAX_WORKER_ACTIONS and budget.remaining > 0:
         if stopped():
@@ -512,21 +481,6 @@ async def run_collaboration(
             candidate_answer = decision["final_answer"]
             if not candidate_answer:
                 guard_message = "finish 缺少必填的 final_answer，不能结束。请重新返回 finish JSON，并直接写好给用户的完整最终回答。"
-                continue
-            required_chars = _required_final_answer_chars(current_user_request, agents)
-            if (
-                required_chars
-                and len(candidate_answer.strip()) < required_chars
-                and final_quality_retries < MAX_FINAL_QUALITY_RETRIES
-                and not forced_final
-            ):
-                final_quality_retries += 1
-                guard_message = (
-                    f"最终回答过度压缩：当前只有 {len(candidate_answer.strip())} 个字符，未充分呈现已有协作成果。"
-                    f"不要重新调研；请立即重新选择 finish，把最终回答扩展到至少约 {required_chars} 个字符，"
-                    "全面整合相关角色的有效产出；调研类保留关键数据或对比、正反证据、局限与不确定性、实用建议和来源，"
-                    "工程类保留实际改动、关键实现、验证、文件和遗留限制。"
-                )
                 continue
             final_answer = candidate_answer
             final_reasoning = str(leader_record.get("reasoning") or "")
