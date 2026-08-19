@@ -425,8 +425,8 @@ function agentRunsHtml(meta={},active=false,detailKey='trace'){
     return `<article class="agent-run" data-agent-id="${escapeHtml(agent.id||String(index))}"><div class="agent-run-head"><strong>${escapeHtml(agent.label||agent.role||'Agent')}</strong>${verdict?`<span class="agent-verdict ${verdict.toLowerCase()}">${escapeHtml(verdict)}</span>`:''}<span class="agent-status ${escapeHtml(status)}">${escapeHtml(statusLabels[status]||status)}</span></div>${agent.task?`<p class="agent-task">${escapeHtml(agent.task)}</p>`:''}${decision}${agent.reasoning?`<div class="agent-reasoning" data-scroll-key="${escapeHtml(detailKey)}-agent-${index}-reasoning">${escapeHtml(agent.reasoning)}</div>`:''}${activities?`<div class="agent-activity">${activities}</div>`:''}${agent.answer?`<div class="agent-output" data-scroll-key="${escapeHtml(detailKey)}-agent-${index}-output">${escapeHtml(agent.answer)}</div>`:''}${agent.error?`<div class="agent-error">${escapeHtml(agent.error)}</div>`:''}</article>`;
   }).join('');
   const running=agents.find(agent=>agent.status==='running');
-  const summary=running?`${running.label||running.role}正在工作`:(active?'Leader 正在决定下一步':'协作已结束');
-  return `<section class="agent-team"><div class="agent-team-head"><strong>四智能体协作</strong><span>${escapeHtml(summary)}</span></div>${runs?`<div class="agent-runs">${runs}</div>`:'<div class="agent-team-waiting">正在启动 Leader…</div>'}</section>`;
+  const summary=running?`${running.label||running.role}正在工作`:(active?'Nexus 正在决定下一步':'协作已结束');
+  return `<section class="agent-team"><div class="agent-team-head"><strong>Nexus 协作编队</strong><span>${escapeHtml(summary)}</span></div>${runs?`<div class="agent-runs">${runs}</div>`:'<div class="agent-team-waiting">正在启动 Nexus…</div>'}</section>`;
 }
 
 function messageHtml(message, index, live=false, retryable=false) {
@@ -437,7 +437,7 @@ function messageHtml(message, index, live=false, retryable=false) {
   const messageAttachments = Array.isArray(meta.attachments) && meta.attachments.length ? `<div class="message-attachments">${attachmentChips(meta.attachments)}</div>` : '';
   const custom = normalizeProviderType(meta.provider_type)==='custom';
   const collaborative=meta.chat_mode==='multi_agent';
-  const assistantName = collaborative ? '协作 Leader' : custom ? 'Custom' : 'DeepSeek';
+  const assistantName = collaborative ? 'Nexus' : custom ? 'Custom' : 'DeepSeek';
   return `<article class="message ${assistant ? 'assistant' : 'user'}${live ? ' live-message' : ''}" data-index="${index}">
     <div class="message-icon">${assistant ? (custom ? 'CU' : 'DS') : escapeHtml(((state.me && state.me.username) || 'U')[0].toUpperCase())}</div>
     <div class="message-body"><div class="message-head"><strong>${assistant ? assistantName : escapeHtml((state.me && state.me.username) || '你')}</strong></div>
@@ -735,11 +735,11 @@ function updateProviderUi(){
   $('#effort').title=custom?(customEffort?'控制发送给 Custom 模型的 reasoning_effort':'Custom 参数中已关闭 reasoning_effort'):'控制 DeepSeek 模型推理投入';
   $('#nativePill').textContent=collaborative?(custom?'● 4 Agents':'⚠ 仅 Custom'):custom?`● ${webInfo.label}`:'● Native Web';
   $('#welcomeOrbitMark').textContent=collaborative?'4A':custom?'CU':'DS';
-  $('#welcomeEyebrow').textContent=collaborative?'LEADER · RESEARCH · CODE · REVIEW':custom?'CUSTOM · OPENAI CHAT': 'DEEPSEEK V4 FLASH';
+  $('#welcomeEyebrow').textContent=collaborative?'NEXUS · ATLAS · FORGE · SENTINEL':custom?'CUSTOM · OPENAI CHAT': 'DEEPSEEK V4 FLASH';
   $('#welcomeTitle').textContent=collaborative?'让四个智能体协同完成任务':custom?'使用 Custom 本地联网':'问点需要查证的问题';
-  $('#welcomeDescription').textContent=collaborative?(custom?'Leader 动态决定调研、编程、检查和返修；所有角色使用当前 Custom 模型及共享工作区。':'多智能体协作仅支持 Custom 模型，请先切换下方 API。'):custom?`模型通过标准 Chat Completions 调用 ${webInfo.label} 搜索与读取真实来源。`:'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
-  if($('#statusText'))$('#statusText').textContent=collaborative?(custom?'多智能体协作 · Leader 动态调度':'多智能体协作 · 等待 Custom 模型'):'标准模式 · 外部搜索工具已就绪';
-  if($('#footnote'))$('#footnote').textContent=collaborative?'多智能体协作仅用于 Custom 模型；Leader 决策，调研员按需联网，程序员执行，检查员只读审查并触发返修。':'标准模式：Custom API 使用你选择的搜索与网页抓取方案；DeepSeek 使用服务端原生联网。';
+  $('#welcomeDescription').textContent=collaborative?(custom?'Nexus 动态调度 Atlas、Forge 与 Sentinel；所有角色使用当前 Custom 模型及共享工作区。':'多智能体协作仅支持 Custom 模型，请先切换下方 API。'):custom?`模型通过标准 Chat Completions 调用 ${webInfo.label} 搜索与读取真实来源。`:'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
+  if($('#statusText'))$('#statusText').textContent=collaborative?(custom?'多智能体协作 · Nexus 动态调度':'多智能体协作 · 等待 Custom 模型'):'标准模式 · 外部搜索工具已就绪';
+  if($('#footnote'))$('#footnote').textContent=collaborative?'多智能体协作仅用于 Custom 模型；Nexus 统筹，Atlas 渐进调研，Forge 工程执行，Sentinel 独立审查并触发返修。':'标准模式：Custom API 使用你选择的搜索与网页抓取方案；DeepSeek 使用服务端原生联网。';
 }
 
 async function loadProviders(){

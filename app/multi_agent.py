@@ -18,12 +18,17 @@ MAX_MODEL_CALLS = 20
 MAX_VISIBLE_ANSWER_CHARS = 20_000
 MAX_VISIBLE_REASONING_CHARS = 12_000
 MAX_STATE_OUTPUT_CHARS = 5_000
+MAX_RESEARCH_SEARCHES_PER_ENTRY = 1
+MAX_RESEARCH_FETCHES_PER_ENTRY = 2
+MAX_RESEARCH_TOOLS_PER_ENTRY = 3
+MAX_FINAL_QUALITY_RETRIES = 1
+RICH_RESEARCH_CHARS = 2_000
 
 ROLE_LABELS = {
-    "leader": "Leader",
-    "researcher": "调研员",
-    "programmer": "程序员",
-    "inspector": "检查员",
+    "leader": "Nexus",
+    "researcher": "Atlas",
+    "programmer": "Forge",
+    "inspector": "Sentinel",
 }
 
 
@@ -45,7 +50,7 @@ class ModelCallBudget:
             raise ModelCallLimitExceeded(f"多智能体协作每个问题最多调用模型 {self.limit} 次")
         self.used += 1
 
-LEADER_DECISION_PROMPT = """你是四智能体协作组的 Leader，负责决定下一步由哪个角色工作，并最终整合答案。你自己没有工具，也不要假装执行过搜索、文件修改或测试。
+LEADER_DECISION_PROMPT = """你是四智能体协作组的 Nexus，负责决定下一步由哪个角色工作，并最终整合答案。你自己没有工具，也不要假装执行过搜索、文件修改或测试。
 
 每次只决定一个下一步动作，并且只输出一个 JSON 对象，不要 Markdown 代码块或额外文字：
 {"action":"research|program|inspect|finish","reason":"简短决策依据","final_answer":"仅 finish 时填写的完整最终回答，其他动作为空"}
@@ -54,24 +59,25 @@ LEADER_DECISION_PROMPT = """你是四智能体协作组的 Leader，负责决定
 - 用户原始对话是唯一任务来源，优先级高于你的理解、共享状态和其他智能体结论。你只能选择角色，不能改写用户任务后再分派；编排器会直接把用户原始请求交给所选角色。
 - 必须原样尊重用户表达的对象、名称、版本、人物、时间、数量、否定关系、条件、范围和输出要求。你认为用户可能写错、概念可疑或含义不明确时，不得静默纠正、替换成相似概念或自行补全；需要外部确认就选 research，否则在最终回答中明确保留不确定性或请用户澄清。
 - “现有知识里没有”“没有搜到”和“资料不足”都不等于事实不存在。不得把猜测、近似对象或未验证结论升级成确定事实。
-- research：需要外部资料、文档、事实核查时交给调研员；可以在工作中的任何阶段再次调用。
-- program：需要创建/修改文件、执行代码或修复检查员发现的问题时交给程序员。
-- inspect：程序员产出后交给检查员独立读取、测试和审查。
+- research：需要外部资料、文档、事实核查时交给 Atlas；可以在工作中的任何阶段再次调用。
+- program：需要创建/修改文件、执行代码或修复 Sentinel 发现的问题时交给 Forge。
+- inspect：Forge 产出后交给 Sentinel 独立读取、测试和审查。
 - finish：证据和产出已经足够且没有待修复或待复检的问题时结束；必须同时在 final_answer 中直接写好给用户的完整回答，以免再调用一次模型。
+- 最终回答的详略必须匹配用户请求和已有成果。用户明确要求简短时才简短；对于评测、分析、比较、调研或复杂任务，如果用户没有要求简短，不能只给一段压缩结论，必须保留支撑判断的关键证据、重要数据或对比、局限与不确定性、实用建议及可用来源。不要机械复制 Atlas 全文，但也不能丢掉其核心信息。
 - 不要为了凑齐角色而调用不需要的智能体，也不要机械串联；根据共享状态作真实决策。
-- 检查员报告 REVISE 后，必须让程序员实际修复，并再次让检查员复检通过，才能 finish。
+- Sentinel 报告 REVISE 后，必须让 Forge 实际修复，并再次让 Sentinel 复检通过，才能 finish。
 """
 
-LEADER_FINAL_PROMPT = """你是协作组 Leader。根据用户原始对话、调研结论、程序员实际保存的文件和检查员结果，给出最终回答。用户原始对话是唯一任务来源；其他智能体的任务理解和结论只能作为证据，不能改变用户原意。必须保留用户表达的对象、名称、版本、人物、时间、数量、否定关系、条件、范围和输出要求。资料不足、没有搜到或无法确认时必须如实保留不确定性，绝不能改成相似对象继续回答，也不能宣称其不存在。只回答用户，不要再输出调度 JSON，不要声称做过记录中没有发生的工作。清楚说明完成内容、关键结论、文件和仍存在的限制。使用与用户提问相同的语言。"""
+LEADER_FINAL_PROMPT = """你是协作组 Nexus。根据用户原始对话、Atlas 调研结论、Forge 实际保存的文件和 Sentinel 检查结果，给出最终回答。用户原始对话是唯一任务来源；其他智能体的任务理解和结论只能作为证据，不能改变用户原意。必须保留用户表达的对象、名称、版本、人物、时间、数量、否定关系、条件、范围和输出要求。资料不足、没有搜到或无法确认时必须如实保留不确定性，绝不能改成相似对象继续回答，也不能宣称其不存在。最终回答的详略必须匹配用户请求和已有成果：用户明确要求简短时才简短；评测、分析、比较、调研或复杂任务若未要求简短，必须综合呈现关键证据、数据或对比、局限、不确定性、实用建议和可用来源，禁止把丰富成果压成一小段泛泛结论。只回答用户，不要再输出调度 JSON，不要声称做过记录中没有发生的工作。清楚说明完成内容、关键结论、文件和仍存在的限制。使用与用户提问相同的语言。"""
 
-RESEARCHER_PROMPT = """你是协作组的调研员，只负责外部信息调研和事实核查。你可以使用搜索和网页抓取工具，但没有工作区文件权限。用户原始对话是唯一任务来源；Leader 只选择了调研角色，无权改写调研对象。开始前必须对照用户原文，原样保留其中的对象、名称、版本、人物、时间、数量、否定关系、条件和范围。遇到陌生、可疑或歧义表达，先按用户原文核实身份，禁止擅自替换为你熟悉的相似概念；没有搜到只能报告“暂未验证”，不能推断“不存在”。寻找可靠资料、交叉核对关键结论，并给程序员或 Leader 提供简洁、可执行且带来源的报告。不要假装修改或测试文件。整个用户问题内，调研员所有出场合计最多搜索 3 次、抓取 3 次、搜索与抓取总计 6 次；界面实际提供的工具额度就是剩余额度，禁止绕过或无意义消耗。"""
+RESEARCHER_PROMPT = """你是协作组的 Atlas，只负责外部信息调研和事实核查。你可以使用搜索和网页抓取工具，但没有工作区文件权限。用户原始对话是唯一任务来源；Nexus 只选择了调研角色，无权改写调研对象。开始前必须对照用户原文，原样保留其中的对象、名称、版本、人物、时间、数量、否定关系、条件和范围。遇到陌生、可疑或歧义表达，先按用户原文核实身份，禁止擅自替换为你熟悉的相似概念；没有搜到只能报告“暂未验证”，不能推断“不存在”。采用渐进式调研：先用一次搜索同时提出少量互补查询，再只抓取最有价值的页面；证据足以回答当前问题就立即停止，绝不能为了用满额度而继续搜索或抓取。每次出场最多搜索 1 次、抓取 2 次、合计 3 次，未使用的共享额度留给后续再次调研。整个用户问题内，Atlas 所有出场合计仍最多搜索 3 次、抓取 3 次、合计 6 次。寻找可靠资料、交叉核对关键结论，并给 Forge 或 Nexus 提供简洁、可执行且带来源的报告。不要假装修改或测试文件，禁止绕过或无意义消耗额度。"""
 
-PROGRAMMER_PROMPT = """你是协作组的程序员，负责具体执行、创建和修改共享工作区文件，并运行适用的检查。你拥有联网和完整工作区工具。用户原始对话是唯一任务来源；Leader 只选择了编程角色，无权重写需求。必须以用户原文及工作区真实状态为准，保留对象、技术栈、版本、文件、条件、范围、禁止项和输出要求；其他角色的结论与用户原意冲突时，以用户原意为准并明确报告冲突，绝不能按被篡改的理解执行。先查看当前工作区真实状态，再落实用户请求；收到检查员反馈时必须针对反馈实际修改文件，不要只描述建议。尽量局部修改，避免无意义地重读或重写文件。完成后简洁列出改动文件、执行的验证及结果，不要在回答中重复粘贴已保存的完整代码。"""
+PROGRAMMER_PROMPT = """你是协作组的 Forge，负责具体执行、创建和修改共享工作区文件，并运行适用的检查。你拥有联网和完整工作区工具。用户原始对话是唯一任务来源；Nexus 只选择了编程角色，无权重写需求。必须以用户原文及工作区真实状态为准，保留对象、技术栈、版本、文件、条件、范围、禁止项和输出要求；其他角色的结论与用户原意冲突时，以用户原意为准并明确报告冲突，绝不能按被篡改的理解执行。先查看当前工作区真实状态，再落实用户请求；收到 Sentinel 反馈时必须针对反馈实际修改文件，不要只描述建议。尽量局部修改，避免无意义地重读或重写文件。完成后简洁列出改动文件、执行的验证及结果，不要在回答中重复粘贴已保存的完整代码。"""
 
-INSPECTOR_PROMPT = """你是协作组的检查员，负责独立审查程序员产出。你只有只读文件、搜索文件和本地测试/语法检查工具，绝不能创建、修改或删除文件。用户原始对话是唯一验收标准；Leader 只选择了检查角色，无权重写验收目标。必须逐项对照用户原文中的对象、技术栈、版本、文件、条件、范围、禁止项和输出要求；如果程序员或调研员改变了原意，即使代码本身能运行也必须判定 REVISE，并指出偏离之处。必须读取相关文件并尽可能运行实际检查，指出可复现的问题、文件路径和证据。整个检查最多有 6 次工具调用：先选最相关的文件，再运行覆盖面最大的验证；工作区未发生变化时，绝对不要重复读取同一范围或重复运行相同测试。一次综合测试成功且代码审查无阻断问题后，应立即给出结论。报告最后单独输出且仅输出以下两种结论之一：
+INSPECTOR_PROMPT = """你是协作组的 Sentinel，负责独立审查 Forge 产出。你只有只读文件、搜索文件和本地测试/语法检查工具，绝不能创建、修改或删除文件。用户原始对话是唯一验收标准；Nexus 只选择了检查角色，无权重写验收目标。必须逐项对照用户原文中的对象、技术栈、版本、文件、条件、范围、禁止项和输出要求；如果 Forge 或 Atlas 改变了原意，即使代码本身能运行也必须判定 REVISE，并指出偏离之处。必须读取相关文件并尽可能运行实际检查，指出可复现的问题、文件路径和证据。整个检查最多有 6 次工具调用：先选最相关的文件，再运行覆盖面最大的验证；工作区未发生变化时，绝对不要重复读取同一范围或重复运行相同测试。一次综合测试成功且代码审查无阻断问题后，应立即给出结论。报告最后单独输出且仅输出以下两种结论之一：
 VERDICT: PASS
 VERDICT: REVISE
-只在产出满足任务且检查未发现阻断问题时 PASS；需要程序员修复时必须 REVISE。"""
+只在产出满足任务且检查未发现阻断问题时 PASS；需要 Forge 修复时必须 REVISE。"""
 
 
 def _trim(value: Any, limit: int) -> str:
@@ -94,14 +100,14 @@ def _extract_json_object(value: str) -> dict[str, Any]:
             continue
         if isinstance(decoded, dict):
             return decoded
-    raise ValueError("Leader 没有返回有效的调度 JSON")
+    raise ValueError("Nexus 没有返回有效的调度 JSON")
 
 
 def _parse_decision(value: str) -> dict[str, str]:
     raw = _extract_json_object(value)
     action = str(raw.get("action") or "").strip().casefold()
     if action not in {"research", "program", "inspect", "finish"}:
-        raise ValueError(f"Leader 返回了无效动作：{action or '空'}")
+        raise ValueError(f"Nexus 返回了无效动作：{action or '空'}")
     task = " ".join(str(raw.get("task") or "").split())[:2_000]
     reason = " ".join(str(raw.get("reason") or "").split())[:1_000]
     final_answer = str(raw.get("final_answer") or "").strip()
@@ -138,16 +144,47 @@ def _latest_user_request(messages: list[dict[str, Any]]) -> str:
 
 
 def _orchestrated_role_task(action: str, *, has_blocker: bool = False) -> str:
-    """Create a role objective without letting the Leader paraphrase user intent."""
+    """Create a role objective without letting Nexus paraphrase user intent."""
     if action == "research":
         return "依据用户原始请求和当前共享状态，核实完成任务仍缺少的外部事实与资料"
     if action == "program":
         if has_blocker:
-            return "依据用户原始请求落实工作，并修复当前检查员指出的未通过项"
+            return "依据用户原始请求落实工作，并修复当前 Sentinel 指出的未通过项"
         return "依据用户原始请求、已验证资料和当前工作区状态完成具体实现"
     if action == "inspect":
         return "以用户原始请求为唯一验收标准，独立检查当前产出并运行必要测试"
     return "依据用户原始请求和已有真实产出整合最终回答"
+
+
+def _research_entry_limits(remaining: tuple[int, int, int]) -> tuple[int, int, int]:
+    searches, fetches, total = remaining
+    return (
+        min(searches, MAX_RESEARCH_SEARCHES_PER_ENTRY),
+        min(fetches, MAX_RESEARCH_FETCHES_PER_ENTRY),
+        min(total, MAX_RESEARCH_TOOLS_PER_ENTRY),
+    )
+
+
+def _explicitly_requests_concise(user_request: str) -> bool:
+    text = str(user_request or "").casefold()
+    return bool(re.search(
+        r"(?:一句(?:话|结论)|只(?:需|要)?回答|只给(?:一句|结论|答案|要点)|简短|简要|精简|简单说|不要展开|无需展开|直接回答|"
+        r"brief|concise|short answer|one sentence|just (?:answer|the answer)|tldr only)",
+        text,
+    ))
+
+
+def _required_final_answer_chars(user_request: str, agents: list[dict[str, Any]]) -> int:
+    if _explicitly_requests_concise(user_request):
+        return 0
+    research_chars = sum(
+        len(str(agent.get("answer") or "").strip())
+        for agent in agents
+        if agent.get("role") == "researcher" and agent.get("status") == "completed"
+    )
+    if research_chars < RICH_RESEARCH_CHARS:
+        return 0
+    return min(1_600, max(700, research_chars // 6))
 
 
 def _inspection_verdict(value: str) -> str:
@@ -285,7 +322,7 @@ async def run_collaboration(
     workspace: ConversationWorkspace,
     streamer: Callable[..., Awaitable[dict[str, Any]]] = custom_stream_response,
 ) -> dict[str, Any]:
-    """Run a Leader-directed, shared-workspace collaboration for Custom models."""
+    """Run a Nexus-directed, shared-workspace collaboration for Custom models."""
     agents: list[dict[str, Any]] = []
     final_answer = ""
     final_reasoning = ""
@@ -424,6 +461,7 @@ async def run_collaboration(
     decisions = 0
     role_counts = {"research": 0, "program": 0, "inspect": 0}
     budget_exhausted = False
+    final_quality_retries = 0
 
     while decisions < MAX_LEADER_DECISIONS and worker_actions < MAX_WORKER_ACTIONS and budget.remaining > 0:
         if stopped():
@@ -451,7 +489,7 @@ async def run_collaboration(
         except ValueError as exc:
             leader_record["status"] = "failed"
             leader_record["error"] = str(exc)
-            guard_message = f"上一轮 Leader 调度格式无效：{exc}。请严格返回指定 JSON。"
+            guard_message = f"上一轮 Nexus 调度格式无效：{exc}。请严格返回指定 JSON。"
             await emit()
             continue
         leader_record["decision_action"] = decision["action"]
@@ -463,13 +501,28 @@ async def run_collaboration(
         action = decision["action"]
         if action == "finish":
             if (pending_inspection or blocker) and not forced_final:
-                guard_message = "存在尚未通过检查的程序改动或待修复问题，不能结束。请安排程序员修复或检查员复检。"
+                guard_message = "存在尚未通过 Sentinel 检查的 Forge 改动或待修复问题，不能结束。请安排 Forge 修复或 Sentinel 复检。"
                 continue
-            final_answer = decision["final_answer"]
-            final_reasoning = str(leader_record.get("reasoning") or "")
-            if not final_answer:
+            candidate_answer = decision["final_answer"]
+            if not candidate_answer:
                 guard_message = "finish 缺少必填的 final_answer，不能结束。请重新返回 finish JSON，并直接写好给用户的完整最终回答。"
                 continue
+            required_chars = _required_final_answer_chars(current_user_request, agents)
+            if (
+                required_chars
+                and len(candidate_answer.strip()) < required_chars
+                and final_quality_retries < MAX_FINAL_QUALITY_RETRIES
+                and not forced_final
+            ):
+                final_quality_retries += 1
+                guard_message = (
+                    f"最终回答过度压缩：当前只有 {len(candidate_answer.strip())} 个字符，而已有 Atlas 调研包含大量有效证据。"
+                    f"不要重新调研；请立即重新选择 finish，把最终回答扩展到至少约 {required_chars} 个字符，"
+                    "综合保留关键数据或对比、正反证据、局限与不确定性、实用建议和可用来源。"
+                )
+                continue
+            final_answer = candidate_answer
+            final_reasoning = str(leader_record.get("reasoning") or "")
             if forced_final and (pending_inspection or blocker):
                 final_answer = (
                     f"⚠️ 多智能体协作已达到每个问题最多 {budget.limit} 次模型调用的硬上限；"
@@ -490,21 +543,22 @@ async def run_collaboration(
                 max(0, 6 - research_used["total"]),
             )
             if research_limits[2] <= 0 or (research_limits[0] <= 0 and research_limits[1] <= 0):
-                guard_message = "调研员已用完本问题的 3 次搜索、3 次抓取或合计 6 次工具额度，不能继续调研。"
+                guard_message = "Atlas 已用完本问题的 3 次搜索、3 次抓取或合计 6 次工具额度，不能继续调研。"
                 continue
             if budget.remaining < 3:
-                guard_message = "模型调用预算不足以完成一次调研并让 Leader 汇总，请立即 finish。"
+                guard_message = "模型调用预算不足以完成一次调研并让 Nexus 汇总，请立即 finish。"
                 continue
             role_counts[action] += 1
             worker_actions += 1
             guard_message = ""
+            entry_limits = _research_entry_limits(research_limits)
             packet = (
                 f"编排器分配的角色目标：{safe_task}\n"
                 "注意：这不是对用户请求的改写；必须以共享状态中的 immutable_current_user_request 和此前用户原始对话为准。\n\n"
                 + shared_state(pending_inspection=pending_inspection, blocker=blocker)
             )
             try:
-                await run_role("researcher", safe_task, packet, reserve_calls=1, web_limits=research_limits)
+                await run_role("researcher", safe_task, packet, reserve_calls=1, web_limits=entry_limits)
             except ModelCallLimitExceeded:
                 budget_exhausted = True
                 break
@@ -515,7 +569,7 @@ async def run_collaboration(
             role_counts[action] += 1
             worker_actions += 1
             guard_message = ""
-            feedback = f"\n\n必须处理的检查员反馈：\n{blocker}" if blocker else ""
+            feedback = f"\n\n必须处理的 Sentinel 反馈：\n{blocker}" if blocker else ""
             packet = (
                 f"编排器分配的角色目标：{safe_task}{feedback}\n"
                 "注意：这不是对用户请求的改写；必须以共享状态中的 immutable_current_user_request 和此前用户原始对话为准。\n\n"
@@ -530,7 +584,7 @@ async def run_collaboration(
             pending_inspection = True
         else:
             if budget.remaining < 3:
-                guard_message = "模型调用预算不足以执行检查并让 Leader 汇总，请立即 finish 并说明未复检。"
+                guard_message = "模型调用预算不足以执行检查并让 Nexus 汇总，请立即 finish 并说明未复检。"
                 continue
             role_counts[action] += 1
             worker_actions += 1
@@ -552,7 +606,7 @@ async def run_collaboration(
                 blocker = ""
             else:
                 pending_inspection = True
-                blocker = str(inspection.get("answer") or "检查员要求修改，但没有提供明确说明。")
+                blocker = str(inspection.get("answer") or "Sentinel 要求修改，但没有提供明确说明。")
             await emit()
 
     if not final_answer:
