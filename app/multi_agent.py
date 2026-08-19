@@ -22,7 +22,6 @@ MAX_RESEARCH_SEARCHES_PER_ENTRY = 1
 MAX_RESEARCH_FETCHES_PER_ENTRY = 2
 MAX_RESEARCH_TOOLS_PER_ENTRY = 3
 MAX_FINAL_QUALITY_RETRIES = 1
-RICH_RESEARCH_CHARS = 2_000
 
 ROLE_LABELS = {
     "leader": "Nexus",
@@ -63,12 +62,12 @@ LEADER_DECISION_PROMPT = """你是四智能体协作组的 Nexus，负责决定�
 - program：需要创建/修改文件、执行代码或修复 Sentinel 发现的问题时交给 Forge。
 - inspect：Forge 产出后交给 Sentinel 独立读取、测试和审查。
 - finish：证据和产出已经足够且没有待修复或待复检的问题时结束；必须同时在 final_answer 中直接写好给用户的完整回答，以免再调用一次模型。
-- 最终回答的详略必须匹配用户请求和已有成果。用户明确要求简短时才简短；对于评测、分析、比较、调研或复杂任务，如果用户没有要求简短，不能只给一段压缩结论，必须保留支撑判断的关键证据、重要数据或对比、局限与不确定性、实用建议及可用来源。不要机械复制 Atlas 全文，但也不能丢掉其核心信息。
+- 多智能体模式的最终回答默认必须全面、详细，因为用户选择该模式就是希望得到完整的协作成果。只要调用过 Atlas、Forge 或 Sentinel，就要充分整合各角色的有效产出；除非用户明确要求一句话、简短或只给结论，否则不能只给一段压缩总结。调研类要保留关键证据、重要数据或对比、正反观点、局限与不确定性、实用建议及可用来源；工程类要说明实际改动、关键实现、验证结果、文件和遗留限制。不要机械复制各角色全文，但也不能丢掉核心信息。没有调用其他角色的简单问题可以直接简洁回答，禁止为了凑长度灌水。
 - 不要为了凑齐角色而调用不需要的智能体，也不要机械串联；根据共享状态作真实决策。
 - Sentinel 报告 REVISE 后，必须让 Forge 实际修复，并再次让 Sentinel 复检通过，才能 finish。
 """
 
-LEADER_FINAL_PROMPT = """你是协作组 Nexus。根据用户原始对话、Atlas 调研结论、Forge 实际保存的文件和 Sentinel 检查结果，给出最终回答。用户原始对话是唯一任务来源；其他智能体的任务理解和结论只能作为证据，不能改变用户原意。必须保留用户表达的对象、名称、版本、人物、时间、数量、否定关系、条件、范围和输出要求。资料不足、没有搜到或无法确认时必须如实保留不确定性，绝不能改成相似对象继续回答，也不能宣称其不存在。最终回答的详略必须匹配用户请求和已有成果：用户明确要求简短时才简短；评测、分析、比较、调研或复杂任务若未要求简短，必须综合呈现关键证据、数据或对比、局限、不确定性、实用建议和可用来源，禁止把丰富成果压成一小段泛泛结论。只回答用户，不要再输出调度 JSON，不要声称做过记录中没有发生的工作。清楚说明完成内容、关键结论、文件和仍存在的限制。使用与用户提问相同的语言。"""
+LEADER_FINAL_PROMPT = """你是协作组 Nexus。根据用户原始对话、Atlas 调研结论、Forge 实际保存的文件和 Sentinel 检查结果，给出最终回答。用户原始对话是唯一任务来源；其他智能体的任务理解和结论只能作为证据，不能改变用户原意。必须保留用户表达的对象、名称、版本、人物、时间、数量、否定关系、条件、范围和输出要求。资料不足、没有搜到或无法确认时必须如实保留不确定性，绝不能改成相似对象继续回答，也不能宣称其不存在。多智能体模式默认输出全面、详细的综合成果：只要调用过其他角色，除非用户明确要求一句话、简短或只给结论，否则必须充分整合其有效产出。调研类应包含结论、关键证据与数据、重要对比、正反观点、局限与不确定性、实用建议和可用来源；工程类应包含实际改动、关键实现、验证结果、文件和遗留限制。不要机械复制角色全文，但禁止把丰富成果压成一小段泛泛结论。没有调用其他角色的简单问题可以直接简洁回答，禁止为了长度灌水。只回答用户，不要再输出调度 JSON，不要声称做过记录中没有发生的工作。使用与用户提问相同的语言。"""
 
 RESEARCHER_PROMPT = """你是协作组的 Atlas，只负责外部信息调研和事实核查。你可以使用搜索和网页抓取工具，但没有工作区文件权限。用户原始对话是唯一任务来源；Nexus 只选择了调研角色，无权改写调研对象。开始前必须对照用户原文，原样保留其中的对象、名称、版本、人物、时间、数量、否定关系、条件和范围。遇到陌生、可疑或歧义表达，先按用户原文核实身份，禁止擅自替换为你熟悉的相似概念；没有搜到只能报告“暂未验证”，不能推断“不存在”。采用渐进式调研：先用一次搜索同时提出少量互补查询，再只抓取最有价值的页面；证据足以回答当前问题就立即停止，绝不能为了用满额度而继续搜索或抓取。每次出场最多搜索 1 次、抓取 2 次、合计 3 次，未使用的共享额度留给后续再次调研。整个用户问题内，Atlas 所有出场合计仍最多搜索 3 次、抓取 3 次、合计 6 次。寻找可靠资料、交叉核对关键结论，并给 Forge 或 Nexus 提供简洁、可执行且带来源的报告。不要假装修改或测试文件，禁止绕过或无意义消耗额度。"""
 
@@ -182,9 +181,16 @@ def _required_final_answer_chars(user_request: str, agents: list[dict[str, Any]]
         for agent in agents
         if agent.get("role") == "researcher" and agent.get("status") == "completed"
     )
-    if research_chars < RICH_RESEARCH_CHARS:
-        return 0
-    return min(1_600, max(700, research_chars // 6))
+    if research_chars:
+        return min(1_800, max(800, research_chars // 5))
+    worker_chars = sum(
+        len(str(agent.get("answer") or "").strip())
+        for agent in agents
+        if agent.get("role") in {"programmer", "inspector"} and agent.get("status") == "completed"
+    )
+    if worker_chars:
+        return min(1_200, max(600, worker_chars // 6))
+    return 0
 
 
 def _inspection_verdict(value: str) -> str:
@@ -516,9 +522,10 @@ async def run_collaboration(
             ):
                 final_quality_retries += 1
                 guard_message = (
-                    f"最终回答过度压缩：当前只有 {len(candidate_answer.strip())} 个字符，而已有 Atlas 调研包含大量有效证据。"
+                    f"最终回答过度压缩：当前只有 {len(candidate_answer.strip())} 个字符，未充分呈现已有协作成果。"
                     f"不要重新调研；请立即重新选择 finish，把最终回答扩展到至少约 {required_chars} 个字符，"
-                    "综合保留关键数据或对比、正反证据、局限与不确定性、实用建议和可用来源。"
+                    "全面整合相关角色的有效产出；调研类保留关键数据或对比、正反证据、局限与不确定性、实用建议和来源，"
+                    "工程类保留实际改动、关键实现、验证、文件和遗留限制。"
                 )
                 continue
             final_answer = candidate_answer
