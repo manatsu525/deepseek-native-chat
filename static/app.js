@@ -359,8 +359,9 @@ function usageHtml(usage={}) {
   const cached = usage.input_tokens_details && usage.input_tokens_details.cached_tokens != null ? usage.input_tokens_details.cached_tokens : 0;
   const reasoning = usage.output_tokens_details && usage.output_tokens_details.reasoning_tokens != null ? usage.output_tokens_details.reasoning_tokens : 0;
   const web = usage.web_search_usage || {};
+  const modelCalls = usage.model_calls == null ? '' : `<span>模型调用 ${Number(usage.model_calls).toLocaleString()} / 20</span>`;
   const webUsage = web.tool_usage == null ? '' : `<span>联网 ${Number(web.tool_usage).toLocaleString()} 次</span><span>网页 ${Number(web.page_usage || 0).toLocaleString()} 篇</span>`;
-  return `<div class="usage"><span>输入 ${input.toLocaleString()}</span><span>缓存命中 ${cached.toLocaleString()}</span><span>输出 ${output.toLocaleString()}</span><span>推理 ${reasoning.toLocaleString()}</span><span>合计 ${(input+output).toLocaleString()}</span>${webUsage}</div>`;
+  return `<div class="usage"><span>输入 ${input.toLocaleString()}</span><span>缓存命中 ${cached.toLocaleString()}</span><span>输出 ${output.toLocaleString()}</span><span>推理 ${reasoning.toLocaleString()}</span><span>合计 ${(input+output).toLocaleString()}</span>${modelCalls}${webUsage}</div>`;
 }
 
 function traceHtml(meta={}, active=false, detailKey='trace') {

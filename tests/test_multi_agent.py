@@ -9,6 +9,9 @@ from app.multi_agent import (
     INSPECTOR_PROMPT,
     LEADER_DECISION_PROMPT,
     LEADER_FINAL_PROMPT,
+    MAX_MODEL_CALLS,
+    ModelCallBudget,
+    ModelCallLimitExceeded,
     PROGRAMMER_PROMPT,
     RESEARCHER_PROMPT,
     _parse_decision,
@@ -54,6 +57,7 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
         async def fake_streamer(**kwargs: Any) -> dict[str, Any]:
             nonlocal program_count, inspection_count
             calls.append(kwargs)
+            kwargs["before_model_call"]()
             await kwargs["update"]({"answer": "partial", "reasoning": "", "searches": [], "sources": [], "usage": {}})
             prompt = kwargs["system_addendum"]
             packet = kwargs["messages"][-1]["content"]
@@ -79,7 +83,7 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
             if prompt == RESEARCHER_PROMPT:
                 return result(
                     "资料确认应输出 fixed。",
-                    searches=[{"id": "s1", "action": "search", "status": "completed", "query": "algorithm"}],
+                    searches=[{"id": "s1", "action": "search", "status": "completed", "query": "algorithm", "quota_counted": True}],
                 )
             if prompt == LEADER_FINAL_PROMPT:
                 raise AssertionError("normal finish must not require another model call")
@@ -119,6 +123,7 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["verdict"] for item in final["agents"] if item["role"] == "inspector"], ["REVISE", "PASS"])
         self.assertTrue(updates)
         self.assertEqual(updates[-1]["answer"], final["answer"])
+        self.assertLessEqual(final["usage"]["model_calls"], MAX_MODEL_CALLS)
 
         researcher_call = next(item for item in calls if item["system_addendum"] == RESEARCHER_PROMPT)
         self.assertTrue(researcher_call["web_enabled"])
@@ -144,6 +149,7 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
         prompts: list[str] = []
 
         async def fake_streamer(**kwargs: Any) -> dict[str, Any]:
+            kwargs["before_model_call"]()
             prompt = kwargs["system_addendum"]
             prompts.append(prompt)
             if prompt == LEADER_DECISION_PROMPT:
@@ -183,6 +189,132 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
         decision = _parse_decision('```json\n{"action":"research","task":"查文档","reason":"需要依据"}\n```')
         self.assertEqual(decision["action"], "research")
         self.assertEqual(decision["task"], "查文档")
+
+    def test_model_call_budget_rejects_call_twenty_one(self) -> None:
+        budget = ModelCallBudget()
+        for _ in range(MAX_MODEL_CALLS):
+            budget.consume()
+        self.assertEqual(budget.used, 20)
+        self.assertEqual(budget.remaining, 0)
+        with self.assertRaises(ModelCallLimitExceeded):
+            budget.consume()
+        self.assertEqual(budget.used, 20)
+
+    async def test_upstream_rounds_across_roles_never_exceed_twenty(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        workspace = ConversationWorkspace(1, "twenty")
+        workspace.root = Path(temporary.name)
+        decisions = iter(
+            [
+                '{"action":"program","task":"写代码","reason":"执行"}',
+                '{"action":"inspect","task":"检查代码","reason":"复检"}',
+                '{"action":"finish","task":"","reason":"通过","final_answer":"完成"}',
+            ]
+        )
+        actual_upstream_calls = 0
+
+        async def fake_streamer(**kwargs: Any) -> dict[str, Any]:
+            nonlocal actual_upstream_calls
+            prompt = kwargs["system_addendum"]
+            rounds = 1 if prompt == LEADER_DECISION_PROMPT else kwargs["max_tool_rounds"] + 1
+            for _ in range(rounds):
+                kwargs["before_model_call"]()
+                actual_upstream_calls += 1
+            if prompt == LEADER_DECISION_PROMPT:
+                return result(next(decisions))
+            if prompt == PROGRAMMER_PROMPT:
+                workspace.write_file("main.py", "print('ok')\n")
+                return result("已完成")
+            if prompt == INSPECTOR_PROMPT:
+                return result("检查通过。\nVERDICT: PASS")
+            raise AssertionError("unexpected role")
+
+        async def update(_: dict[str, Any]) -> None:
+            return None
+
+        final = await run_collaboration(
+            base_url="https://example.test/v1",
+            api_key="test-key",
+            model="test-model",
+            messages=[{"role": "user", "content": "写代码并检查"}],
+            timeout=30,
+            stopped=lambda: False,
+            update=update,
+            settings={"max_completion_tokens": 65_536},
+            conversation_id="twenty",
+            user_timezone="UTC",
+            effort="high",
+            workspace=workspace,
+            streamer=fake_streamer,
+        )
+        self.assertEqual(final["answer"], "完成")
+        self.assertEqual(actual_upstream_calls, 20)
+        self.assertEqual(final["usage"]["model_calls"], 20)
+
+    async def test_research_limits_are_shared_across_researcher_reentries(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        workspace = ConversationWorkspace(1, "research-budget")
+        workspace.root = Path(temporary.name)
+        decisions = iter(
+            [
+                '{"action":"research","task":"第一批资料","reason":"先查"}',
+                '{"action":"research","task":"补充资料","reason":"再查"}',
+                '{"action":"finish","task":"","reason":"足够","final_answer":"调研完成"}',
+            ]
+        )
+        researcher_limits: list[tuple[int, int, int]] = []
+        researcher_count = 0
+
+        async def fake_streamer(**kwargs: Any) -> dict[str, Any]:
+            nonlocal researcher_count
+            kwargs["before_model_call"]()
+            prompt = kwargs["system_addendum"]
+            if prompt == LEADER_DECISION_PROMPT:
+                return result(next(decisions))
+            if prompt != RESEARCHER_PROMPT:
+                raise AssertionError("unexpected role")
+            researcher_count += 1
+            limits = (kwargs["web_search_limit"], kwargs["web_fetch_limit"], kwargs["web_tool_round_limit"])
+            researcher_limits.append(limits)
+            if researcher_count == 1:
+                steps = [
+                    {"id": "s1", "action": "search", "status": "completed", "quota_counted": True},
+                    {"id": "s2", "action": "search", "status": "completed", "quota_counted": True},
+                    {"id": "f1", "action": "open_page", "status": "completed", "quota_counted": True},
+                    {"id": "f2", "action": "open_page", "status": "completed", "quota_counted": True},
+                ]
+            else:
+                steps = [
+                    {"id": "s3", "action": "search", "status": "completed", "quota_counted": True},
+                    {"id": "f3", "action": "open_page", "status": "completed", "quota_counted": True},
+                ]
+            return result("资料", searches=steps)
+
+        async def update(_: dict[str, Any]) -> None:
+            return None
+
+        final = await run_collaboration(
+            base_url="https://example.test/v1",
+            api_key="test-key",
+            model="test-model",
+            messages=[{"role": "user", "content": "分两次调研"}],
+            timeout=30,
+            stopped=lambda: False,
+            update=update,
+            settings={"max_completion_tokens": 65_536},
+            conversation_id="research-budget",
+            user_timezone="UTC",
+            effort="high",
+            workspace=workspace,
+            streamer=fake_streamer,
+        )
+        self.assertEqual(final["answer"], "调研完成")
+        self.assertEqual(researcher_limits, [(3, 3, 6), (1, 1, 2)])
+        researcher_steps = [step for agent in final["agents"] if agent["role"] == "researcher" for step in agent["searches"]]
+        self.assertEqual(sum(step["action"] == "search" for step in researcher_steps), 3)
+        self.assertEqual(sum(step["action"] == "open_page" for step in researcher_steps), 3)
 
 
 if __name__ == "__main__":

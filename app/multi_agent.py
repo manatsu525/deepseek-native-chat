@@ -14,6 +14,7 @@ from .workspace import ConversationWorkspace
 MAX_WORKER_ACTIONS = 10
 MAX_LEADER_DECISIONS = 14
 MAX_ROLE_ACTIONS = 5
+MAX_MODEL_CALLS = 20
 MAX_VISIBLE_ANSWER_CHARS = 20_000
 MAX_VISIBLE_REASONING_CHARS = 12_000
 MAX_STATE_OUTPUT_CHARS = 5_000
@@ -24,6 +25,25 @@ ROLE_LABELS = {
     "programmer": "程序员",
     "inspector": "检查员",
 }
+
+
+class ModelCallLimitExceeded(RuntimeError):
+    pass
+
+
+class ModelCallBudget:
+    def __init__(self, limit: int = MAX_MODEL_CALLS) -> None:
+        self.limit = int(limit)
+        self.used = 0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.limit - self.used)
+
+    def consume(self) -> None:
+        if self.used >= self.limit:
+            raise ModelCallLimitExceeded(f"多智能体协作每个问题最多调用模型 {self.limit} 次")
+        self.used += 1
 
 LEADER_DECISION_PROMPT = """你是四智能体协作组的 Leader，负责理解用户目标、决定下一步由谁工作，并最终整合答案。你自己没有工具，也不要假装执行过搜索、文件修改或测试。
 
@@ -41,7 +61,7 @@ LEADER_DECISION_PROMPT = """你是四智能体协作组的 Leader，负责理解
 
 LEADER_FINAL_PROMPT = """你是协作组 Leader。根据用户原始对话、调研结论、程序员实际保存的文件和检查员结果，给出最终回答。只回答用户，不要再输出调度 JSON，不要声称做过记录中没有发生的工作。清楚说明完成内容、关键结论、文件和仍存在的限制。使用与用户提问相同的语言。"""
 
-RESEARCHER_PROMPT = """你是协作组的调研员，只负责外部信息调研和事实核查。你可以使用搜索和网页抓取工具，但没有工作区文件权限。围绕 Leader 指派的任务寻找可靠资料，交叉核对关键结论，并给程序员或 Leader 提供简洁、可执行且带来源的报告。不要假装修改或测试文件。"""
+RESEARCHER_PROMPT = """你是协作组的调研员，只负责外部信息调研和事实核查。你可以使用搜索和网页抓取工具，但没有工作区文件权限。围绕 Leader 指派的任务寻找可靠资料，交叉核对关键结论，并给程序员或 Leader 提供简洁、可执行且带来源的报告。不要假装修改或测试文件。整个用户问题内，调研员所有出场合计最多搜索 3 次、抓取 3 次、搜索与抓取总计 6 次；界面实际提供的工具额度就是剩余额度，禁止绕过或无意义消耗。"""
 
 PROGRAMMER_PROMPT = """你是协作组的程序员，负责具体执行、创建和修改共享工作区文件，并运行适用的检查。你拥有联网和完整工作区工具。先查看当前工作区真实状态，再完成 Leader 的任务；收到检查员反馈时必须针对反馈实际修改文件，不要只描述建议。尽量局部修改，避免无意义地重读或重写文件。完成后简洁列出改动文件、执行的验证及结果，不要在回答中重复粘贴已保存的完整代码。"""
 
@@ -110,7 +130,24 @@ def _usage_for(agents: list[dict[str, Any]]) -> dict[str, Any]:
     usage: dict[str, Any] = {}
     for agent in agents:
         usage = _merge_usage(usage, agent.get("usage") or {})
+    usage["model_calls"] = sum(int((agent.get("usage") or {}).get("model_calls") or 0) for agent in agents)
     return usage
+
+
+def _research_tool_usage(agents: list[dict[str, Any]]) -> dict[str, int]:
+    searches = 0
+    fetches = 0
+    for agent in agents:
+        if agent.get("role") != "researcher":
+            continue
+        for step in agent.get("searches") or []:
+            if not step.get("quota_counted"):
+                continue
+            if step.get("action") == "search":
+                searches += 1
+            elif step.get("action") == "open_page":
+                fetches += 1
+    return {"searches": searches, "fetches": fetches, "total": searches + fetches}
 
 
 def _sources_for(agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -155,6 +192,8 @@ def _state_packet(
     pending_inspection: bool,
     blocker: str,
     guard_message: str = "",
+    model_calls_used: int = 0,
+    model_call_limit: int = MAX_MODEL_CALLS,
 ) -> str:
     completed = []
     for agent in agents:
@@ -174,6 +213,9 @@ def _state_packet(
         "program_changes_need_inspection": pending_inspection,
         "unresolved_inspector_feedback": _trim(blocker, MAX_STATE_OUTPUT_CHARS),
         "orchestrator_guard": guard_message,
+        "model_calls": {"used": model_calls_used, "limit": model_call_limit, "remaining": max(0, model_call_limit - model_calls_used)},
+        "research_tool_usage": _research_tool_usage(agents),
+        "research_tool_limits": {"searches": 3, "fetches": 3, "total": 6},
     }
     return (
         "以下是协作组的当前共享状态。请结合此前的用户原始对话作决定：\n"
@@ -201,6 +243,23 @@ async def run_collaboration(
     agents: list[dict[str, Any]] = []
     final_answer = ""
     final_reasoning = ""
+    budget = ModelCallBudget()
+
+    def shared_state(
+        *,
+        pending_inspection: bool,
+        blocker: str,
+        guard_message: str = "",
+    ) -> str:
+        return _state_packet(
+            agents,
+            workspace,
+            pending_inspection=pending_inspection,
+            blocker=blocker,
+            guard_message=guard_message,
+            model_calls_used=budget.used,
+            model_call_limit=budget.limit,
+        )
 
     async def emit() -> None:
         await update(
@@ -220,6 +279,8 @@ async def run_collaboration(
         packet: str,
         *,
         phase: str = "work",
+        reserve_calls: int = 0,
+        web_limits: tuple[int, int, int] = (3, 3, 6),
     ) -> dict[str, Any]:
         capabilities = {
             "leader": (False, "none", LEADER_FINAL_PROMPT if phase == "final" else LEADER_DECISION_PROMPT),
@@ -229,6 +290,13 @@ async def run_collaboration(
         }
         web_enabled, workspace_access, system_prompt = capabilities[role]
         tool_round_limits = {"leader": 0, "researcher": 6, "programmer": 12, "inspector": 6}
+        if budget.remaining <= reserve_calls:
+            raise ModelCallLimitExceeded(f"模型调用剩余 {budget.remaining} 次，必须预留 {reserve_calls} 次完成协作")
+        role_call_allowance = budget.remaining - reserve_calls
+        effective_tool_rounds = min(tool_round_limits[role], max(0, role_call_allowance - 1))
+        if role == "researcher":
+            effective_tool_rounds = min(effective_tool_rounds, max(0, web_limits[2]))
+        start_model_calls = budget.used
         record: dict[str, Any] = {
             "id": f"agent-{len(agents) + 1}",
             "role": role,
@@ -251,7 +319,8 @@ async def run_collaboration(
             record["reasoning"] = _trim(state.get("reasoning"), MAX_VISIBLE_REASONING_CHARS)
             record["searches"] = state.get("searches") or []
             record["sources"] = state.get("sources") or []
-            record["usage"] = state.get("usage") or {}
+            record["usage"] = dict(state.get("usage") or {})
+            record["usage"]["model_calls"] = budget.used - start_model_calls
             await emit()
 
         try:
@@ -271,7 +340,11 @@ async def run_collaboration(
                 web_enabled=web_enabled,
                 workspace_access=workspace_access,
                 system_addendum=system_prompt,
-                max_tool_rounds=tool_round_limits[role],
+                max_tool_rounds=effective_tool_rounds,
+                web_search_limit=web_limits[0],
+                web_fetch_limit=web_limits[1],
+                web_tool_round_limit=web_limits[2],
+                before_model_call=budget.consume,
             )
         except asyncio.CancelledError:
             record["status"] = "stopped"
@@ -280,6 +353,8 @@ async def run_collaboration(
         except Exception as exc:
             record["status"] = "failed"
             record["error"] = str(exc)[:3_000]
+            record["usage"] = dict(record.get("usage") or {})
+            record["usage"]["model_calls"] = budget.used - start_model_calls
             await emit()
             raise
         record["status"] = "completed"
@@ -287,7 +362,8 @@ async def run_collaboration(
         record["reasoning"] = _trim(result.get("reasoning"), MAX_VISIBLE_REASONING_CHARS)
         record["searches"] = result.get("searches") or []
         record["sources"] = result.get("sources") or []
-        record["usage"] = result.get("usage") or {}
+        record["usage"] = dict(result.get("usage") or {})
+        record["usage"]["model_calls"] = budget.used - start_model_calls
         if result.get("tool_trace"):
             record["tool_trace"] = result["tool_trace"]
         await emit()
@@ -299,18 +375,27 @@ async def run_collaboration(
     worker_actions = 0
     decisions = 0
     role_counts = {"research": 0, "program": 0, "inspect": 0}
+    budget_exhausted = False
 
-    while decisions < MAX_LEADER_DECISIONS and worker_actions < MAX_WORKER_ACTIONS:
+    while decisions < MAX_LEADER_DECISIONS and worker_actions < MAX_WORKER_ACTIONS and budget.remaining > 0:
         if stopped():
             raise asyncio.CancelledError
-        state_packet = _state_packet(
-            agents,
-            workspace,
+        forced_final = budget.remaining == 1
+        if forced_final:
+            guard_message = (
+                f"只剩最后 1 次模型调用，必须立即选择 finish 并在 final_answer 中如实汇总；"
+                f"如仍有未修复或未复检问题，必须明确告知用户。总调用绝不能超过 {budget.limit} 次。"
+            )
+        state_packet = shared_state(
             pending_inspection=pending_inspection,
             blocker=blocker,
             guard_message=guard_message,
         )
-        decision_result = await run_role("leader", "决定下一步工作", state_packet, phase="decision")
+        try:
+            decision_result = await run_role("leader", "决定下一步工作", state_packet, phase="decision")
+        except ModelCallLimitExceeded:
+            budget_exhausted = True
+            break
         decisions += 1
         leader_record = agents[-1]
         try:
@@ -328,7 +413,7 @@ async def run_collaboration(
 
         action = decision["action"]
         if action == "finish":
-            if pending_inspection or blocker:
+            if (pending_inspection or blocker) and not forced_final:
                 guard_message = "存在尚未通过检查的程序改动或待修复问题，不能结束。请安排程序员修复或检查员复检。"
                 continue
             final_answer = decision["final_answer"]
@@ -336,6 +421,11 @@ async def run_collaboration(
             if not final_answer:
                 guard_message = "finish 缺少必填的 final_answer，不能结束。请重新返回 finish JSON，并直接写好给用户的完整最终回答。"
                 continue
+            if forced_final and (pending_inspection or blocker):
+                final_answer = (
+                    f"⚠️ 多智能体协作已达到每个问题最多 {budget.limit} 次模型调用的硬上限；"
+                    "以下结果仍有未修复或未复检项目。\n\n" + final_answer
+                )
             await emit()
             break
 
@@ -343,30 +433,66 @@ async def run_collaboration(
             guard_message = f"{action} 已达到单角色调用上限，请基于现有结果选择其他动作或在条件允许时结束。"
             continue
 
-        role_counts[action] += 1
-        worker_actions += 1
-        guard_message = ""
         if action == "research":
+            research_used = _research_tool_usage(agents)
+            research_limits = (
+                max(0, 3 - research_used["searches"]),
+                max(0, 3 - research_used["fetches"]),
+                max(0, 6 - research_used["total"]),
+            )
+            if research_limits[2] <= 0 or (research_limits[0] <= 0 and research_limits[1] <= 0):
+                guard_message = "调研员已用完本问题的 3 次搜索、3 次抓取或合计 6 次工具额度，不能继续调研。"
+                continue
+            if budget.remaining < 3:
+                guard_message = "模型调用预算不足以完成一次调研并让 Leader 汇总，请立即 finish。"
+                continue
+            role_counts[action] += 1
+            worker_actions += 1
+            guard_message = ""
             packet = (
                 f"Leader 指派的调研任务：{decision['task']}\n\n"
-                + _state_packet(agents, workspace, pending_inspection=pending_inspection, blocker=blocker)
+                + shared_state(pending_inspection=pending_inspection, blocker=blocker)
             )
-            await run_role("researcher", decision["task"], packet)
+            try:
+                await run_role("researcher", decision["task"], packet, reserve_calls=1, web_limits=research_limits)
+            except ModelCallLimitExceeded:
+                budget_exhausted = True
+                break
         elif action == "program":
+            if budget.remaining < 5:
+                guard_message = "模型调用预算不足以执行编程、检查和最终汇总，请立即 finish 并说明未完成项。"
+                continue
+            role_counts[action] += 1
+            worker_actions += 1
+            guard_message = ""
             feedback = f"\n\n必须处理的检查员反馈：\n{blocker}" if blocker else ""
             packet = (
                 f"Leader 指派的程序任务：{decision['task']}{feedback}\n\n"
-                + _state_packet(agents, workspace, pending_inspection=pending_inspection, blocker=blocker)
+                + shared_state(pending_inspection=pending_inspection, blocker=blocker)
             )
-            await run_role("programmer", decision["task"], packet)
+            try:
+                await run_role("programmer", decision["task"], packet, reserve_calls=3)
+            except ModelCallLimitExceeded:
+                budget_exhausted = True
+                break
             blocker = ""
             pending_inspection = True
         else:
+            if budget.remaining < 3:
+                guard_message = "模型调用预算不足以执行检查并让 Leader 汇总，请立即 finish 并说明未复检。"
+                continue
+            role_counts[action] += 1
+            worker_actions += 1
+            guard_message = ""
             packet = (
                 f"Leader 指派的独立检查任务：{decision['task']}\n\n"
-                + _state_packet(agents, workspace, pending_inspection=pending_inspection, blocker=blocker)
+                + shared_state(pending_inspection=pending_inspection, blocker=blocker)
             )
-            inspection = await run_role("inspector", decision["task"], packet)
+            try:
+                inspection = await run_role("inspector", decision["task"], packet, reserve_calls=1)
+            except ModelCallLimitExceeded:
+                budget_exhausted = True
+                break
             verdict = _inspection_verdict(str(inspection.get("answer") or ""))
             agents[-1]["verdict"] = verdict
             if verdict == "PASS":
@@ -379,22 +505,37 @@ async def run_collaboration(
 
     if not final_answer:
         unresolved = (
-            "协作轮次已达到上限，且仍有未通过的程序检查。必须明确告诉用户未完成及剩余问题。"
+            "模型调用或协作轮次即将达到上限，且仍有未通过的程序检查。必须明确告诉用户未完成及剩余问题。"
             if pending_inspection or blocker
-            else "协作轮次已达到上限。请基于已有产出给出最佳最终回答并说明限制。"
+            else "模型调用或协作轮次即将达到上限。请基于已有产出给出最佳最终回答并说明限制。"
         )
-        final_packet = _state_packet(
-            agents,
-            workspace,
-            pending_inspection=pending_inspection,
-            blocker=blocker,
-            guard_message=unresolved,
-        ) + "\n\n现在停止调度并向用户给出最终回答。"
-        final_result = await run_role("leader", "在轮次上限内整合回答", final_packet, phase="final")
-        final_answer = str(final_result.get("answer") or "").strip()
-        final_reasoning = str(final_result.get("reasoning") or "")
+        if budget.remaining > 0:
+            final_packet = shared_state(
+                pending_inspection=pending_inspection,
+                blocker=blocker,
+                guard_message=unresolved,
+            ) + "\n\n现在停止调度并向用户给出最终回答。"
+            try:
+                final_result = await run_role("leader", "在硬限制内整合回答", final_packet, phase="final")
+            except ModelCallLimitExceeded:
+                budget_exhausted = True
+            else:
+                final_answer = str(final_result.get("answer") or "").strip()
+                final_reasoning = str(final_result.get("reasoning") or "")
         if not final_answer:
-            raise RuntimeError("Leader 未生成最终回答")
+            completed = [
+                f"- {agent.get('label')}：{_trim(agent.get('answer'), 1_500)}"
+                for agent in agents
+                if agent.get("role") != "leader" and agent.get("status") == "completed" and agent.get("answer")
+            ][-3:]
+            files = "、".join(item["path"] for item in workspace.list_files()) or "无"
+            reason = "模型调用已达到硬上限" if budget_exhausted or budget.remaining <= 0 else "协作轮次已达到上限"
+            final_answer = (
+                f"⚠️ {reason}（每个问题最多 {budget.limit} 次），已停止继续请求以避免触发 RPM 限流。\n\n"
+                + ("当前已完成：\n" + "\n".join(completed) + "\n\n" if completed else "")
+                + f"当前工作区文件：{files}。"
+                + ("\n\n仍有未修复或未复检的问题，请在下一条消息中继续。" if pending_inspection or blocker else "")
+            )
         await emit()
 
     searches = _searches_for(agents)
