@@ -38,6 +38,8 @@ from .workspace import ConversationWorkspace, WorkspaceError, delete_conversatio
 db = Database(settings.db_path)
 secret = b""
 tasks: dict[str, asyncio.Task[Any]] = {}
+MAX_CONCURRENT_JOBS = 2
+job_slots: Optional[asyncio.Semaphore] = None
 attachment_cleanup_task: Optional[asyncio.Task[Any]] = None
 attachment_upload_locks: dict[int, asyncio.Lock] = {}
 attachment_processing_lock = asyncio.Lock()
@@ -358,9 +360,9 @@ def title_for(text: str) -> str:
     return compact[:36] + ("…" if len(compact) > 36 else "")
 
 
-async def run_job(job_id: str) -> None:
+async def _execute_job(job_id: str) -> None:
     job = db.one("SELECT * FROM jobs WHERE id=?", (job_id,))
-    if not job:
+    if not job or job["status"] not in {"queued", "running"}:
         return
     attachment_records = db.attachments_for_job(job["user_id"], job_id)
     provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (job["provider_id"], job["user_id"]))
@@ -559,6 +561,18 @@ async def run_job(job_id: str) -> None:
         if attachment_records:
             deleted = db.delete_attachments(job["user_id"], [item["id"] for item in attachment_records])
             await asyncio.to_thread(attachments.delete_files, deleted)
+
+
+async def run_job(job_id: str) -> None:
+    """Run one job while keeping excess conversations visibly queued."""
+    try:
+        slots = job_slots
+        if slots is None:
+            await _execute_job(job_id)
+        else:
+            async with slots:
+                await _execute_job(job_id)
+    finally:
         tasks.pop(job_id, None)
 
 
@@ -569,10 +583,11 @@ def launch(job_id: str) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global secret, attachment_cleanup_task
+    global secret, attachment_cleanup_task, job_slots
     db.init()
     migrate_custom_provider_settings()
     secret = load_secret(settings.secret_path)
+    job_slots = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
     if not db.one("SELECT id FROM users LIMIT 1"):
         username = os.getenv("ADMIN_USERNAME", "admin").strip() or "admin"
         password = os.getenv("ADMIN_PASSWORD", "")

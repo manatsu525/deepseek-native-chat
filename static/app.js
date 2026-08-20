@@ -615,7 +615,7 @@ async function openConversation(id) {
     restoreProviderForConversation(data);
     storeValue('active-conversation', state.conversation.id);
     $('#conversationTitle').textContent=state.conversation.title;renderWorkspaceState(); renderMessages(); await Promise.all([loadHistory(state.page),loadPendingAttachments()]);
-    if(state.job)startPolling(state.job.id);
+    if(state.job)startPolling(state.job.id);else setRunning(false);
     return true;
   } catch(err){
     if (err.message === '对话不存在') storeValue('active-conversation', null);
@@ -628,7 +628,7 @@ async function newConversation(){
   if(state.retryingAnswer){toast('正在重新回答');return}
   if(!state.conversation&&state.pendingAttachments.length)await discardPendingAttachments();
   stopPolling();state.conversation=null;state.messages=[];state.job=null;state.pendingAttachments=[];state.attachmentDraftId=newAttachmentDraftId();state.workspaceFiles=[];
-  storeValue('active-conversation','__new__');storeValue('attachment-draft',state.attachmentDraftId);$('#conversationTitle').textContent='新对话';renderPendingAttachments();renderWorkspaceState();setAttachmentStatus('');renderMessages();loadHistory(1);
+  setRunning(false);storeValue('active-conversation','__new__');storeValue('attachment-draft',state.attachmentDraftId);$('#conversationTitle').textContent='新对话';renderPendingAttachments();renderWorkspaceState();setAttachmentStatus('');renderMessages();loadHistory(1);
 }
 
 async function submitPrompt(value) {
