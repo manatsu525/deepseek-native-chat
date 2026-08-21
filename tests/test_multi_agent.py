@@ -42,9 +42,9 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
             [
                 '{"action":"research","reason":"需要外部资料"}',
                 '{"action":"inspect","reason":"关键数字存在未解决口径冲突"}',
-                '{"action":"finish","reason":"想跳过补查","final_answer":"不应采用"}',
+                '{"action":"finish","reason":"想跳过补查"}',
                 '{"action":"research","reason":"按审查意见定向补查"}',
-                '{"action":"finish","reason":"证据缺口已解决","final_answer":"核实后的回答"}',
+                '{"action":"finish","reason":"证据缺口已解决"}',
             ]
         )
         researcher_packets: list[str] = []
@@ -69,6 +69,8 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
                     "数字乙的摘要缺少决定适用范围的条件，且与数字甲冲突；需要 Atlas 定向补查。\n"
                     "VERDICT: RESEARCH_REQUIRED"
                 )
+            if prompt == LEADER_FINAL_PROMPT:
+                return result("核实后的回答")
             raise AssertionError("unexpected role")
 
         async def update(_: dict[str, Any]) -> None:
@@ -113,7 +115,7 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
         decisions = iter(
             [
                 '{"action":"research","task":"' + altered_task + '","reason":"需要资料"}',
-                '{"action":"finish","reason":"资料足够","final_answer":"已按原请求完成方案甲的风险调研，未执行部署。"}',
+                '{"action":"finish","reason":"资料足够"}',
             ]
         )
         researcher_packets: list[str] = []
@@ -129,6 +131,8 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(original_request, packet)
                 self.assertNotIn(altered_task, packet)
                 return result("仅核实了方案甲的风险，没有执行部署。")
+            if prompt == LEADER_FINAL_PROMPT:
+                return result("已按原请求完成方案甲的风险调研，未执行部署。")
             raise AssertionError("unexpected role")
 
         async def update(_: dict[str, Any]) -> None:
@@ -169,7 +173,7 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
                 '{"action":"research","task":"核对正确算法","reason":"修复前需要资料"}',
                 '{"action":"program","task":"按检查意见修复","reason":"存在阻断问题"}',
                 '{"action":"inspect","task":"复检修复结果","reason":"确认问题已解决"}',
-                '{"action":"finish","task":"","reason":"复检通过","final_answer":"程序已经修复并通过检查，可下载 app.py。"}',
+                '{"action":"finish","task":"","reason":"复检通过"}',
             ]
         )
         calls: list[dict[str, Any]] = []
@@ -209,7 +213,7 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
                     searches=[{"id": "s1", "action": "search", "status": "completed", "query": "algorithm", "quota_counted": True}],
                 )
             if prompt == LEADER_FINAL_PROMPT:
-                raise AssertionError("normal finish must not require another model call")
+                return result("程序已经修复并通过检查，可下载 app.py。")
             raise AssertionError("unexpected role prompt")
 
         updates: list[dict[str, Any]] = []
@@ -269,9 +273,9 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
         decisions = iter(
             [
                 '{"action":"program","task":"写文件","reason":"执行"}',
-                '{"action":"finish","task":"","reason":"想直接结束","final_answer":"不应被采用"}',
+                '{"action":"finish","task":"","reason":"想直接结束"}',
                 '{"action":"inspect","task":"检查文件","reason":"需要复检"}',
-                '{"action":"finish","task":"","reason":"已经通过","final_answer":"最终完成"}',
+                '{"action":"finish","task":"","reason":"已经通过"}',
             ]
         )
         prompts: list[str] = []
@@ -288,7 +292,8 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
             if prompt == INSPECTOR_PROMPT:
                 return result("检查通过。\nVERDICT: PASS")
             if prompt == LEADER_FINAL_PROMPT:
-                raise AssertionError("normal finish must not require another model call")
+                self.assertEqual(kwargs["settings"]["max_completion_tokens"], 65_536)
+                return result("最终完成")
             raise AssertionError("unexpected role")
 
         async def update(_: dict[str, Any]) -> None:
@@ -310,7 +315,7 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
             streamer=fake_streamer,
         )
         self.assertEqual(final["answer"], "最终完成")
-        self.assertEqual(prompts.count(LEADER_FINAL_PROMPT), 0)
+        self.assertEqual(prompts.count(LEADER_FINAL_PROMPT), 1)
         self.assertLess(prompts.index(INSPECTOR_PROMPT), len(prompts))
 
     def test_decision_parser_accepts_fenced_json(self) -> None:
@@ -342,7 +347,7 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
             [
                 '{"action":"program","task":"写代码","reason":"执行"}',
                 '{"action":"inspect","task":"检查代码","reason":"复检"}',
-                '{"action":"finish","task":"","reason":"通过","final_answer":"完成"}',
+                '{"action":"finish","task":"","reason":"通过"}',
             ]
         )
         actual_upstream_calls = 0
@@ -361,6 +366,8 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
                 return result("已完成")
             if prompt == INSPECTOR_PROMPT:
                 return result("检查通过。\nVERDICT: PASS")
+            if prompt == LEADER_FINAL_PROMPT:
+                return result("完成")
             raise AssertionError("unexpected role")
 
         async def update(_: dict[str, Any]) -> None:
@@ -394,7 +401,7 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
             [
                 '{"action":"research","task":"第一批资料","reason":"先查"}',
                 '{"action":"research","task":"补充资料","reason":"再查"}',
-                '{"action":"finish","task":"","reason":"足够","final_answer":"调研完成"}',
+                '{"action":"finish","task":"","reason":"足够"}',
             ]
         )
         researcher_limits: list[tuple[int, int, int]] = []
@@ -407,6 +414,8 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
             if prompt == LEADER_DECISION_PROMPT:
                 return result(next(decisions))
             if prompt != RESEARCHER_PROMPT:
+                if prompt == LEADER_FINAL_PROMPT:
+                    return result("调研完成")
                 raise AssertionError("unexpected role")
             researcher_count += 1
             limits = (kwargs["web_search_limit"], kwargs["web_fetch_limit"], kwargs["web_tool_round_limit"])

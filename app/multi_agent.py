@@ -47,8 +47,8 @@ class ModelCallBudget:
 
 LEADER_DECISION_PROMPT = """你是四智能体协作组的 Nexus，负责决定下一步由哪个角色工作，并最终整合答案。你自己没有工具，也不要假装执行过搜索、文件修改或测试。
 
-每次只决定一个下一步动作，并且只输出一个 JSON 对象，不要 Markdown 代码块或额外文字：
-{"action":"research|program|inspect|finish","reason":"简短决策依据","final_answer":"仅 finish 时填写的完整最终回答，其他动作为空"}
+每次只决定一个下一步动作，并且只输出一个 JSON 对象，不要 Markdown 代码块、最终回答或额外文字：
+{"action":"research|program|inspect|finish","reason":"简短决策依据"}
 
 规则：
 - 用户原始对话是唯一任务来源，优先级高于你的理解、共享状态和其他智能体结论。你只能选择角色，不能改写用户任务后再分派；编排器会直接把用户原始请求交给所选角色。
@@ -57,7 +57,7 @@ LEADER_DECISION_PROMPT = """你是四智能体协作组的 Nexus，负责决定�
 - research：需要外部资料、文档、事实核查时交给 Atlas；可以在工作中的任何阶段再次调用。
 - program：需要创建/修改文件、执行代码或修复 Sentinel 发现的问题时交给 Forge。
 - inspect：工程任务中，Forge 产出后交给 Sentinel 独立读取、测试和审查；非代码信息任务中，仅当 Atlas 的关键证据存在来源薄弱、实质冲突、关键限定缺失或重要推断未被证据直接支持等风险时，交给 Sentinel 做证据审查。简单且证据清晰的问题不要机械增加审查轮次。
-- finish：证据和产出已经足够且没有待修复或待复检的问题时结束；必须同时在 final_answer 中直接写好给用户的完整回答，以免再调用一次模型。
+- finish：证据和产出已经足够且没有待修复或待复检的问题时结束。只返回调度 JSON；编排器会另行调用专门的最终整合阶段，禁止把最终回答塞进这个 JSON。
 - 多智能体模式的最终回答默认必须全面、详细，因为用户选择该模式就是希望得到完整的协作成果。只要调用过 Atlas、Forge 或 Sentinel，就要充分整合各角色的有效产出；除非用户明确要求一句话、简短或只给结论，否则不能只给一段压缩总结。回答内容和结构必须由当前问题及已有产出决定：保留所有真正影响结论、实现或使用结果的信息，不要求凑齐预设栏目，也不要补充与问题无关的对比、观点或建议。不要机械复制各角色全文，但也不能丢掉核心信息。没有调用其他角色的简单问题可以直接简洁回答，禁止为了凑长度灌水。
 - 不要为了凑齐角色而调用不需要的智能体，也不要机械串联；根据共享状态作真实决策。
 - 编程任务保持原有流程：Atlas 仅在确实需要外部资料时调研，Forge 负责实现，Sentinel 在 Forge 之后检查；不要把非代码证据审查流程强加到写代码任务。
@@ -122,8 +122,7 @@ def _parse_decision(value: str) -> dict[str, str]:
         raise ValueError(f"Nexus 返回了无效动作：{action or '空'}")
     task = " ".join(str(raw.get("task") or "").split())[:2_000]
     reason = " ".join(str(raw.get("reason") or "").split())[:1_000]
-    final_answer = str(raw.get("final_answer") or "").strip()
-    return {"action": action, "task": task, "reason": reason, "final_answer": final_answer}
+    return {"action": action, "task": task, "reason": reason}
 
 
 def _message_content_text(content: Any) -> str:
@@ -194,7 +193,7 @@ def _role_settings(settings: dict[str, Any], role: str, phase: str = "work") -> 
     configured = int(result.get("max_completion_tokens") or 65_536)
     limits = {
         ("leader", "decision"): 4_096,
-        ("leader", "final"): 16_384,
+        ("leader", "final"): 65_536,
         ("researcher", "work"): 16_384,
         ("programmer", "work"): 32_768,
         ("inspector", "work"): 16_384,
@@ -496,12 +495,12 @@ async def run_collaboration(
                 "禁止继续调度 Atlas；必须基于已有证据给出最佳回答，并明确说明尚未解决的证据缺口和不确定性。"
             )
             break
-        forced_final = budget.remaining == 1
-        if forced_final:
+        if budget.remaining == 1:
             guard_message = (
-                f"只剩最后 1 次模型调用，必须立即选择 finish 并在 final_answer 中如实汇总；"
-                f"如仍有未修复或未复检问题，必须明确告知用户。总调用绝不能超过 {budget.limit} 次。"
+                f"只剩最后 1 次模型调用，必须跳过后续调度并用于最终回答；"
+                f"如仍有未修复或未复检问题，最终回答必须明确告知用户。总调用绝不能超过 {budget.limit} 次。"
             )
+            break
         state_packet = shared_state(
             pending_inspection=pending_inspection,
             blocker=blocker,
@@ -536,27 +535,32 @@ async def run_collaboration(
 
         action = decision["action"]
         if action == "finish":
-            if research_blocker and not forced_final:
+            if research_blocker:
                 guard_message = "Sentinel 发现调研证据不足，不能结束。请让 Atlas 按 unresolved_research_review 中的具体问题定向补查。"
                 continue
-            if (pending_inspection or blocker) and not forced_final:
+            if pending_inspection or blocker:
                 guard_message = "存在尚未通过 Sentinel 检查的 Forge 改动或待修复问题，不能结束。请安排 Forge 修复或 Sentinel 复检。"
                 continue
-            candidate_answer = decision["final_answer"]
-            if not candidate_answer:
-                guard_message = "finish 缺少必填的 final_answer，不能结束。请重新返回 finish JSON，并直接写好给用户的完整最终回答。"
-                continue
-            final_answer = candidate_answer
-            final_reasoning = str(leader_record.get("reasoning") or "")
-            if forced_final and (pending_inspection or blocker or research_blocker):
-                final_answer = (
-                    f"⚠️ 多智能体协作已达到每个问题最多 {budget.limit} 次模型调用的硬上限；"
-                    "以下结果仍有未修复或未复检项目。\n\n" + final_answer
-                )
+            final_packet = shared_state(
+                pending_inspection=pending_inspection,
+                blocker=blocker,
+                research_feedback=research_blocker,
+                guard_message=(
+                    "Nexus 已决定结束协作。现在使用专门的最终整合阶段回答用户；"
+                    "不要继续调度，不要输出 JSON，并充分整合所有有效产出。"
+                ),
+            ) + "\n\n现在停止调度并向用户给出完整、具体的最终回答。"
+            try:
+                final_result = await run_role("leader", "整合完整最终回答", final_packet, phase="final")
+            except ModelCallLimitExceeded:
+                budget_exhausted = True
+                break
+            final_answer = str(final_result.get("answer") or "").strip()
+            final_reasoning = str(final_result.get("reasoning") or "")
             await emit()
             break
 
-        if research_blocker and action != "research" and not forced_final:
+        if research_blocker and action != "research":
             guard_message = "Sentinel 已要求补充调研；下一步必须选择 research，让 Atlas 定向解决 unresolved_research_review。"
             continue
 
