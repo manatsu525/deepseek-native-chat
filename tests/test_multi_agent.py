@@ -13,6 +13,7 @@ from app.multi_agent import (
     ModelCallBudget,
     ModelCallLimitExceeded,
     PROGRAMMER_PROMPT,
+    RESEARCH_INSPECTOR_PROMPT,
     RESEARCHER_PROMPT,
     _parse_decision,
     run_collaboration,
@@ -32,6 +33,76 @@ def result(answer: str, *, searches: list[dict[str, Any]] | None = None) -> dict
 
 
 class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_non_code_research_can_be_audited_and_sent_back_to_atlas(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        workspace = ConversationWorkspace(1, "research-review")
+        workspace.root = Path(temporary.name)
+        decisions = iter(
+            [
+                '{"action":"research","reason":"需要外部资料"}',
+                '{"action":"inspect","reason":"关键数字存在未解决口径冲突"}',
+                '{"action":"finish","reason":"想跳过补查","final_answer":"不应采用"}',
+                '{"action":"research","reason":"按审查意见定向补查"}',
+                '{"action":"finish","reason":"证据缺口已解决","final_answer":"核实后的回答"}',
+            ]
+        )
+        researcher_packets: list[str] = []
+        inspector_calls: list[dict[str, Any]] = []
+        researcher_count = 0
+
+        async def fake_streamer(**kwargs: Any) -> dict[str, Any]:
+            nonlocal researcher_count
+            kwargs["before_model_call"]()
+            prompt = kwargs["system_addendum"]
+            if prompt == LEADER_DECISION_PROMPT:
+                return result(next(decisions))
+            if prompt == RESEARCHER_PROMPT:
+                researcher_count += 1
+                researcher_packets.append(kwargs["messages"][-1]["content"])
+                if researcher_count == 1:
+                    return result("数字甲来自已抓取来源；数字乙仅为搜索摘要，冲突尚未解决。")
+                return result("已定向补查，确认数字甲对应用户指定对象；数字乙属于其他版本。")
+            if prompt == RESEARCH_INSPECTOR_PROMPT:
+                inspector_calls.append(kwargs)
+                return result(
+                    "数字乙没有正文证据，且尚未对应具体版本；需要 Atlas 定向补查。\n"
+                    "VERDICT: RESEARCH_REQUIRED"
+                )
+            raise AssertionError("unexpected role")
+
+        async def update(_: dict[str, Any]) -> None:
+            return None
+
+        final = await run_collaboration(
+            base_url="https://example.test/v1",
+            api_key="test-key",
+            model="test-model",
+            messages=[{"role": "user", "content": "查询并比较两个公开数据口径"}],
+            timeout=30,
+            stopped=lambda: False,
+            update=update,
+            settings={"max_completion_tokens": 65_536},
+            conversation_id="research-review",
+            user_timezone="UTC",
+            effort="high",
+            workspace=workspace,
+            streamer=fake_streamer,
+        )
+
+        self.assertEqual(final["answer"], "核实后的回答")
+        self.assertEqual(researcher_count, 2)
+        self.assertIn("必须解决的 Sentinel 调研审查反馈", researcher_packets[1])
+        self.assertIn("数字乙没有正文证据", researcher_packets[1])
+        self.assertEqual(len(inspector_calls), 1)
+        self.assertFalse(inspector_calls[0]["web_enabled"])
+        self.assertIsNone(inspector_calls[0]["workspace"])
+        self.assertEqual(inspector_calls[0]["workspace_access"], "none")
+        self.assertEqual(inspector_calls[0]["max_tool_rounds"], 0)
+        reviewers = [item for item in final["agents"] if item["role"] == "inspector"]
+        self.assertEqual(reviewers[0]["verdict"], "RESEARCH_REQUIRED")
+        self.assertFalse(any(item["role"] == "programmer" for item in final["agents"]))
+
     async def test_leader_paraphrase_cannot_replace_user_request_for_worker(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
