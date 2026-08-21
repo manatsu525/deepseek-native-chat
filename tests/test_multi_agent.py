@@ -61,12 +61,12 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
                 researcher_count += 1
                 researcher_packets.append(kwargs["messages"][-1]["content"])
                 if researcher_count == 1:
-                    return result("数字甲来自正文；数字乙来自搜索摘要，但摘要未标明对应版本，冲突尚未解决。")
-                return result("已定向补查，确认数字甲对应用户指定对象；数字乙属于其他版本。")
+                    return result("数字甲来自正文；数字乙来自搜索摘要，但摘要缺少决定适用范围的条件，冲突尚未解决。")
+                return result("已定向补查，确认数字甲适用于用户问题；数字乙适用于另一种条件。")
             if prompt == RESEARCH_INSPECTOR_PROMPT:
                 inspector_calls.append(kwargs)
                 return result(
-                    "数字乙的摘要没有标明具体版本，且与数字甲冲突；需要 Atlas 定向补查。\n"
+                    "数字乙的摘要缺少决定适用范围的条件，且与数字甲冲突；需要 Atlas 定向补查。\n"
                     "VERDICT: RESEARCH_REQUIRED"
                 )
             raise AssertionError("unexpected role")
@@ -93,7 +93,7 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final["answer"], "核实后的回答")
         self.assertEqual(researcher_count, 2)
         self.assertIn("必须解决的 Sentinel 调研审查反馈", researcher_packets[1])
-        self.assertIn("数字乙的摘要没有标明具体版本", researcher_packets[1])
+        self.assertIn("数字乙的摘要缺少决定适用范围的条件", researcher_packets[1])
         self.assertEqual(len(inspector_calls), 1)
         self.assertFalse(inspector_calls[0]["web_enabled"])
         self.assertIsNone(inspector_calls[0]["workspace"])
