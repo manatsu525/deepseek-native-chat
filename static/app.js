@@ -739,7 +739,7 @@ function updateProviderUi(){
   $('#welcomeTitle').textContent=collaborative?'让四个智能体协同完成任务':custom?'使用 Custom 本地联网':'问点需要查证的问题';
   $('#welcomeDescription').textContent=collaborative?(custom?'Nexus 动态调度 Atlas、Forge 与 Sentinel；所有角色使用当前 Custom 模型及共享工作区。':'多智能体协作仅支持 Custom 模型，请先切换下方 API。'):custom?`模型通过标准 Chat Completions 调用 ${webInfo.label} 搜索与读取真实来源。`:'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
   if($('#statusText'))$('#statusText').textContent=collaborative?(custom?'多智能体协作 · Nexus 动态调度':'多智能体协作 · 等待 Custom 模型'):'标准模式 · 外部搜索工具已就绪';
-  if($('#footnote'))$('#footnote').textContent=collaborative?'多智能体协作仅用于 Custom 模型；Nexus 统筹，Atlas 按需调研，Forge 工程执行，Sentinel 独立审查并触发返修。':'标准模式：Custom API 使用你选择的搜索与网页抓取方案；DeepSeek 使用服务端原生联网。';
+  if($('#footnote'))$('#footnote').textContent=collaborative?'多智能体协作仅用于 Custom 模型；Nexus 统筹，Atlas 渐进调研，Forge 工程执行，Sentinel 独立审查并触发返修。':'标准模式：Custom API 使用你选择的搜索与网页抓取方案；DeepSeek 使用服务端原生联网。';
 }
 
 async function loadProviders(){
