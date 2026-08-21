@@ -62,6 +62,7 @@ LEADER_DECISION_PROMPT = """你是四智能体协作组的 Nexus，负责决定�
 - 不要为了凑齐角色而调用不需要的智能体，也不要机械串联；根据共享状态作真实决策。
 - 编程任务保持原有流程：Atlas 仅在确实需要外部资料时调研，Forge 负责实现，Sentinel 在 Forge 之后检查；不要把非代码证据审查流程强加到写代码任务。
 - 非代码调研中，你不是 Atlas 的转述者。必须区分网页正文证据、搜索标题/摘要证据、推断和未解决冲突；摘要本身可以作为证据，不能仅因正文抓取失败就否定它，但必须按摘要实际包含的信息控制结论范围和置信度。若 Sentinel 报告 RESEARCH_REQUIRED，必须让 Atlas 按反馈定向补查，不能直接 finish。证据足够时应直接综合回答，不要为了展示协作而强行调用 Sentinel。
+- 共享状态中的 research_tools_available 为 false 时，Atlas 的联网额度已经耗尽，绝不能再选择 research。即使 Sentinel 认为证据仍有缺口，也只能基于已有证据结束并在最终回答中如实说明限制。
 - Sentinel 对代码报告 REVISE 后，必须让 Forge 实际修复，并再次让 Sentinel 复检通过，才能 finish。
 """
 
@@ -227,6 +228,20 @@ def _research_tool_usage(agents: list[dict[str, Any]]) -> dict[str, int]:
     return {"searches": searches, "fetches": fetches, "total": searches + fetches}
 
 
+def _remaining_research_limits(agents: list[dict[str, Any]]) -> tuple[int, int, int]:
+    used = _research_tool_usage(agents)
+    return (
+        max(0, 3 - used["searches"]),
+        max(0, 3 - used["fetches"]),
+        max(0, 6 - used["total"]),
+    )
+
+
+def _research_tools_available(agents: list[dict[str, Any]]) -> bool:
+    searches, fetches, total = _remaining_research_limits(agents)
+    return total > 0 and (searches > 0 or fetches > 0)
+
+
 def _sources_for(agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -298,6 +313,7 @@ def _state_packet(
         "model_calls": {"used": model_calls_used, "limit": model_call_limit, "remaining": max(0, model_call_limit - model_calls_used)},
         "research_tool_usage": _research_tool_usage(agents),
         "research_tool_limits": {"searches": 3, "fetches": 3, "total": 6},
+        "research_tools_available": _research_tools_available(agents),
     }
     return (
         "以下是协作组的当前共享状态。请结合此前的用户原始对话作决定：\n"
@@ -469,10 +485,17 @@ async def run_collaboration(
     decisions = 0
     role_counts = {"research": 0, "program": 0, "inspect": 0}
     budget_exhausted = False
+    research_quota_stop = ""
 
     while decisions < MAX_LEADER_DECISIONS and worker_actions < MAX_WORKER_ACTIONS and budget.remaining > 0:
         if stopped():
             raise asyncio.CancelledError
+        if research_blocker and not _research_tools_available(agents):
+            research_quota_stop = (
+                "Atlas 的搜索和网页抓取额度已经耗尽，无法执行 Sentinel 要求的补查。"
+                "禁止继续调度 Atlas；必须基于已有证据给出最佳回答，并明确说明尚未解决的证据缺口和不确定性。"
+            )
+            break
         forced_final = budget.remaining == 1
         if forced_final:
             guard_message = (
@@ -542,15 +565,13 @@ async def run_collaboration(
             continue
 
         if action == "research":
-            research_used = _research_tool_usage(agents)
-            research_limits = (
-                max(0, 3 - research_used["searches"]),
-                max(0, 3 - research_used["fetches"]),
-                max(0, 6 - research_used["total"]),
-            )
-            if research_limits[2] <= 0 or (research_limits[0] <= 0 and research_limits[1] <= 0):
-                guard_message = "Atlas 已用完本问题的 3 次搜索、3 次抓取或合计 6 次工具额度，不能继续调研。"
-                continue
+            research_limits = _remaining_research_limits(agents)
+            if not _research_tools_available(agents):
+                research_quota_stop = (
+                    "Atlas 的搜索和网页抓取额度已经耗尽，不能执行 Nexus 请求的再次调研。"
+                    "禁止继续调度 Atlas；必须直接基于已有证据回答，并明确说明证据限制。"
+                )
+                break
             if budget.remaining < 3:
                 guard_message = "模型调用预算不足以完成一次调研并让 Nexus 汇总，请立即 finish。"
                 continue
@@ -651,7 +672,7 @@ async def run_collaboration(
             await emit()
 
     if not final_answer:
-        unresolved = (
+        unresolved = research_quota_stop or (
             "模型调用或协作轮次即将达到上限，且仍有未通过的程序检查或未解决的调研证据缺口。必须明确告诉用户未完成及剩余问题。"
             if pending_inspection or blocker or research_blocker
             else "模型调用或协作轮次即将达到上限。请基于已有产出给出最佳最终回答并说明限制。"

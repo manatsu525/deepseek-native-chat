@@ -449,6 +449,72 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(step["action"] == "search" for step in researcher_steps), 3)
         self.assertEqual(sum(step["action"] == "open_page" for step in researcher_steps), 3)
 
+    async def test_exhausted_research_quota_goes_straight_to_final_answer(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        workspace = ConversationWorkspace(1, "research-exhausted")
+        workspace.root = Path(temporary.name)
+        decisions = iter(
+            [
+                '{"action":"research","reason":"查询资料"}',
+                '{"action":"inspect","reason":"审查证据"}',
+            ]
+        )
+        prompts: list[str] = []
+        final_packets: list[str] = []
+
+        async def fake_streamer(**kwargs: Any) -> dict[str, Any]:
+            kwargs["before_model_call"]()
+            prompt = kwargs["system_addendum"]
+            prompts.append(prompt)
+            if prompt == LEADER_DECISION_PROMPT:
+                return result(next(decisions))
+            if prompt == RESEARCHER_PROMPT:
+                return result(
+                    "已取得部分资料。",
+                    searches=[
+                        {"id": "s1", "action": "search", "status": "completed", "quota_counted": True},
+                        {"id": "s2", "action": "search", "status": "completed", "quota_counted": True},
+                        {"id": "s3", "action": "search", "status": "completed", "quota_counted": True},
+                        {"id": "f1", "action": "open_page", "status": "completed", "quota_counted": True},
+                        {"id": "f2", "action": "open_page", "status": "completed", "quota_counted": True},
+                        {"id": "f3", "action": "open_page", "status": "completed", "quota_counted": True},
+                    ],
+                )
+            if prompt == RESEARCH_INSPECTOR_PROMPT:
+                return result("关键事实仍缺少可靠证据。\nVERDICT: RESEARCH_REQUIRED")
+            if prompt == LEADER_FINAL_PROMPT:
+                final_packets.append(kwargs["messages"][-1]["content"])
+                return result("根据现有资料只能得出暂定结论，关键事实仍需后续核实。")
+            raise AssertionError("unexpected role")
+
+        async def update(_: dict[str, Any]) -> None:
+            return None
+
+        final = await run_collaboration(
+            base_url="https://example.test/v1",
+            api_key="test-key",
+            model="test-model",
+            messages=[{"role": "user", "content": "调研一个证据可能不足的问题"}],
+            timeout=30,
+            stopped=lambda: False,
+            update=update,
+            settings={"max_completion_tokens": 65_536},
+            conversation_id="research-exhausted",
+            user_timezone="UTC",
+            effort="high",
+            workspace=workspace,
+            streamer=fake_streamer,
+        )
+
+        self.assertEqual(final["answer"], "根据现有资料只能得出暂定结论，关键事实仍需后续核实。")
+        self.assertEqual(prompts.count(RESEARCHER_PROMPT), 1)
+        self.assertEqual(prompts.count(LEADER_DECISION_PROMPT), 2)
+        self.assertEqual(prompts.count(LEADER_FINAL_PROMPT), 1)
+        self.assertIn('"research_tools_available":false', final_packets[0])
+        self.assertIn("禁止继续调度 Atlas", final_packets[0])
+        self.assertIn("关键事实仍缺少可靠证据", final_packets[0])
+
 
 if __name__ == "__main__":
     unittest.main()
