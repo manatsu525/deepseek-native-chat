@@ -435,7 +435,7 @@ function messageHtml(message, index, live=false, retryable=false) {
   const content = message.content || '';
   const detailKey = meta.trace_key || `trace-${meta.job_id || `message-${index}`}`;
   const messageAttachments = Array.isArray(meta.attachments) && meta.attachments.length ? `<div class="message-attachments">${attachmentChips(meta.attachments)}</div>` : '';
-  const custom = normalizeProviderType(meta.provider_type)==='custom';
+  const custom = isCustomProviderType(meta.provider_type);
   const collaborative=meta.chat_mode==='multi_agent';
   const assistantName = collaborative ? 'Nexus' : custom ? 'Custom' : 'DeepSeek';
   return `<article class="message ${assistant ? 'assistant' : 'user'}${live ? ' live-message' : ''}" data-index="${index}">
@@ -557,7 +557,7 @@ async function retryAnswer(messageIndex,items){
   if(!prompt||!prompt.id){toast('找不到这条消息对应的问题，请刷新后重试');return}
   const provider=selectedProvider();if(!provider){$('#providerModal').showModal();toast('请先添加 API 配置');return}
   const model=selectedModel();if(!model){$('#providerModal').showModal();toast('请先选择模型');return}
-  if(state.chatMode==='multi_agent'&&normalizeProviderType(provider.provider_type)!=='custom'){toast('多智能体协作模式仅支持 Custom 模型');return}
+  if(state.chatMode==='multi_agent'&&!isCustomProviderType(provider.provider_type)){toast('多智能体协作模式仅支持 Custom 模型');return}
   const conversationId=state.conversation.id;
   const promptMessageId=prompt.id;
   state.retryingAnswer=true;setRunning(false);renderMessages();
@@ -640,7 +640,7 @@ async function submitPrompt(value) {
   const content=rawContent||'请分析这些附件。';
   const provider=selectedProvider(); if(!provider){$('#providerModal').showModal();toast('请先添加 API 配置');return}
   const model=selectedModel(); if(!model){$('#providerModal').showModal();toast('请先选择模型');return}
-  if(state.chatMode==='multi_agent'&&normalizeProviderType(provider.provider_type)!=='custom'){toast('多智能体协作模式仅支持 Custom 模型');return}
+  if(state.chatMode==='multi_agent'&&!isCustomProviderType(provider.provider_type)){toast('多智能体协作模式仅支持 Custom 模型');return}
   if(state.job && ['queued','running'].includes(state.job.status)){toast('请先停止当前回答');return}
   const pendingSnapshot=state.pendingAttachments.map(item=>({...item}));
   const attachmentIds=pendingSnapshot.map(item=>item.id);
@@ -680,7 +680,8 @@ function startPolling(id){
 
 function normalizeProviderType(value){return value==='mimo'?'custom':(value||'deepseek')}
 function isMimoModel(value){return String(value||'').toLowerCase().startsWith('mimo-')}
-function providerLabel(provider){return normalizeProviderType(provider.provider_type)==='custom'?'Custom':'DeepSeek'}
+function isCustomProviderType(value){return ['custom','custom_response'].includes(normalizeProviderType(value))}
+function providerLabel(provider){const kind=normalizeProviderType(provider.provider_type);return kind==='custom_response'?'Custom Responses':kind==='custom'?'Custom Chat':'DeepSeek'}
 function providerModels(provider){const models=Array.isArray(provider&&provider.models)&&provider.models.length?provider.models:[provider&&provider.model];return [...new Set(models.filter(Boolean).map(String))]}
 function selectedOption(){return $('#providerSelect').selectedOptions[0]||null}
 function selectedProvider(){const option=selectedOption();const id=option&&option.dataset.providerId||$('#providerSelect').value;return state.providers.find(x=>String(x.id)===String(id))}
@@ -727,7 +728,7 @@ const customWebToolInfo={
 };
 function selectedWebToolInfo(provider=selectedProvider()){const key=customSettings(provider).web_tool_backend;return customWebToolInfo[key]||customWebToolInfo.parallel}
 function updateProviderUi(){
-  const provider=selectedProvider(), custom=provider&&normalizeProviderType(provider.provider_type)==='custom', customEffort=custom&&customSettings(provider).reasoning_effort_enabled;
+  const provider=selectedProvider(), custom=provider&&isCustomProviderType(provider.provider_type), responses=provider&&normalizeProviderType(provider.provider_type)==='custom_response', customEffort=custom&&customSettings(provider).reasoning_effort_enabled;
   const webInfo=custom?selectedWebToolInfo(provider):null;
   const collaborative=state.chatMode==='multi_agent';
   $('#customSettingsButton').classList.toggle('hidden',!custom);
@@ -735,9 +736,9 @@ function updateProviderUi(){
   $('#effort').title=custom?(customEffort?'控制发送给 Custom 模型的 reasoning_effort':'Custom 参数中已关闭 reasoning_effort'):'控制 DeepSeek 模型推理投入';
   $('#nativePill').textContent=collaborative?(custom?'● 4 Agents':'⚠ 仅 Custom'):custom?`● ${webInfo.label}`:'● Native Web';
   $('#welcomeOrbitMark').textContent=collaborative?'4A':custom?'CU':'DS';
-  $('#welcomeEyebrow').textContent=collaborative?'NEXUS · ATLAS · FORGE · SENTINEL':custom?'CUSTOM · OPENAI CHAT': 'DEEPSEEK V4 FLASH';
+  $('#welcomeEyebrow').textContent=collaborative?'NEXUS · ATLAS · FORGE · SENTINEL':responses?'CUSTOM · RESPONSES':custom?'CUSTOM · CHAT COMPLETIONS': 'DEEPSEEK V4 FLASH';
   $('#welcomeTitle').textContent=collaborative?'让四个智能体协同完成任务':custom?'使用 Custom 本地联网':'问点需要查证的问题';
-  $('#welcomeDescription').textContent=collaborative?(custom?'Nexus 动态调度 Atlas、Forge 与 Sentinel；所有角色使用当前 Custom 模型及共享工作区。':'多智能体协作仅支持 Custom 模型，请先切换下方 API。'):custom?`模型通过标准 Chat Completions 调用 ${webInfo.label} 搜索与读取真实来源。`:'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
+  $('#welcomeDescription').textContent=collaborative?(custom?'Nexus 动态调度 Atlas、Forge 与 Sentinel；所有角色使用当前 Custom 模型及共享工作区。':'多智能体协作仅支持 Custom 模型，请先切换下方 API。'):custom?`模型通过标准 ${responses?'Responses':'Chat Completions'} 协议调用 ${webInfo.label} 搜索与读取真实来源。`:'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
   if($('#statusText'))$('#statusText').textContent=collaborative?(custom?'多智能体协作 · Nexus 动态调度':'多智能体协作 · 等待 Custom 模型'):'标准模式 · 外部搜索工具已就绪';
   if($('#footnote'))$('#footnote').textContent=collaborative?'多智能体协作仅用于 Custom 模型；Nexus 统筹，Atlas 渐进调研，Forge 工程执行，Sentinel 独立审查并触发返修。':'标准模式：Custom API 使用你选择的搜索与网页抓取方案；DeepSeek 使用服务端原生联网。';
 }
@@ -763,10 +764,10 @@ function renderCustomModels(models=[], selected=[]){
   const list=$('#customModelList'), selectedSet=new Set(selected), values=[...new Set((models||[]).map(String).filter(Boolean))];
   list.innerHTML=values.length?values.map(model=>`<label class="custom-model-option" data-model="${escapeHtml(model.toLowerCase())}"><input type="checkbox" value="${escapeHtml(model)}" ${selectedSet.has(model)?'checked':''}><span title="${escapeHtml(model)}">${escapeHtml(model)}</span></label>`).join(''):'<p class="custom-model-empty">测试 API 后显示可勾选模型。</p>';
   $('#customModelCount').textContent=values.length?`共 ${values.length} 个，可勾选保存`:'请先测试 API';
-  $('#customModelsPanel').classList.toggle('hidden',providerType()!=='custom'||!values.length);
+  $('#customModelsPanel').classList.toggle('hidden',!isCustomProviderType(providerType())||!values.length);
 }
 function syncProviderForm(){
-  const custom=providerType()==='custom';
+  const custom=isCustomProviderType(providerType());
   const base=$('#providerBase'), model=$('#providerModel');
   base.value=custom?'https://api.openai.com/v1':'https://api.deepseek.com';
   model.innerHTML='<option value="deepseek-v4-flash">deepseek-v4-flash</option><option value="deepseek-v4-pro">deepseek-v4-pro</option>';
@@ -793,14 +794,14 @@ function editProviderModels(providerId){
   $('#providerName').disabled=true;$('#providerType').disabled=true;$('#providerKey').disabled=true;$('#providerKey').required=false;$('#providerBase').disabled=true;
   $('#providerKey').placeholder=`沿用已保存密钥 ${provider.api_key_masked}`;
   $('#providerModalTitle').textContent='编辑 API 模型';$('#providerSubmit').textContent='保存模型';$('#cancelProviderEdit').classList.remove('hidden');
-  if(normalizeProviderType(provider.provider_type)==='custom'){
+  if(isCustomProviderType(provider.provider_type)){
     const models=providerModels(provider);renderCustomModels(models,models);$('#manualModel').value='';
   }else{$('#providerModel').value=provider.model||'deepseek-v4-flash'}
   $('#providerStatus').textContent='连接信息和密钥保持不变；可重新测试模型列表、调整勾选或补充手填模型。';
   $('#providerForm').scrollIntoView({behavior:'smooth',block:'start'});
 }
 async function testProvider(){
-  const button=$('#testProvider');button.disabled=true;$('#providerStatus').textContent=`正在连接 ${providerType()==='custom'?'Custom':'DeepSeek'}…`;
+  const button=$('#testProvider');button.disabled=true;$('#providerStatus').textContent=`正在连接 ${isCustomProviderType(providerType())?'Custom':'DeepSeek'}…`;
   try{
     const editing=state.providers.find(item=>String(item.id)===String(state.editingProviderId));
     const before=checkedCustomModels();
@@ -808,7 +809,7 @@ async function testProvider(){
     const result=editing
       ? await api(`/api/providers/${editing.id}/test`,{method:'POST',body:{manual_models:manualModelList()}})
       : await api('/api/providers/test',{method:'POST',body});
-    if(providerType()==='custom'){
+    if(isCustomProviderType(providerType())){
       const selected=[...new Set([...before,...manualModelList()])];
       const available=[...new Set([...(result.models||[]),...(editing?providerModels(editing):[]),...manualModelList()])];
       renderCustomModels(available,selected.length?selected:(editing?providerModels(editing):available.slice(0,1)));
@@ -821,7 +822,7 @@ async function testProvider(){
   }catch(err){$('#providerStatus').textContent=err.message}finally{button.disabled=false}
 }
 function checkedCustomModels(){return $$('#customModelList input[type="checkbox"]:checked').map(input=>input.value)}
-function providerFormData(){const custom=providerType()==='custom';const manual=custom?manualModelList():[];const selected=custom?[...new Set([...checkedCustomModels(),...manual])]:[$('#providerModel').value||'deepseek-v4-flash'];return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:selected[0]||'deepseek-v4-flash',selected_models:selected,manual_models:manual}}
+function providerFormData(){const custom=isCustomProviderType(providerType());const manual=custom?manualModelList():[];const selected=custom?[...new Set([...checkedCustomModels(),...manual])]:[$('#providerModel').value||'deepseek-v4-flash'];return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:selected[0]||'deepseek-v4-flash',selected_models:selected,manual_models:manual}}
 
 function customSettings(provider,model=selectedModel()){
   const defaults={thinking:'enabled',reasoning_effort_enabled:true,dsml_fallback_enabled:false,max_completion_tokens:65536,temperature:1,top_p:.95,web_tool_backend:'parallel'};
@@ -837,9 +838,9 @@ function fillCustomSettings(){
   $('#customThinking').value=config.thinking;$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customDsmlFallbackEnabled').checked=config.dsml_fallback_enabled;$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
   syncCustomThinkingFields();syncCustomToolFields();
 }
-function syncCustomThinkingFields(){const mimo=isMimoModel(selectedModel()),thinking=$('#customThinking').value==='enabled',effort=$('#customReasoningEffortEnabled').checked;$('#customTemperature').disabled=mimo&&thinking;$('#customTopP').disabled=mimo&&thinking;$('#customSamplingNote').textContent=`thinking 将${thinking?'开启':'关闭'}；reasoning_effort 将${effort?'按顶部所选档位发送':'不发送'}。已知模型使用官方字段，其他 Custom 使用通用顶层字段；接口不支持时可在这里关闭。`}
+function syncCustomThinkingFields(){const responses=normalizeProviderType((selectedProvider()||{}).provider_type)==='custom_response',mimo=isMimoModel(selectedModel()),thinking=$('#customThinking').value==='enabled',effort=$('#customReasoningEffortEnabled').checked;$('#customThinking').disabled=responses;$('#customTemperature').disabled=!responses&&mimo&&thinking;$('#customTopP').disabled=!responses&&mimo&&thinking;$('#customSamplingNote').textContent=responses?`Responses 协议不发送非标准 thinking 字段；reasoning.effort 将${effort?'按顶部所选档位发送':'不发送'}，temperature/top_p 正常发送。`:`thinking 将${thinking?'开启':'关闭'}；reasoning_effort 将${effort?'按顶部所选档位发送':'不发送'}。已知模型使用官方字段，其他 Custom 使用通用顶层字段；接口不支持时可在这里关闭。`}
 function syncCustomToolFields(){const info=customWebToolInfo[$('#customWebToolBackend').value]||customWebToolInfo.parallel;$('#customToolNote').textContent=`${info.description} 不需要 API Key；不会自动切换、并发调用或回退到其他方案。`}
-function openCustomSettings(){if(!selectedProvider()||normalizeProviderType(selectedProvider().provider_type)!=='custom'){toast('请先选择 Custom API');return}fillCustomSettings();$('#customModal').showModal()}
+function openCustomSettings(){if(!selectedProvider()||!isCustomProviderType(selectedProvider().provider_type)){toast('请先选择 Custom API');return}fillCustomSettings();$('#customModal').showModal()}
 async function saveCustomSettings(event){
   event.preventDefault(); const provider=selectedProvider(); if(!provider)return;
   const model=selectedModel();

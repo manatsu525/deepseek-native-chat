@@ -260,7 +260,8 @@ class Database:
             rows = connection.execute(
                 """SELECT a.* FROM attachments a
                    LEFT JOIN jobs j ON j.id=a.job_id
-                   WHERE a.created_at<? AND (a.job_id IS NULL OR j.status NOT IN ('queued','running'))""",
+                   WHERE a.created_at<? AND a.conversation_id IS NULL
+                     AND (a.job_id IS NULL OR j.status NOT IN ('queued','running'))""",
                 (cutoff,),
             ).fetchall()
             if rows:

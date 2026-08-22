@@ -57,7 +57,7 @@ sudo ./install.sh
 
 默认访问地址为 `https://服务器IP:8000`。证书为自签证书，首次访问需要在浏览器中确认继续。
 
-进入页面后，在右上角打开“API”，接口类型只分为 DeepSeek 和 Custom。填写 Custom 的 OpenAI 兼容 API 地址和 API Key 后，点击“测试并读取模型”；`/models` 返回的模型会以复选框显示，也可以手动填写不在列表中的模型名并测试。DeepSeek 使用 `https://api.deepseek.com`，Custom 默认使用 `https://api.openai.com/v1`，可改成任意兼容接口地址。
+进入页面后，在右上角打开“API”，接口类型分为三种：DeepSeek 专用 Responses、Custom Chat Completions 和 Custom Responses。填写 Custom 的 OpenAI 兼容 API 地址和 API Key 后，点击“测试并读取模型”；`/models` 返回的模型会以复选框显示，也可以手动填写不在列表中的模型名并测试。DeepSeek 使用 `https://api.deepseek.com`，两种 Custom 默认使用 `https://api.openai.com/v1`，可改成任意兼容接口地址。协议是每条 API 配置的一部分，不会根据模型名自动猜测；同一平台需要两种协议时请分别添加两条配置。
 
 升级旧版本时，原来的 MiMo API 配置会自动迁移为 Custom，已保存的模型和对话不会删除。
 
@@ -79,7 +79,7 @@ sudo ./uninstall.sh --yes
 
 ## 设计说明
 
-DeepSeek 使用官方 `/responses` 路由，当前原生 `web_search` 适配 `deepseek-v4-flash`。Custom 使用标准 `/chat/completions`，不依赖模型供应商的原生搜索；后端把联网能力适配成模型可见的 `web_search` 与 `fetch_webpage` Function Tools。默认方案匿名连接 Parallel 官方 Streamable HTTP MCP；也可以手动选择 Keenable、Tavily Keyless、Firecrawl Keyless、You.com Free 或 DDG + Jina。选择后，搜索与抓取固定使用对应的一组实现，不自动切换、不 fallback、不同 provider 之间不并发。You.com Free 只提供搜索，因此它是唯一复用现有 Jina Reader 抓取的新增方案。查询词和待读取 URL 会发送给当前选择的服务。两种模型协议由后端分别解析，不能共用 DeepSeek 的 Responses SSE 事件处理器。
+DeepSeek 使用官方 `/responses` 路由及原生联网。Custom Chat 使用标准 `/chat/completions`，Custom Responses 使用标准 `/responses`；两种 Custom 都由本机后端提供 `web_search`、`fetch_webpage` 和工作区 Function Tools，并共享相同的工具限额、多智能体协作及模型级参数。默认方案匿名连接 Parallel 官方 Streamable HTTP MCP；也可以手动选择 Keenable、Tavily Keyless、Firecrawl Keyless、You.com Free 或 DDG + Jina。选择后，搜索与抓取固定使用对应的一组实现，不自动切换、不 fallback、不同 provider 之间不并发。You.com Free 只提供搜索，因此它是唯一复用现有 Jina Reader 抓取的新增方案。查询词和待读取 URL 会发送给当前选择的服务。
 
 新增匿名 MCP 由独立的轻量客户端适配：Keenable 调用 `https://api.keenable.ai/mcp` 的 `search_web_pages` / `fetch_page_content`，抓取固定发送 `live=true`；Tavily 调用 `https://mcp.tavily.com/mcp/` 的 `tavily_search` / `tavily_extract`，每次请求固定发送 `X-Tavily-Access-Mode: keyless`；Firecrawl 调用 `https://mcp.firecrawl.dev/v2/mcp`，只使用 `firecrawl_search` / `firecrawl_scrape`；You.com 调用 `https://api.you.com/mcp?profile=free` 的 `you-search`，抓取则直接复用原来的 Jina Reader。四种服务的原始响应都会归一化为相同的标题、URL、摘要和正文格式，再作为 `tool` 消息回传给 LLM。
 
@@ -100,7 +100,7 @@ DeepSeek 当前会忽略 Responses API 的 `max_tool_calls`。项目在系统提
 - DOCX：流式读取正文 XML；XLSX：最多读取前 5 个工作表和每表 2,000 行，并限制共享字符串内存。
 - 常见文本、Markdown、CSV、JSON 和代码文件：按文本读取。旧版 `.doc`、`.xls` 需要先另存为 `.docx`、`.xlsx`。
 
-一次回答中的全部文档摘录最多 80,000 字符。附件本体只用于本次回答，任务完成、停止或失败后立即删除；历史记录仅保留名称和原始大小，因此“重新回答”不会自动重传旧附件。尚未发送的附件按草稿保留，刷新页面可以恢复，超过 24 小时会自动清理。DeepSeek Responses 路由仍不接收图片，但可以使用已提取为文字的文档；图片请切换到支持视觉的 Custom 模型。
+一次回答中的全部文档摘录最多 80,000 字符。已发送附件随所属对话保留，因此可以对带附件的问题执行“重新回答”；删除对话或普通对话超过 100 条被自动清理时，附件文件会同步删除。尚未发送的附件按草稿保留，刷新页面可以恢复，超过 24 小时会自动清理。DeepSeek Responses 路由仍不接收图片，但可以使用已提取为文字的文档；图片请切换到支持视觉的 Custom 模型。
 
 ## 数据与安全
 

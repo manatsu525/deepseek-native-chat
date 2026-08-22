@@ -158,7 +158,7 @@
     <form id="providerForm" class="form-grid">
       <label>配置名称<input id="providerName" placeholder="例如：我的 DeepSeek" required></label>
       <label>API Key<input id="providerKey" type="password" autocomplete="off" placeholder="输入对应服务商 API Key" required></label>
-      <label>接口类型<select id="providerType"><option value="deepseek">DeepSeek · Responses</option><option value="custom">Custom · OpenAI Chat</option></select></label>
+      <label>接口类型<select id="providerType"><option value="deepseek">DeepSeek · Responses（专用）</option><option value="custom">Custom · Chat Completions</option><option value="custom_response">Custom · Responses</option></select></label>
       <label>API 地址<input id="providerBase" value="https://api.deepseek.com" required></label>
       <label id="providerModelField">模型
         <select id="providerModel"><option value="deepseek-v4-flash">deepseek-v4-flash</option><option value="deepseek-v4-pro">deepseek-v4-pro</option></select>

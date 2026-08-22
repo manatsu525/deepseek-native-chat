@@ -351,6 +351,91 @@ def _apply_thinking_options(
         payload["reasoning_effort"] = selected_effort
 
 
+def _responses_content(content: Any, role: str) -> Any:
+    """Translate Chat Completions multimodal parts to Responses input parts."""
+    if not isinstance(content, list):
+        return content
+    translated: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind == "text":
+            translated.append({"type": "input_text" if role != "assistant" else "output_text", "text": str(part.get("text") or "")})
+        elif kind == "image_url":
+            image = part.get("image_url") or {}
+            url = image.get("url") if isinstance(image, dict) else image
+            translated.append({"type": "input_image", "image_url": str(url or "")})
+        else:
+            translated.append(dict(part))
+    return translated
+
+
+def _responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert the agent's internal Chat history into Responses API input."""
+    result: list[dict[str, Any]] = []
+    for message in messages:
+        role = str(message.get("role") or "user")
+        if role == "tool":
+            result.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": str(message.get("tool_call_id") or ""),
+                    "output": str(message.get("content") or ""),
+                }
+            )
+            continue
+        tool_calls = message.get("tool_calls") or []
+        content = message.get("content")
+        if content not in (None, "", []):
+            result.append({"role": role, "content": _responses_content(content, role)})
+        for call in tool_calls:
+            function = call.get("function") or {}
+            result.append(
+                {
+                    "type": "function_call",
+                    "call_id": str(call.get("id") or ""),
+                    "name": str(function.get("name") or ""),
+                    "arguments": str(function.get("arguments") or "{}"),
+                }
+            )
+    return result
+
+
+def _responses_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for tool in tools:
+        if tool.get("type") != "function":
+            result.append(dict(tool))
+            continue
+        function = tool.get("function") or {}
+        converted = {
+            "type": "function",
+            "name": function.get("name"),
+            "description": function.get("description", ""),
+            "parameters": function.get("parameters", {"type": "object", "properties": {}}),
+        }
+        if "strict" in function:
+            converted["strict"] = bool(function["strict"])
+        result.append(converted)
+    return result
+
+
+def _normalize_responses_usage(raw: dict[str, Any]) -> dict[str, Any]:
+    input_details = raw.get("input_tokens_details") or {}
+    output_details = raw.get("output_tokens_details") or {}
+    input_tokens = int(raw.get("input_tokens") or 0)
+    output_tokens = int(raw.get("output_tokens") or 0)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": int(raw.get("total_tokens") or input_tokens + output_tokens),
+        "input_tokens_details": {"cached_tokens": int(input_details.get("cached_tokens") or 0)},
+        "output_tokens_details": {"reasoning_tokens": int(output_details.get("reasoning_tokens") or 0)},
+        "web_search_usage": raw.get("web_search_usage") or {},
+    }
+
+
 async def stream_response(
     *,
     base_url: str,
@@ -373,6 +458,7 @@ async def stream_response(
     web_fetch_limit: int = JINA_MAX_FETCHES_PER_RESPONSE,
     web_tool_round_limit: int = MIMO_MAX_TOOL_ROUNDS,
     before_model_call: Callable[[], None] | None = None,
+    api_protocol: str = "chat_completions",
 ) -> dict[str, Any]:
     """Run a custom OpenAI-compatible model with local web tools.
 
@@ -531,29 +617,45 @@ async def stream_response(
                     *conversation,
                     {"role": "system", "content": FINAL_ANSWER_PROMPT + retry_note},
                 ]
-            payload: dict[str, Any] = {
-                "model": model,
-                "messages": request_messages,
-                # Older MiMo gateways use max_completion_tokens; the generic
-                # OpenAI-compatible spelling remains max_tokens.
-                "max_completion_tokens" if mimo_model else "max_tokens": int(config["max_completion_tokens"]),
-                "stream": True,
-            }
-            _apply_thinking_options(
-                payload,
-                base_url,
-                model,
-                config["thinking"],
-                effort,
-                bool(config.get("reasoning_effort_enabled", True)),
-                int(config["max_completion_tokens"]),
-            )
-            if round_tools:
-                payload["tools"] = round_tools
-                payload["tool_choice"] = "auto"
-            if not mimo_model or config["thinking"] == "disabled":
+            responses_protocol = api_protocol == "responses"
+            if responses_protocol:
+                payload = {
+                    "model": model,
+                    "input": _responses_input(request_messages),
+                    "max_output_tokens": int(config["max_completion_tokens"]),
+                    "stream": True,
+                }
+                if bool(config.get("reasoning_effort_enabled", True)):
+                    payload["reasoning"] = {"effort": normalize_reasoning_effort(effort)}
                 payload["temperature"] = float(config["temperature"])
                 payload["top_p"] = float(config["top_p"])
+                if round_tools:
+                    payload["tools"] = _responses_tools(round_tools)
+                    payload["tool_choice"] = "auto"
+            else:
+                payload = {
+                    "model": model,
+                    "messages": request_messages,
+                    # Older MiMo gateways use max_completion_tokens; the generic
+                    # OpenAI-compatible spelling remains max_tokens.
+                    "max_completion_tokens" if mimo_model else "max_tokens": int(config["max_completion_tokens"]),
+                    "stream": True,
+                }
+                _apply_thinking_options(
+                    payload,
+                    base_url,
+                    model,
+                    config["thinking"],
+                    effort,
+                    bool(config.get("reasoning_effort_enabled", True)),
+                    int(config["max_completion_tokens"]),
+                )
+                if round_tools:
+                    payload["tools"] = round_tools
+                    payload["tool_choice"] = "auto"
+                if not mimo_model or config["thinking"] == "disabled":
+                    payload["temperature"] = float(config["temperature"])
+                    payload["top_p"] = float(config["top_p"])
 
             round_answer = ""
             round_preview = ""
@@ -571,7 +673,8 @@ async def stream_response(
             )
             if before_model_call is not None:
                 before_model_call()
-            async with api_client.stream("POST", _url(base_url, "/chat/completions"), headers=headers, json=payload) as response:
+            endpoint = "/responses" if responses_protocol else "/chat/completions"
+            async with api_client.stream("POST", _url(base_url, endpoint), headers=headers, json=payload) as response:
                 if response.status_code >= 400:
                     body = (await response.aread()).decode(errors="replace")[:2000]
                     raise RuntimeError(f"Custom API {response.status_code}: {body}")
@@ -591,9 +694,36 @@ async def stream_response(
                         continue
                     if data.get("error"):
                         raise RuntimeError(f"Custom 响应失败: {data['error']}")
+                    event_type = str(data.get("type") or "")
                     raw_usage = data.get("usage")
+                    if event_type in {"response.completed", "response.incomplete"}:
+                        raw_usage = (data.get("response") or {}).get("usage") or raw_usage
                     if isinstance(raw_usage, dict):
-                        round_usage = _normalize_usage(raw_usage)
+                        round_usage = _normalize_responses_usage(raw_usage) if responses_protocol else _normalize_usage(raw_usage)
+                    if responses_protocol:
+                        if event_type == "response.output_text.delta":
+                            delta_content = str(data.get("delta") or "")
+                            round_answer += delta_content
+                            if markup_stream is not None:
+                                round_preview += markup_stream.feed(delta_content)
+                        elif event_type in {"response.reasoning_text.delta", "response.reasoning_summary_text.delta"}:
+                            round_reasoning += str(data.get("delta") or "")
+                        elif event_type in {"response.output_item.added", "response.output_item.done"}:
+                            item = data.get("item") or {}
+                            if item.get("type") == "function_call":
+                                index = int(data.get("output_index") or 0)
+                                current = round_tools_by_index.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                                current["id"] = str(item.get("call_id") or item.get("id") or current.get("id") or "")
+                                current["function"]["name"] = str(item.get("name") or current["function"].get("name") or "")
+                                if item.get("arguments") is not None:
+                                    current["function"]["arguments"] = str(item.get("arguments") or "")
+                        elif event_type == "response.function_call_arguments.delta":
+                            index = int(data.get("output_index") or 0)
+                            current = round_tools_by_index.setdefault(index, {"id": str(data.get("item_id") or ""), "type": "function", "function": {"name": "", "arguments": ""}})
+                            current["function"]["arguments"] += str(data.get("delta") or "")
+                        elif event_type == "response.failed":
+                            failure = (data.get("response") or {}).get("error") or data.get("error") or data
+                            raise RuntimeError(f"Custom Responses 响应失败: {failure}")
                     for choice in data.get("choices") or []:
                         delta = choice.get("delta") or {}
                         message = choice.get("message") or {}

@@ -25,6 +25,7 @@ from .config import settings
 from .db import Database
 from .deepseek import list_models as deepseek_list_models
 from .deepseek import stream_response as deepseek_stream_response
+from .custom_responses import stream_response as custom_responses_stream_response
 from .mimo import DEFAULT_SETTINGS as CUSTOM_DEFAULT_SETTINGS
 from .mimo import MIMO_MAX_COMPLETION_TOKENS, custom_auth_headers, is_mimo_model, list_models as custom_list_models
 from .mimo_local import stream_response as custom_stream_response
@@ -49,10 +50,12 @@ SUPPORTED_MODELS = {
     # Custom providers advertise their own model IDs through /models or a
     # manually entered model name, so there is no static allow-list here.
     "custom": set(),
+    "custom_response": set(),
 }
 DEFAULT_BASE_URLS = {
     "deepseek": "https://api.deepseek.com",
     "custom": "https://api.openai.com/v1",
+    "custom_response": "https://api.openai.com/v1",
 }
 
 
@@ -74,7 +77,7 @@ class PasswordBody(BaseModel):
 class ProviderBody(BaseModel):
     name: str = Field(min_length=1, max_length=40)
     api_key: str = Field(min_length=8, max_length=300)
-    provider_type: Literal["deepseek", "custom"] = "deepseek"
+    provider_type: Literal["deepseek", "custom", "custom_response"] = "deepseek"
     base_url: str = ""
     model: str = ""
     selected_models: list[str] = Field(default_factory=list, max_length=500)
@@ -171,7 +174,7 @@ def custom_settings_for_model(row: dict[str, Any], model: str) -> dict[str, Any]
 
 def migrate_custom_provider_settings() -> None:
     """Persist the former API-wide settings as independent per-model values."""
-    for provider in db.all("SELECT * FROM providers WHERE provider_type='custom'"):
+    for provider in db.all("SELECT * FROM providers WHERE provider_type IN ('custom','custom_response')"):
         before = _decoded_provider_settings(provider)
         after = custom_settings_document(provider)
         if before != after:
@@ -190,6 +193,10 @@ normalize_mimo_settings = normalize_custom_settings
 def provider_type(row: dict[str, Any]) -> str:
     kind = row.get("provider_type") or "deepseek"
     return "custom" if kind == "mimo" else kind
+
+
+def is_custom_provider(kind: str) -> bool:
+    return kind in {"custom", "custom_response"}
 
 
 def _clean_model_ids(values: Any) -> list[str]:
@@ -219,7 +226,7 @@ def provider_models(row: dict[str, Any]) -> list[str]:
 def validate_provider_selection(kind: str, model: str, provider: Optional[dict[str, Any]] = None) -> None:
     if kind not in SUPPORTED_MODELS:
         raise HTTPException(400, "不支持的服务商类型")
-    if kind == "custom":
+    if is_custom_provider(kind):
         if not model.strip():
             raise HTTPException(400, "请选择或填写一个 custom 模型")
         if provider is not None and model not in provider_models(provider):
@@ -271,8 +278,20 @@ def trim_old_conversations(user_id: int) -> None:
                ORDER BY updated_at DESC LIMIT -1 OFFSET 100""",
             (user_id,),
         ).fetchall()
+        attachment_records: list[dict[str, Any]] = []
         if rows:
+            conversation_ids = [row["id"] for row in rows]
+            placeholders = ",".join("?" for _ in conversation_ids)
+            attachment_records = [
+                dict(row)
+                for row in connection.execute(
+                    f"SELECT * FROM attachments WHERE user_id=? AND conversation_id IN ({placeholders})",
+                    (user_id, *conversation_ids),
+                ).fetchall()
+            ]
             connection.executemany("DELETE FROM conversations WHERE id=? AND user_id=?", [(row["id"], user_id) for row in rows])
+    if attachment_records:
+        attachments.delete_files(attachment_records)
     for row in rows:
         delete_conversation_workspace(user_id, row["id"])
 
@@ -299,7 +318,7 @@ def public_provider(row: dict[str, Any]) -> dict[str, Any]:
     saved_models = _models_from_settings(row.get("model"), saved_settings)
     key = row.pop("api_key", "")
     row["provider_type"] = provider_type(row)
-    if row["provider_type"] == "custom":
+    if is_custom_provider(row["provider_type"]):
         row["model_settings"] = custom_settings_by_model(row, saved_models)
         # Keep the old field useful for clients that have not yet learned the
         # per-model response shape. It represents only the provider's primary
@@ -368,9 +387,6 @@ async def _execute_job(job_id: str) -> None:
     provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (job["provider_id"], job["user_id"]))
     if not provider:
         db.update_job(job_id, status="failed", error="API 配置不存在")
-        if attachment_records:
-            deleted = db.delete_attachments(job["user_id"], [item["id"] for item in attachment_records])
-            await asyncio.to_thread(attachments.delete_files, deleted)
         return
     kind = provider_type(provider)
     job_workspace = ConversationWorkspace(job["user_id"], job["conversation_id"])
@@ -427,9 +443,9 @@ async def _execute_job(job_id: str) -> None:
                 attachments.build_model_messages,
                 history,
                 attachment_records,
-                kind == "custom",
+                is_custom_provider(kind),
             )
-        if kind == "custom" and job.get("chat_mode") == "multi_agent":
+        if is_custom_provider(kind) and job.get("chat_mode") == "multi_agent":
             provider_settings = custom_settings_for_model(provider, job["model"])
             result = await run_collaboration(
                 base_url=provider["base_url"],
@@ -444,10 +460,12 @@ async def _execute_job(job_id: str) -> None:
                 user_timezone=job.get("timezone") or "UTC",
                 effort=job["effort"],
                 workspace=job_workspace,
+                streamer=custom_responses_stream_response if kind == "custom_response" else custom_stream_response,
             )
-        elif kind == "custom":
+        elif is_custom_provider(kind):
             provider_settings = custom_settings_for_model(provider, job["model"])
-            result = await custom_stream_response(
+            streamer = custom_responses_stream_response if kind == "custom_response" else custom_stream_response
+            result = await streamer(
                 base_url=provider["base_url"],
                 api_key=provider["api_key"],
                 model=job["model"],
@@ -558,9 +576,6 @@ async def _execute_job(job_id: str) -> None:
     finally:
         if attachment_lock_acquired:
             attachment_job_lock.release()
-        if attachment_records:
-            deleted = db.delete_attachments(job["user_id"], [item["id"] for item in attachment_records])
-            await asyncio.to_thread(attachments.delete_files, deleted)
 
 
 async def run_job(job_id: str) -> None:
@@ -794,24 +809,28 @@ def providers(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, An
     return [public_provider(row) for row in db.all("SELECT * FROM providers WHERE user_id=? ORDER BY id", (user["id"],))]
 
 
-async def test_custom_model(base_url: str, api_key: str, model: str) -> None:
-    """Validate a manually entered model with a one-token chat request."""
+async def test_custom_model(base_url: str, api_key: str, model: str, *, responses: bool = False) -> None:
+    """Validate a manually entered model with a minimal protocol-appropriate request."""
     mimo_model = is_mimo_model(model)
     token_field = "max_completion_tokens" if mimo_model else "max_tokens"
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": "Reply OK"}],
-        token_field: 1,
-        "stream": False,
-    }
-    if mimo_model:
+    payload = (
+        {"model": model, "input": "Reply OK", "max_output_tokens": 1, "stream": False}
+        if responses
+        else {
+            "model": model,
+            "messages": [{"role": "user", "content": "Reply OK"}],
+            token_field: 1,
+            "stream": False,
+        }
+    )
+    if mimo_model and not responses:
         # Keep a connection test cheap and deterministic. MiMo accepts the
         # thinking switch, while ordinary Custom providers never receive it.
         payload["thinking"] = {"type": "disabled"}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(30, connect=5), follow_redirects=True) as client:
             response = await client.post(
-                base_url.rstrip("/") + "/chat/completions",
+                base_url.rstrip("/") + ("/responses" if responses else "/chat/completions"),
                 headers=custom_auth_headers(api_key, base_url=base_url),
                 json=payload,
             )
@@ -837,21 +856,21 @@ async def test_provider_credentials(kind: str, base: str, api_key: str, manual_v
     manual_models = _clean_model_ids(manual_values)
     manual_tested: list[str] = []
     try:
-        models = await (custom_list_models(base, api_key) if kind == "custom" else deepseek_list_models(base, api_key))
+        models = await (custom_list_models(base, api_key) if is_custom_provider(kind) else deepseek_list_models(base, api_key))
     except Exception as exc:
-        if kind != "custom" or not manual_models:
+        if not is_custom_provider(kind) or not manual_models:
             raise HTTPException(400, f"API 测试失败：{exc}") from exc
         models = []
         models_warning = str(exc)
     else:
         models_warning = ""
-    if kind == "custom":
+    if is_custom_provider(kind):
         if len(manual_models) > 20:
             raise HTTPException(400, "一次最多测试 20 个手填模型")
         advertised = set(models)
         for model_id in manual_models:
             if model_id not in advertised:
-                await test_custom_model(base, api_key, model_id)
+                await test_custom_model(base, api_key, model_id, responses=kind == "custom_response")
                 manual_tested.append(model_id)
         models = list(dict.fromkeys([*models, *manual_models]))
         supported = models
@@ -881,7 +900,7 @@ def add_provider(body: ProviderBody, user: dict[str, Any] = Depends(current_user
     kind = body.provider_type
     base = clean_base_url(body.base_url or DEFAULT_BASE_URLS[kind])
     selected_models = _clean_model_ids(body.selected_models)
-    if kind == "custom":
+    if is_custom_provider(kind):
         model = body.model.strip() or (selected_models[0] if selected_models else "")
         if model and model not in selected_models:
             selected_models.insert(0, model)
@@ -891,7 +910,7 @@ def add_provider(body: ProviderBody, user: dict[str, Any] = Depends(current_user
         model = body.model.strip() or "deepseek-v4-flash"
         selected_models = [model]
     validate_provider_selection(kind, model)
-    if kind == "custom":
+    if is_custom_provider(kind):
         initial_settings = normalize_custom_settings(body.custom_settings)
         settings_value = {
             "models": selected_models,
@@ -924,7 +943,7 @@ def update_provider_models(provider_id: int, body: ProviderModelsBody, user: dic
         raise HTTPException(404, "API 配置不存在")
     kind = provider_type(provider)
     selected_models = _clean_model_ids(body.selected_models)
-    if kind == "custom":
+    if is_custom_provider(kind):
         model = body.model.strip() or (selected_models[0] if selected_models else "")
         if model and model not in selected_models:
             selected_models.insert(0, model)
@@ -936,7 +955,7 @@ def update_provider_models(provider_id: int, body: ProviderModelsBody, user: dic
     validate_provider_selection(kind, model)
     settings_value = (
         custom_settings_document(provider, selected_models)
-        if kind == "custom"
+        if is_custom_provider(kind)
         else {"models": selected_models}
     )
     db.run(
@@ -961,10 +980,10 @@ def update_provider_settings(provider_id: int, body: CustomModelSettingsBody, us
     provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"]))
     if not provider:
         raise HTTPException(404, "API 配置不存在")
-    if provider_type(provider) != "custom":
+    if not is_custom_provider(provider_type(provider)):
         raise HTTPException(400, "只有 custom API 支持这组参数")
     model = body.model.strip()
-    validate_provider_selection("custom", model, provider)
+    validate_provider_selection(provider_type(provider), model, provider)
     settings_value = custom_settings_document(provider)
     settings_value["model_settings"][model] = normalize_custom_settings(body.model_dump(exclude={"model"}))
     db.run("UPDATE providers SET settings_json=? WHERE id=? AND user_id=?", (json.dumps(settings_value, ensure_ascii=False), provider_id, user["id"]))
@@ -1087,7 +1106,7 @@ async def retry_answer(
     if kind == "deepseek" and model != provider["model"]:
         raise HTTPException(400, "当前回答使用的模型与 API 配置不一致，请重新选择模型配置")
     validate_provider_selection(kind, model, provider)
-    if body.chat_mode == "multi_agent" and kind != "custom":
+    if body.chat_mode == "multi_agent" and not is_custom_provider(kind):
         raise HTTPException(400, "多智能体协作模式仅支持 Custom 模型")
     validate_effort(body.effort)
     timezone_name = clean_timezone(body.timezone)
@@ -1114,8 +1133,23 @@ async def retry_answer(
         if not prompt or prompt["role"] != "user":
             raise HTTPException(409, "找不到要重新回答的问题")
         prompt_meta = db.decode(prompt["meta_json"], {})
-        if isinstance(prompt_meta, dict) and prompt_meta.get("attachments"):
-            raise HTTPException(409, "原问题包含已清理的附件，请重新上传后再提问")
+        attachment_meta = prompt_meta.get("attachments") if isinstance(prompt_meta, dict) else []
+        attachment_ids = [
+            str(item.get("id") or "")
+            for item in attachment_meta or []
+            if isinstance(item, dict) and str(item.get("id") or "")
+        ]
+        attachment_rows: list[Any] = []
+        if attachment_ids:
+            placeholders = ",".join("?" for _ in attachment_ids)
+            attachment_rows = connection.execute(
+                f"SELECT * FROM attachments WHERE user_id=? AND conversation_id=? AND id IN ({placeholders})",
+                (user["id"], conversation_id, *attachment_ids),
+            ).fetchall()
+            if len(attachment_rows) != len(set(attachment_ids)):
+                raise HTTPException(409, "原问题的附件文件已经不可用，无法重新回答")
+            if not is_custom_provider(kind) and any(row["kind"] == "image" for row in attachment_rows):
+                raise HTTPException(400, "当前 DeepSeek Responses 路由不接受图片，请改用支持视觉输入的 Custom 模型")
 
         connection.execute(
             "DELETE FROM messages WHERE conversation_id=? AND id>?",
@@ -1131,6 +1165,12 @@ async def retry_answer(
                 model, body.effort, timezone_name, body.chat_mode, "queued", created_at, created_at,
             ),
         )
+        if attachment_rows:
+            placeholders = ",".join("?" for _ in attachment_ids)
+            connection.execute(
+                f"UPDATE attachments SET job_id=? WHERE user_id=? AND conversation_id=? AND id IN ({placeholders})",
+                (job_id, user["id"], conversation_id, *attachment_ids),
+            )
         connection.execute("UPDATE conversations SET updated_at=? WHERE id=?", (created_at, conversation_id))
 
     launch(job_id)
@@ -1175,7 +1215,7 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
     if kind == "deepseek" and model != provider["model"]:
         raise HTTPException(400, "当前回答使用的模型与 API 配置不一致，请重新选择模型配置")
     validate_provider_selection(kind, model, provider)
-    if body.chat_mode == "multi_agent" and kind != "custom":
+    if body.chat_mode == "multi_agent" and not is_custom_provider(kind):
         raise HTTPException(400, "多智能体协作模式仅支持 Custom 模型")
     validate_effort(body.effort)
     content = body.content.strip()
@@ -1187,7 +1227,7 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
     attachment_records = db.get_attachments(user["id"], attachment_ids)
     if len(attachment_records) != len(attachment_ids) or any(item.get("job_id") for item in attachment_records):
         raise HTTPException(400, "部分附件不存在、已过期或已经发送")
-    if kind != "custom" and any(item["kind"] == "image" for item in attachment_records):
+    if not is_custom_provider(kind) and any(item["kind"] == "image" for item in attachment_records):
         raise HTTPException(400, "当前 DeepSeek Responses 路由不接受图片，请改用支持视觉输入的 Custom 模型")
     timezone_name = clean_timezone(body.timezone)
     conversation_id = body.conversation_id

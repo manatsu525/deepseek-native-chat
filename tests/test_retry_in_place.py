@@ -202,6 +202,63 @@ class RetryInPlaceTests(unittest.TestCase):
         self.assertEqual((latest["role"], latest["content"]), ("assistant", "answer to remove"))
         self.assertEqual(main.db.one("SELECT COUNT(*) AS n FROM jobs")["n"], 0)
 
+    def test_retry_reuses_a_retained_attachment(self) -> None:
+        provider_id = self.add_provider("current-provider", "current-model")
+        conversation_id = "attachment-conversation"
+        main.db.run(
+            "INSERT INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?)",
+            (conversation_id, self.user_id, "Attachment", 100, 103),
+        )
+        main.db.run(
+            """INSERT INTO jobs(
+                   id,user_id,conversation_id,provider_id,provider_type,model,
+                   effort,timezone,status,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            ("original-job", self.user_id, conversation_id, provider_id, "custom", "current-model", "high", "UTC", "completed", 100, 100),
+        )
+        stored = attachments.ATTACHMENTS_DIR / str(self.user_id) / "kept.txt"
+        stored.parent.mkdir(parents=True, exist_ok=True)
+        stored.write_text("retained attachment body", encoding="utf-8")
+        main.db.create_attachment(
+            "a" * 32,
+            self.user_id,
+            "old-draft",
+            "notes.txt",
+            "document",
+            "text/plain",
+            str(stored),
+            24,
+            24,
+            100,
+        )
+        main.db.run(
+            "UPDATE attachments SET conversation_id=?,job_id=? WHERE id=?",
+            (conversation_id, "original-job", "a" * 32),
+        )
+        prompt_id = self.add_message(
+            conversation_id,
+            "user",
+            "answer from this file",
+            101,
+            {"attachments": [{"id": "a" * 32, "name": "notes.txt", "kind": "document"}]},
+        )
+        self.add_message(conversation_id, "assistant", "old answer", 102)
+        histories: list[list[dict]] = []
+
+        async def fake_custom_stream_response(**kwargs):
+            histories.append(copy.deepcopy(kwargs["messages"]))
+            return {"answer": "new answer", "reasoning": "", "searches": [], "sources": [], "usage": {}}
+
+        with patch.object(main, "custom_stream_response", new=fake_custom_stream_response):
+            response = self.retry(conversation_id, prompt_id, provider_id, "current-model")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.wait_for_job(response.json()["job_id"])
+
+        self.assertIn("retained attachment body", histories[0][-1]["content"])
+        retained = main.db.one("SELECT job_id FROM attachments WHERE id=?", ("a" * 32,))
+        self.assertEqual(retained["job_id"], response.json()["job_id"])
+        self.assertTrue(stored.is_file())
+
     def test_retry_earlier_prompt_discards_every_message_below_it(self) -> None:
         provider_id = self.add_provider("current-provider", "current-model")
         conversation_id = self.seed_conversation()
