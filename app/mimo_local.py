@@ -436,6 +436,102 @@ def _normalize_responses_usage(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _anthropic_image(part: dict[str, Any]) -> dict[str, Any]:
+    image = part.get("image_url") or {}
+    url = str(image.get("url") if isinstance(image, dict) else image or "")
+    if url.startswith("data:") and ";base64," in url:
+        header, data = url.split(";base64,", 1)
+        return {
+            "type": "image",
+            "source": {"type": "base64", "media_type": header.removeprefix("data:"), "data": data},
+        }
+    return {"type": "image", "source": {"type": "url", "url": url}}
+
+
+def _anthropic_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    """Convert internal Chat history into an Anthropic Messages conversation."""
+    systems: list[str] = []
+    result: list[dict[str, Any]] = []
+    for message in messages:
+        role = str(message.get("role") or "user")
+        if role == "system":
+            systems.append(str(message.get("content") or ""))
+            continue
+        if role == "tool":
+            block = {
+                "type": "tool_result",
+                "tool_use_id": str(message.get("tool_call_id") or ""),
+                "content": str(message.get("content") or ""),
+            }
+            if result and result[-1].get("role") == "user" and isinstance(result[-1].get("content"), list):
+                result[-1]["content"].append(block)
+            else:
+                result.append({"role": "user", "content": [block]})
+            continue
+        content = message.get("content")
+        blocks: list[dict[str, Any]] = []
+        if role == "assistant":
+            for thinking_block in message.get("anthropic_thinking_blocks") or []:
+                if isinstance(thinking_block, dict):
+                    blocks.append(dict(thinking_block))
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    blocks.append({"type": "text", "text": str(part.get("text") or "")})
+                elif part.get("type") == "image_url":
+                    blocks.append(_anthropic_image(part))
+        elif content not in (None, ""):
+            blocks.append({"type": "text", "text": str(content)})
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            try:
+                tool_input = json.loads(str(function.get("arguments") or "{}"))
+            except json.JSONDecodeError:
+                tool_input = {}
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": str(call.get("id") or ""),
+                    "name": str(function.get("name") or ""),
+                    "input": tool_input if isinstance(tool_input, dict) else {},
+                }
+            )
+        if blocks:
+            result.append({"role": "assistant" if role == "assistant" else "user", "content": blocks})
+    return "\n\n".join(item for item in systems if item), result
+
+
+def _anthropic_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for tool in tools:
+        function = tool.get("function") or {}
+        result.append(
+            {
+                "name": function.get("name"),
+                "description": function.get("description", ""),
+                "input_schema": function.get("parameters", {"type": "object", "properties": {}}),
+            }
+        )
+    return result
+
+
+def _normalize_anthropic_usage(raw: dict[str, Any]) -> dict[str, Any]:
+    input_tokens = int(raw.get("input_tokens") or 0)
+    output_tokens = int(raw.get("output_tokens") or 0)
+    cached = int(raw.get("cache_read_input_tokens") or 0)
+    output_details = raw.get("output_tokens_details") or {}
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "input_tokens_details": {"cached_tokens": cached},
+        "output_tokens_details": {"reasoning_tokens": int(output_details.get("thinking_tokens") or 0)},
+        "web_search_usage": {},
+    }
+
+
 async def stream_response(
     *,
     base_url: str,
@@ -487,6 +583,9 @@ async def stream_response(
         stream=True,
         conversation_id=conversation_id,
     )
+    if api_protocol == "messages":
+        headers["x-api-key"] = api_key
+        headers["anthropic-version"] = "2023-06-01"
     if not web_enabled:
         base_prompt = "You are an AI assistant. No web-search or webpage-reading tool is available in this role."
     elif parallel_mode:
@@ -618,6 +717,7 @@ async def stream_response(
                     {"role": "system", "content": FINAL_ANSWER_PROMPT + retry_note},
                 ]
             responses_protocol = api_protocol == "responses"
+            messages_protocol = api_protocol == "messages"
             if responses_protocol:
                 payload = {
                     "model": model,
@@ -632,6 +732,30 @@ async def stream_response(
                 if round_tools:
                     payload["tools"] = _responses_tools(round_tools)
                     payload["tool_choice"] = "auto"
+            elif messages_protocol:
+                system_value, anthropic_history = _anthropic_messages(request_messages)
+                max_tokens = int(config["max_completion_tokens"])
+                payload = {
+                    "model": model,
+                    "system": system_value,
+                    "messages": anthropic_history,
+                    "max_tokens": max_tokens,
+                    "stream": True,
+                }
+                if config["thinking"] == "enabled":
+                    if max_tokens <= 1024:
+                        raise ValueError("Messages 开启 thinking 时，最大生成 Token 必须大于 1024")
+                    payload["thinking"] = {
+                        "type": "enabled",
+                        "budget_tokens": min(16384, max_tokens - 1),
+                    }
+                else:
+                    payload["thinking"] = {"type": "disabled"}
+                    payload["temperature"] = float(config["temperature"])
+                    payload["top_p"] = float(config["top_p"])
+                if round_tools:
+                    payload["tools"] = _anthropic_tools(round_tools)
+                    payload["tool_choice"] = {"type": "auto"}
             else:
                 payload = {
                     "model": model,
@@ -661,6 +785,8 @@ async def stream_response(
             round_preview = ""
             round_reasoning = ""
             round_usage: dict[str, Any] = {}
+            anthropic_usage: dict[str, Any] = {}
+            anthropic_thinking_blocks: dict[int, dict[str, Any]] = {}
             round_tools_by_index: dict[int, dict[str, Any]] = {}
             markup_stream = (
                 InklingStreamBuffer()
@@ -673,7 +799,7 @@ async def stream_response(
             )
             if before_model_call is not None:
                 before_model_call()
-            endpoint = "/responses" if responses_protocol else "/chat/completions"
+            endpoint = "/responses" if responses_protocol else "/messages" if messages_protocol else "/chat/completions"
             async with api_client.stream("POST", _url(base_url, endpoint), headers=headers, json=payload) as response:
                 if response.status_code >= 400:
                     body = (await response.aread()).decode(errors="replace")[:2000]
@@ -698,8 +824,14 @@ async def stream_response(
                     raw_usage = data.get("usage")
                     if event_type in {"response.completed", "response.incomplete"}:
                         raw_usage = (data.get("response") or {}).get("usage") or raw_usage
+                    if messages_protocol and event_type == "message_start":
+                        raw_usage = (data.get("message") or {}).get("usage") or raw_usage
                     if isinstance(raw_usage, dict):
-                        round_usage = _normalize_responses_usage(raw_usage) if responses_protocol else _normalize_usage(raw_usage)
+                        if messages_protocol:
+                            anthropic_usage.update(raw_usage)
+                            round_usage = _normalize_anthropic_usage(anthropic_usage)
+                        else:
+                            round_usage = _normalize_responses_usage(raw_usage) if responses_protocol else _normalize_usage(raw_usage)
                     if responses_protocol:
                         if event_type == "response.output_text.delta":
                             delta_content = str(data.get("delta") or "")
@@ -724,7 +856,44 @@ async def stream_response(
                         elif event_type == "response.failed":
                             failure = (data.get("response") or {}).get("error") or data.get("error") or data
                             raise RuntimeError(f"Custom Responses 响应失败: {failure}")
-                    for choice in data.get("choices") or []:
+                    elif messages_protocol:
+                        if event_type == "content_block_start":
+                            index = int(data.get("index") or 0)
+                            block = data.get("content_block") or {}
+                            if block.get("type") == "text":
+                                delta_content = str(block.get("text") or "")
+                                round_answer += delta_content
+                                if markup_stream is not None:
+                                    round_preview += markup_stream.feed(delta_content)
+                            elif block.get("type") in {"thinking", "redacted_thinking"}:
+                                round_reasoning += str(block.get("thinking") or "")
+                                anthropic_thinking_blocks[index] = dict(block)
+                            elif block.get("type") == "tool_use":
+                                current = round_tools_by_index.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                                current["id"] = str(block.get("id") or "")
+                                current["function"]["name"] = str(block.get("name") or "")
+                                initial_input = block.get("input")
+                                if initial_input:
+                                    current["function"]["arguments"] = json.dumps(initial_input, ensure_ascii=False, separators=(",", ":"))
+                        elif event_type == "content_block_delta":
+                            index = int(data.get("index") or 0)
+                            delta = data.get("delta") or {}
+                            if delta.get("type") == "text_delta":
+                                delta_content = str(delta.get("text") or "")
+                                round_answer += delta_content
+                                if markup_stream is not None:
+                                    round_preview += markup_stream.feed(delta_content)
+                            elif delta.get("type") == "thinking_delta":
+                                round_reasoning += str(delta.get("thinking") or "")
+                                thinking_block = anthropic_thinking_blocks.setdefault(index, {"type": "thinking", "thinking": "", "signature": ""})
+                                thinking_block["thinking"] = str(thinking_block.get("thinking") or "") + str(delta.get("thinking") or "")
+                            elif delta.get("type") == "signature_delta":
+                                thinking_block = anthropic_thinking_blocks.setdefault(index, {"type": "thinking", "thinking": "", "signature": ""})
+                                thinking_block["signature"] = str(thinking_block.get("signature") or "") + str(delta.get("signature") or "")
+                            elif delta.get("type") == "input_json_delta":
+                                current = round_tools_by_index.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                                current["function"]["arguments"] += str(delta.get("partial_json") or "")
+                    for choice in [] if messages_protocol else data.get("choices") or []:
                         delta = choice.get("delta") or {}
                         message = choice.get("message") or {}
                         delta_content = str(delta.get("content") or "")
@@ -824,6 +993,10 @@ async def stream_response(
             # protocol expects the field on tool-call turns).
             if round_reasoning or (mimo_model and config["thinking"] == "enabled"):
                 assistant_message["reasoning_content"] = round_reasoning
+            if messages_protocol and anthropic_thinking_blocks:
+                assistant_message["anthropic_thinking_blocks"] = [
+                    anthropic_thinking_blocks[index] for index in sorted(anthropic_thinking_blocks)
+                ]
             conversation.append(assistant_message)
             tool_rounds_used += 1
             call_id = call["id"]

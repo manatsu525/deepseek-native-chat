@@ -680,8 +680,8 @@ function startPolling(id){
 
 function normalizeProviderType(value){return value==='mimo'?'custom':(value||'deepseek')}
 function isMimoModel(value){return String(value||'').toLowerCase().startsWith('mimo-')}
-function isCustomProviderType(value){return ['custom','custom_response'].includes(normalizeProviderType(value))}
-function providerLabel(provider){const kind=normalizeProviderType(provider.provider_type);return kind==='custom_response'?'Custom Responses':kind==='custom'?'Custom Chat':'DeepSeek'}
+function isCustomProviderType(value){return ['custom','custom_response','custom_messages'].includes(normalizeProviderType(value))}
+function providerLabel(provider){const kind=normalizeProviderType(provider.provider_type);return kind==='custom_response'?'Custom Responses':kind==='custom_messages'?'Custom Messages':kind==='custom'?'Custom Chat':'DeepSeek'}
 function providerModels(provider){const models=Array.isArray(provider&&provider.models)&&provider.models.length?provider.models:[provider&&provider.model];return [...new Set(models.filter(Boolean).map(String))]}
 function selectedOption(){return $('#providerSelect').selectedOptions[0]||null}
 function selectedProvider(){const option=selectedOption();const id=option&&option.dataset.providerId||$('#providerSelect').value;return state.providers.find(x=>String(x.id)===String(id))}
@@ -728,7 +728,7 @@ const customWebToolInfo={
 };
 function selectedWebToolInfo(provider=selectedProvider()){const key=customSettings(provider).web_tool_backend;return customWebToolInfo[key]||customWebToolInfo.parallel}
 function updateProviderUi(){
-  const provider=selectedProvider(), custom=provider&&isCustomProviderType(provider.provider_type), responses=provider&&normalizeProviderType(provider.provider_type)==='custom_response', customEffort=custom&&customSettings(provider).reasoning_effort_enabled;
+  const provider=selectedProvider(), custom=provider&&isCustomProviderType(provider.provider_type), protocol=provider&&normalizeProviderType(provider.provider_type), responses=protocol==='custom_response', messages=protocol==='custom_messages', customEffort=custom&&!messages&&customSettings(provider).reasoning_effort_enabled;
   const webInfo=custom?selectedWebToolInfo(provider):null;
   const collaborative=state.chatMode==='multi_agent';
   $('#customSettingsButton').classList.toggle('hidden',!custom);
@@ -736,9 +736,9 @@ function updateProviderUi(){
   $('#effort').title=custom?(customEffort?'控制发送给 Custom 模型的 reasoning_effort':'Custom 参数中已关闭 reasoning_effort'):'控制 DeepSeek 模型推理投入';
   $('#nativePill').textContent=collaborative?(custom?'● 4 Agents':'⚠ 仅 Custom'):custom?`● ${webInfo.label}`:'● Native Web';
   $('#welcomeOrbitMark').textContent=collaborative?'4A':custom?'CU':'DS';
-  $('#welcomeEyebrow').textContent=collaborative?'NEXUS · ATLAS · FORGE · SENTINEL':responses?'CUSTOM · RESPONSES':custom?'CUSTOM · CHAT COMPLETIONS': 'DEEPSEEK V4 FLASH';
+  $('#welcomeEyebrow').textContent=collaborative?'NEXUS · ATLAS · FORGE · SENTINEL':responses?'CUSTOM · RESPONSES':messages?'CUSTOM · MESSAGES':custom?'CUSTOM · CHAT COMPLETIONS': 'DEEPSEEK V4 FLASH';
   $('#welcomeTitle').textContent=collaborative?'让四个智能体协同完成任务':custom?'使用 Custom 本地联网':'问点需要查证的问题';
-  $('#welcomeDescription').textContent=collaborative?(custom?'Nexus 动态调度 Atlas、Forge 与 Sentinel；所有角色使用当前 Custom 模型及共享工作区。':'多智能体协作仅支持 Custom 模型，请先切换下方 API。'):custom?`模型通过标准 ${responses?'Responses':'Chat Completions'} 协议调用 ${webInfo.label} 搜索与读取真实来源。`:'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
+  $('#welcomeDescription').textContent=collaborative?(custom?'Nexus 动态调度 Atlas、Forge 与 Sentinel；所有角色使用当前 Custom 模型及共享工作区。':'多智能体协作仅支持 Custom 模型，请先切换下方 API。'):custom?`模型通过标准 ${responses?'Responses':messages?'Anthropic Messages':'Chat Completions'} 协议调用 ${webInfo.label} 搜索与读取真实来源。`:'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
   if($('#statusText'))$('#statusText').textContent=collaborative?(custom?'多智能体协作 · Nexus 动态调度':'多智能体协作 · 等待 Custom 模型'):'标准模式 · 外部搜索工具已就绪';
   if($('#footnote'))$('#footnote').textContent=collaborative?'多智能体协作仅用于 Custom 模型；Nexus 统筹，Atlas 渐进调研，Forge 工程执行，Sentinel 独立审查并触发返修。':'标准模式：Custom API 使用你选择的搜索与网页抓取方案；DeepSeek 使用服务端原生联网。';
 }
@@ -769,7 +769,7 @@ function renderCustomModels(models=[], selected=[]){
 function syncProviderForm(){
   const custom=isCustomProviderType(providerType());
   const base=$('#providerBase'), model=$('#providerModel');
-  base.value=custom?'https://api.openai.com/v1':'https://api.deepseek.com';
+  base.value=providerType()==='custom_messages'?'https://api.anthropic.com/v1':custom?'https://api.openai.com/v1':'https://api.deepseek.com';
   model.innerHTML='<option value="deepseek-v4-flash">deepseek-v4-flash</option><option value="deepseek-v4-pro">deepseek-v4-pro</option>';
   $('#providerModelField').classList.toggle('hidden',custom);
   $('#manualModelField').classList.toggle('hidden',!custom);
@@ -838,7 +838,7 @@ function fillCustomSettings(){
   $('#customThinking').value=config.thinking;$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customDsmlFallbackEnabled').checked=config.dsml_fallback_enabled;$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
   syncCustomThinkingFields();syncCustomToolFields();
 }
-function syncCustomThinkingFields(){const responses=normalizeProviderType((selectedProvider()||{}).provider_type)==='custom_response',mimo=isMimoModel(selectedModel()),thinking=$('#customThinking').value==='enabled',effort=$('#customReasoningEffortEnabled').checked;$('#customThinking').disabled=responses;$('#customTemperature').disabled=!responses&&mimo&&thinking;$('#customTopP').disabled=!responses&&mimo&&thinking;$('#customSamplingNote').textContent=responses?`Responses 协议不发送非标准 thinking 字段；reasoning.effort 将${effort?'按顶部所选档位发送':'不发送'}，temperature/top_p 正常发送。`:`thinking 将${thinking?'开启':'关闭'}；reasoning_effort 将${effort?'按顶部所选档位发送':'不发送'}。已知模型使用官方字段，其他 Custom 使用通用顶层字段；接口不支持时可在这里关闭。`}
+function syncCustomThinkingFields(){const protocol=normalizeProviderType((selectedProvider()||{}).provider_type),responses=protocol==='custom_response',messages=protocol==='custom_messages',mimo=isMimoModel(selectedModel()),thinking=$('#customThinking').value==='enabled',effort=$('#customReasoningEffortEnabled').checked;$('#customThinking').disabled=responses;$('#customReasoningEffortEnabled').disabled=messages;$('#customTemperature').disabled=messages?thinking:!responses&&mimo&&thinking;$('#customTopP').disabled=messages?thinking:!responses&&mimo&&thinking;$('#customSamplingNote').textContent=responses?`Responses 协议不发送非标准 thinking 字段；reasoning.effort 将${effort?'按顶部所选档位发送':'不发送'}，temperature/top_p 正常发送。`:messages?`Messages 使用 Anthropic thinking 语法；开启 thinking 时不发送 temperature/top_p。该协议没有通用 reasoning_effort 字段。`:`thinking 将${thinking?'开启':'关闭'}；reasoning_effort 将${effort?'按顶部所选档位发送':'不发送'}。已知模型使用官方字段，其他 Custom 使用通用顶层字段；接口不支持时可在这里关闭。`}
 function syncCustomToolFields(){const info=customWebToolInfo[$('#customWebToolBackend').value]||customWebToolInfo.parallel;$('#customToolNote').textContent=`${info.description} 不需要 API Key；不会自动切换、并发调用或回退到其他方案。`}
 function openCustomSettings(){if(!selectedProvider()||!isCustomProviderType(selectedProvider().provider_type)){toast('请先选择 Custom API');return}fillCustomSettings();$('#customModal').showModal()}
 async function saveCustomSettings(event){

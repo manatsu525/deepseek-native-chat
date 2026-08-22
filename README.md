@@ -57,7 +57,7 @@ sudo ./install.sh
 
 默认访问地址为 `https://服务器IP:8000`。证书为自签证书，首次访问需要在浏览器中确认继续。
 
-进入页面后，在右上角打开“API”，接口类型分为三种：DeepSeek 专用 Responses、Custom Chat Completions 和 Custom Responses。填写 Custom 的 OpenAI 兼容 API 地址和 API Key 后，点击“测试并读取模型”；`/models` 返回的模型会以复选框显示，也可以手动填写不在列表中的模型名并测试。DeepSeek 使用 `https://api.deepseek.com`，两种 Custom 默认使用 `https://api.openai.com/v1`，可改成任意兼容接口地址。协议是每条 API 配置的一部分，不会根据模型名自动猜测；同一平台需要两种协议时请分别添加两条配置。
+进入页面后，在右上角打开“API”，接口类型分为四种：DeepSeek 专用 Responses、Custom Chat Completions、Custom Responses 和 Custom Messages（Anthropic）。填写 Custom API 地址和 API Key 后，点击“测试并读取模型”；`/models` 返回的模型会以复选框显示，也可以手动填写不在列表中的模型名并测试。DeepSeek 使用 `https://api.deepseek.com`，Chat/Responses 默认使用 `https://api.openai.com/v1`，Messages 默认使用 `https://api.anthropic.com/v1`，均可改成兼容平台地址。协议是每条 API 配置的一部分，不会根据模型名自动猜测；同一平台需要多种协议时请分别添加配置。
 
 升级旧版本时，原来的 MiMo API 配置会自动迁移为 Custom，已保存的模型和对话不会删除。
 
@@ -79,7 +79,7 @@ sudo ./uninstall.sh --yes
 
 ## 设计说明
 
-DeepSeek 使用官方 `/responses` 路由及原生联网。Custom Chat 使用标准 `/chat/completions`，Custom Responses 使用标准 `/responses`；两种 Custom 都由本机后端提供 `web_search`、`fetch_webpage` 和工作区 Function Tools，并共享相同的工具限额、多智能体协作及模型级参数。默认方案匿名连接 Parallel 官方 Streamable HTTP MCP；也可以手动选择 Keenable、Tavily Keyless、Firecrawl Keyless、You.com Free 或 DDG + Jina。选择后，搜索与抓取固定使用对应的一组实现，不自动切换、不 fallback、不同 provider 之间不并发。You.com Free 只提供搜索，因此它是唯一复用现有 Jina Reader 抓取的新增方案。查询词和待读取 URL 会发送给当前选择的服务。
+DeepSeek 使用官方 `/responses` 路由及原生联网。Custom Chat 使用标准 `/chat/completions`，Custom Responses 使用标准 `/responses`，Custom Messages 使用 Anthropic `/messages`；三种 Custom 都由本机后端提供 `web_search`、`fetch_webpage` 和工作区工具，并共享相同的工具限额、多智能体协作及模型级参数。Messages 会转换 system、图片、tool use/tool result、thinking 及签名块，并发送 `x-api-key` 和 `anthropic-version` 请求头。默认方案匿名连接 Parallel 官方 Streamable HTTP MCP；也可以手动选择 Keenable、Tavily Keyless、Firecrawl Keyless、You.com Free 或 DDG + Jina。选择后，搜索与抓取固定使用对应的一组实现，不自动切换、不 fallback、不同 provider 之间不并发。You.com Free 只提供搜索，因此它是唯一复用现有 Jina Reader 抓取的新增方案。查询词和待读取 URL 会发送给当前选择的服务。
 
 新增匿名 MCP 由独立的轻量客户端适配：Keenable 调用 `https://api.keenable.ai/mcp` 的 `search_web_pages` / `fetch_page_content`，抓取固定发送 `live=true`；Tavily 调用 `https://mcp.tavily.com/mcp/` 的 `tavily_search` / `tavily_extract`，每次请求固定发送 `X-Tavily-Access-Mode: keyless`；Firecrawl 调用 `https://mcp.firecrawl.dev/v2/mcp`，只使用 `firecrawl_search` / `firecrawl_scrape`；You.com 调用 `https://api.you.com/mcp?profile=free` 的 `you-search`，抓取则直接复用原来的 Jina Reader。四种服务的原始响应都会归一化为相同的标题、URL、摘要和正文格式，再作为 `tool` 消息回传给 LLM。
 

@@ -172,9 +172,13 @@ def custom_auth_headers(
     return headers
 
 
-async def list_models(base_url: str, api_key: str, timeout: int = 30) -> list[str]:
+async def list_models(base_url: str, api_key: str, timeout: int = 30, api_protocol: str = "chat_completions") -> list[str]:
+    headers = custom_auth_headers(api_key, base_url=base_url)
+    if api_protocol == "messages":
+        headers["x-api-key"] = api_key
+        headers["anthropic-version"] = "2023-06-01"
     async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.get(_url(base_url, "/models"), headers=custom_auth_headers(api_key, base_url=base_url))
+        response = await client.get(_url(base_url, "/models"), headers=headers)
         response.raise_for_status()
         data = response.json().get("data", [])
     return sorted({str(item.get("id")) for item in data if item.get("id")})[:500]

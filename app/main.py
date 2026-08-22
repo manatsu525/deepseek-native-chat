@@ -26,6 +26,7 @@ from .db import Database
 from .deepseek import list_models as deepseek_list_models
 from .deepseek import stream_response as deepseek_stream_response
 from .custom_responses import stream_response as custom_responses_stream_response
+from .custom_messages import stream_response as custom_messages_stream_response
 from .mimo import DEFAULT_SETTINGS as CUSTOM_DEFAULT_SETTINGS
 from .mimo import MIMO_MAX_COMPLETION_TOKENS, custom_auth_headers, is_mimo_model, list_models as custom_list_models
 from .mimo_local import stream_response as custom_stream_response
@@ -51,11 +52,13 @@ SUPPORTED_MODELS = {
     # manually entered model name, so there is no static allow-list here.
     "custom": set(),
     "custom_response": set(),
+    "custom_messages": set(),
 }
 DEFAULT_BASE_URLS = {
     "deepseek": "https://api.deepseek.com",
     "custom": "https://api.openai.com/v1",
     "custom_response": "https://api.openai.com/v1",
+    "custom_messages": "https://api.anthropic.com/v1",
 }
 
 
@@ -77,7 +80,7 @@ class PasswordBody(BaseModel):
 class ProviderBody(BaseModel):
     name: str = Field(min_length=1, max_length=40)
     api_key: str = Field(min_length=8, max_length=300)
-    provider_type: Literal["deepseek", "custom", "custom_response"] = "deepseek"
+    provider_type: Literal["deepseek", "custom", "custom_response", "custom_messages"] = "deepseek"
     base_url: str = ""
     model: str = ""
     selected_models: list[str] = Field(default_factory=list, max_length=500)
@@ -174,7 +177,7 @@ def custom_settings_for_model(row: dict[str, Any], model: str) -> dict[str, Any]
 
 def migrate_custom_provider_settings() -> None:
     """Persist the former API-wide settings as independent per-model values."""
-    for provider in db.all("SELECT * FROM providers WHERE provider_type IN ('custom','custom_response')"):
+    for provider in db.all("SELECT * FROM providers WHERE provider_type IN ('custom','custom_response','custom_messages')"):
         before = _decoded_provider_settings(provider)
         after = custom_settings_document(provider)
         if before != after:
@@ -196,7 +199,15 @@ def provider_type(row: dict[str, Any]) -> str:
 
 
 def is_custom_provider(kind: str) -> bool:
-    return kind in {"custom", "custom_response"}
+    return kind in {"custom", "custom_response", "custom_messages"}
+
+
+def custom_streamer(kind: str):
+    if kind == "custom_response":
+        return custom_responses_stream_response
+    if kind == "custom_messages":
+        return custom_messages_stream_response
+    return custom_stream_response
 
 
 def _clean_model_ids(values: Any) -> list[str]:
@@ -460,11 +471,11 @@ async def _execute_job(job_id: str) -> None:
                 user_timezone=job.get("timezone") or "UTC",
                 effort=job["effort"],
                 workspace=job_workspace,
-                streamer=custom_responses_stream_response if kind == "custom_response" else custom_stream_response,
+                streamer=custom_streamer(kind),
             )
         elif is_custom_provider(kind):
             provider_settings = custom_settings_for_model(provider, job["model"])
-            streamer = custom_responses_stream_response if kind == "custom_response" else custom_stream_response
+            streamer = custom_streamer(kind)
             result = await streamer(
                 base_url=provider["base_url"],
                 api_key=provider["api_key"],
@@ -809,29 +820,37 @@ def providers(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, An
     return [public_provider(row) for row in db.all("SELECT * FROM providers WHERE user_id=? ORDER BY id", (user["id"],))]
 
 
-async def test_custom_model(base_url: str, api_key: str, model: str, *, responses: bool = False) -> None:
+async def test_custom_model(base_url: str, api_key: str, model: str, *, api_protocol: str = "chat_completions") -> None:
     """Validate a manually entered model with a minimal protocol-appropriate request."""
     mimo_model = is_mimo_model(model)
     token_field = "max_completion_tokens" if mimo_model else "max_tokens"
-    payload = (
-        {"model": model, "input": "Reply OK", "max_output_tokens": 1, "stream": False}
-        if responses
-        else {
+    if api_protocol == "responses":
+        payload = {"model": model, "input": "Reply OK", "max_output_tokens": 1, "stream": False}
+        endpoint = "/responses"
+    elif api_protocol == "messages":
+        payload = {"model": model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 1, "stream": False}
+        endpoint = "/messages"
+    else:
+        payload = {
             "model": model,
             "messages": [{"role": "user", "content": "Reply OK"}],
             token_field: 1,
             "stream": False,
         }
-    )
-    if mimo_model and not responses:
+        endpoint = "/chat/completions"
+    if mimo_model and api_protocol == "chat_completions":
         # Keep a connection test cheap and deterministic. MiMo accepts the
         # thinking switch, while ordinary Custom providers never receive it.
         payload["thinking"] = {"type": "disabled"}
+    request_headers = custom_auth_headers(api_key, base_url=base_url)
+    if api_protocol == "messages":
+        request_headers["x-api-key"] = api_key
+        request_headers["anthropic-version"] = "2023-06-01"
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(30, connect=5), follow_redirects=True) as client:
             response = await client.post(
-                base_url.rstrip("/") + ("/responses" if responses else "/chat/completions"),
-                headers=custom_auth_headers(api_key, base_url=base_url),
+                base_url.rstrip("/") + endpoint,
+                headers=request_headers,
                 json=payload,
             )
     except Exception as exc:
@@ -856,7 +875,8 @@ async def test_provider_credentials(kind: str, base: str, api_key: str, manual_v
     manual_models = _clean_model_ids(manual_values)
     manual_tested: list[str] = []
     try:
-        models = await (custom_list_models(base, api_key) if is_custom_provider(kind) else deepseek_list_models(base, api_key))
+        protocol = "responses" if kind == "custom_response" else "messages" if kind == "custom_messages" else "chat_completions"
+        models = await (custom_list_models(base, api_key, api_protocol=protocol) if is_custom_provider(kind) else deepseek_list_models(base, api_key))
     except Exception as exc:
         if not is_custom_provider(kind) or not manual_models:
             raise HTTPException(400, f"API 测试失败：{exc}") from exc
@@ -870,7 +890,7 @@ async def test_provider_credentials(kind: str, base: str, api_key: str, manual_v
         advertised = set(models)
         for model_id in manual_models:
             if model_id not in advertised:
-                await test_custom_model(base, api_key, model_id, responses=kind == "custom_response")
+                await test_custom_model(base, api_key, model_id, api_protocol=protocol)
                 manual_tested.append(model_id)
         models = list(dict.fromkeys([*models, *manual_models]))
         supported = models

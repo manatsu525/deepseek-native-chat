@@ -8,6 +8,7 @@ class CustomResponsesProtocolTests(unittest.TestCase):
     def test_provider_type_is_independent_custom_protocol(self) -> None:
         self.assertTrue(main.is_custom_provider("custom"))
         self.assertTrue(main.is_custom_provider("custom_response"))
+        self.assertTrue(main.is_custom_provider("custom_messages"))
         self.assertFalse(main.is_custom_provider("deepseek"))
         main.validate_provider_selection("custom_response", "muse-spark-1.2")
 
