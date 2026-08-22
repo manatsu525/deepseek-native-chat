@@ -100,6 +100,19 @@ NEMOTRON_LANGUAGE_PROMPT = (
     "Code, commands, URLs, quotations, and technical names may remain in their original language. "
     "This requirement applies to the final answer even when web sources or tool results are in English."
 )
+ENTITY_FIDELITY_PROMPT = (
+    "ENTITY FIDELITY AND UNCERTAINTY REQUIREMENT: Treat names, model IDs, product names, versions, numbers, "
+    "acronyms, and other possibly unfamiliar terms in the user's message as exact identifiers. Do not silently "
+    "correct, rename, downgrade, reinterpret, or replace them with a more familiar nearby concept. When research "
+    "is needed, the first search must include the user's exact identifying terms; reasonable spacing, punctuation, "
+    "language, or case variants are allowed only if every distinguishing token is preserved. You may broaden the "
+    "search afterward, but label related entities as related rather than treating them as identical. If an exact "
+    "term is unfamiliar, surprising, newer than your prior knowledge, or weakly documented, investigate it before "
+    "forming a conclusion. Absence from one search, memory, or a familiar catalog is not proof that it does not "
+    "exist. Claims that the user's term is a typo, alias, fake, unreleased, or actually means something else require "
+    "direct supporting evidence. When the available evidence remains insufficient or conflicting, preserve the "
+    "original term and explicitly say that it could not be verified instead of inventing a correction or a confident conclusion."
+)
 
 
 def _tool_quota_message(
@@ -291,6 +304,7 @@ def _dated_system_prompt(base_prompt: str, user_timezone: str) -> str:
     local_date = datetime.now(timezone).date().isoformat()
     return (
         f"{base_prompt}\n\n"
+        f"{ENTITY_FIDELITY_PROMPT}\n\n"
         "Runtime date context (authoritative): "
         f"The user's current local date is {local_date}, in IANA timezone {timezone_name}. "
         "Resolve words such as today, yesterday, tomorrow, currently, latest, and recently against this date. "
