@@ -195,6 +195,11 @@ class CustomModelSettingsTests(unittest.TestCase):
         provider_id = self.add_legacy_provider()
         main.migrate_custom_provider_settings()
 
+        revealed = self.client.get(f"/api/providers/{provider_id}/key")
+        self.assertEqual(revealed.status_code, 200, revealed.text)
+        self.assertEqual(revealed.json()["api_key"], "custom-settings-token")
+        self.assertEqual(revealed.headers["cache-control"], "no-store")
+
         response = self.client.put(
             f"/api/providers/{provider_id}",
             json={

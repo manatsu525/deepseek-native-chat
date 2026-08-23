@@ -832,6 +832,20 @@ def providers(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, An
     return [public_provider(row) for row in db.all("SELECT * FROM providers WHERE user_id=? ORDER BY id", (user["id"],))]
 
 
+@app.get("/api/providers/{provider_id}/key")
+def provider_api_key(
+    provider_id: int,
+    response: Response,
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, str]:
+    """Reveal the current user's saved Key only when opening its editor."""
+    provider = db.one("SELECT api_key FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"]))
+    if not provider:
+        raise HTTPException(404, "API 配置不存在")
+    response.headers["Cache-Control"] = "no-store"
+    return {"api_key": provider["api_key"]}
+
+
 async def test_custom_model(base_url: str, api_key: str, model: str, *, api_protocol: str = "chat_completions") -> None:
     """Validate a manually entered model with a minimal protocol-appropriate request."""
     mimo_model = is_mimo_model(model)

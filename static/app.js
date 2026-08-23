@@ -786,17 +786,19 @@ function resetProviderEditor(){
   $('#providerModalTitle').textContent='模型 API';$('#providerSubmit').textContent='保存 API';$('#cancelProviderEdit').classList.add('hidden');
   $('#providerType').value='deepseek';syncProviderForm();$('#providerKey').value='';$('#manualModel').value='';renderCustomModels([],[]);$('#providerStatus').textContent='';
 }
-function editProviderModels(providerId){
+async function editProviderModels(providerId){
   const provider=state.providers.find(item=>String(item.id)===String(providerId));if(!provider)return;
+  let savedKey;
+  try{savedKey=(await api(`/api/providers/${provider.id}/key`)).api_key}catch(err){toast(err.message);return}
   resetProviderEditor();state.editingProviderId=provider.id;
   $('#providerType').value=normalizeProviderType(provider.provider_type);syncProviderForm();
-  $('#providerName').value=provider.name;$('#providerBase').value=provider.base_url;$('#providerKey').value='';
-  $('#providerKey').required=false;$('#providerKey').placeholder=`留空沿用 ${provider.api_key_masked}；输入新 Key 可替换`;
+  $('#providerName').value=provider.name;$('#providerBase').value=provider.base_url;$('#providerKey').value=savedKey||'';
+  $('#providerKey').required=true;$('#providerKey').placeholder='输入对应服务商 API Key';
   $('#providerModalTitle').textContent='编辑 API';$('#providerSubmit').textContent='保存更改';$('#cancelProviderEdit').classList.remove('hidden');
   if(isCustomProviderType(provider.provider_type)){
     const models=providerModels(provider);renderCustomModels(models,models);$('#manualModel').value='';
   }else{$('#providerModel').value=provider.model||'deepseek-v4-flash'}
-  $('#providerStatus').textContent='名称、Key、接口类型、地址和模型均可修改；Key 留空会沿用当前值。测试失败的手填模型也可以直接保存。';
+  $('#providerStatus').textContent='名称、Key、接口类型、地址和模型均可修改；当前 Key 已明文显示。测试失败的手填模型也可以直接保存。';
   $('#providerForm').scrollIntoView({behavior:'smooth',block:'start'});
 }
 async function testProvider(){
