@@ -769,7 +769,9 @@ function renderCustomModels(models=[], selected=[]){
 function syncProviderForm(){
   const custom=isCustomProviderType(providerType());
   const base=$('#providerBase'), model=$('#providerModel');
-  base.value=providerType()==='custom_messages'?'https://api.anthropic.com/v1':custom?'https://api.openai.com/v1':'https://api.deepseek.com';
+  // Protocol changes on an existing provider must not silently replace its
+  // endpoint. A NanoGPT Key sent to the protocol default would fail with 401.
+  if(!state.editingProviderId)base.value=providerType()==='custom_messages'?'https://api.anthropic.com/v1':custom?'https://api.openai.com/v1':'https://api.deepseek.com';
   model.innerHTML='<option value="deepseek-v4-flash">deepseek-v4-flash</option><option value="deepseek-v4-pro">deepseek-v4-pro</option>';
   $('#providerModelField').classList.toggle('hidden',custom);
   $('#manualModelField').classList.toggle('hidden',!custom);
