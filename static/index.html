@@ -157,13 +157,13 @@
     <div id="providerList" class="item-list"></div>
     <form id="providerForm" class="form-grid">
       <label>配置名称<input id="providerName" placeholder="例如：我的 DeepSeek" required></label>
-      <label>API Key<input id="providerKey" type="password" autocomplete="off" placeholder="输入对应服务商 API Key" required></label>
+      <label>API Key<input id="providerKey" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="输入对应服务商 API Key" required></label>
       <label>接口类型<select id="providerType"><option value="deepseek">DeepSeek · Responses（专用）</option><option value="custom">Custom · Chat Completions</option><option value="custom_response">Custom · Responses</option><option value="custom_messages">Custom · Messages（Anthropic）</option></select></label>
       <label>API 地址<input id="providerBase" value="https://api.deepseek.com" required></label>
       <label id="providerModelField">模型
         <select id="providerModel"><option value="deepseek-v4-flash">deepseek-v4-flash</option><option value="deepseek-v4-pro">deepseek-v4-pro</option></select>
       </label>
-      <label class="wide" id="manualModelField">手动模型名<textarea id="manualModel" rows="2" placeholder="Custom 可填写一个或多个模型名，每行一个；不在 /models 中也可以测试"></textarea></label>
+      <label class="wide" id="manualModelField">手动模型名<textarea id="manualModel" rows="2" placeholder="Custom 可填写一个或多个模型名，每行一个；测试失败也可以直接保存"></textarea></label>
       <div id="customModelsPanel" class="wide custom-models-panel hidden">
         <div class="custom-models-head"><strong>/models 模型列表</strong><span id="customModelCount">请先测试 API</span></div>
         <input id="customModelFilter" class="custom-model-filter" placeholder="筛选模型名称…">
@@ -223,6 +223,6 @@
 
   <div id="toast" class="toast"></div>
   <script src="/assets/vendor/katex/katex.min.js" defer></script>
-  <script src="/assets/app.js?v=20260819-concurrent-chat" defer></script>
+  <script src="/assets/app.js?v=20260823-provider-editor" defer></script>
 </body>
 </html>

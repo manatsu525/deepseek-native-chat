@@ -191,6 +191,65 @@ class CustomModelSettingsTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400, response.text)
         self.assertIn("未在此 custom API", response.json()["detail"])
 
+    def test_connection_key_protocol_address_and_models_can_be_edited(self) -> None:
+        provider_id = self.add_legacy_provider()
+        main.migrate_custom_provider_settings()
+
+        response = self.client.put(
+            f"/api/providers/{provider_id}",
+            json={
+                "name": "edited-provider",
+                "api_key": "replacement-api-key",
+                "provider_type": "custom_response",
+                "base_url": "https://responses.invalid/v1/",
+                "model": "model-b",
+                "selected_models": ["model-b", "model-c"],
+                "manual_models": ["model-c"],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        public = response.json()
+        self.assertEqual(public["name"], "edited-provider")
+        self.assertEqual(public["provider_type"], "custom_response")
+        self.assertEqual(public["base_url"], "https://responses.invalid/v1")
+        self.assertEqual(public["models"], ["model-b", "model-c"])
+        stored = main.db.one("SELECT * FROM providers WHERE id=?", (provider_id,))
+        self.assertEqual(stored["api_key"], "replacement-api-key")
+        self.assertEqual(public["model_settings"]["model-b"]["temperature"], 0.4)
+        self.assertEqual(public["model_settings"]["model-c"]["temperature"], 1.0)
+
+        response = self.client.put(
+            f"/api/providers/{provider_id}",
+            json={
+                "name": "edited-again",
+                "api_key": "",
+                "provider_type": "custom_messages",
+                "base_url": "https://messages.invalid/v1",
+                "model": "model-b",
+                "selected_models": ["model-b"],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        stored = main.db.one("SELECT * FROM providers WHERE id=?", (provider_id,))
+        self.assertEqual(stored["api_key"], "replacement-api-key")
+        self.assertEqual(stored["provider_type"], "custom_messages")
+
+    def test_manual_model_can_be_saved_without_a_successful_probe(self) -> None:
+        response = self.client.post(
+            "/api/providers",
+            json={
+                "name": "unverified-manual-model",
+                "api_key": "manual-model-api-key",
+                "provider_type": "custom_response",
+                "base_url": "https://offline.invalid/v1",
+                "model": "tencent/hy3",
+                "selected_models": ["tencent/hy3"],
+                "manual_models": ["tencent/hy3"],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["models"], ["tencent/hy3"])
+
 
 if __name__ == "__main__":
     unittest.main()

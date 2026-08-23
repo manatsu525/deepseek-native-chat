@@ -94,6 +94,18 @@ class ProviderModelsBody(BaseModel):
     manual_models: Optional[list[str]] = Field(default=None, max_length=500)
 
 
+class ProviderEditBody(BaseModel):
+    """Editable connection fields; an empty Key keeps the saved credential."""
+
+    name: str = Field(default="", max_length=40)
+    api_key: str = Field(default="", max_length=300)
+    provider_type: Optional[Literal["deepseek", "custom", "custom_response", "custom_messages"]] = None
+    base_url: str = ""
+    model: str = ""
+    selected_models: list[str] = Field(default_factory=list, max_length=500)
+    manual_models: Optional[list[str]] = Field(default=None, max_length=500)
+
+
 class CustomSettingsBody(BaseModel):
     thinking: Literal["enabled", "disabled"] = "enabled"
     reasoning_effort_enabled: bool = True
@@ -825,7 +837,10 @@ async def test_custom_model(base_url: str, api_key: str, model: str, *, api_prot
     mimo_model = is_mimo_model(model)
     token_field = "max_completion_tokens" if mimo_model else "max_tokens"
     if api_protocol == "responses":
-        payload = {"model": model, "input": "Reply OK", "max_output_tokens": 1, "stream": False}
+        # OpenAI accepts this small value, while aggregators such as NanoGPT
+        # enforce a protocol minimum of 16 output tokens even for a connection
+        # test. The instruction keeps actual generation much shorter.
+        payload = {"model": model, "input": "Reply only OK", "max_output_tokens": 16, "stream": False}
         endpoint = "/responses"
     elif api_protocol == "messages":
         payload = {"model": model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 1, "stream": False}
@@ -947,13 +962,61 @@ def add_provider(body: ProviderBody, user: dict[str, Any] = Depends(current_user
 
 
 @app.post("/api/providers/{provider_id}/test")
-async def test_saved_provider(provider_id: int, body: ProviderModelsBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+async def test_saved_provider(provider_id: int, body: ProviderEditBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"]))
     if not provider:
         raise HTTPException(404, "API 配置不存在")
-    kind = provider_type(provider)
+    kind = body.provider_type or provider_type(provider)
+    base = clean_base_url(body.base_url or provider["base_url"] or DEFAULT_BASE_URLS[kind])
+    api_key = body.api_key.strip() or provider["api_key"]
+    if len(api_key) < 8:
+        raise HTTPException(400, "API Key 至少需要 8 个字符")
     manual_values = body.manual_models if body.manual_models is not None else body.selected_models
-    return await test_provider_credentials(kind, provider["base_url"], provider["api_key"], manual_values)
+    return await test_provider_credentials(kind, base, api_key, manual_values)
+
+
+@app.put("/api/providers/{provider_id}")
+def update_provider(provider_id: int, body: ProviderEditBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"]))
+    if not provider:
+        raise HTTPException(404, "API 配置不存在")
+    if db.one("SELECT id FROM jobs WHERE provider_id=? AND status IN ('queued','running')", (provider_id,)):
+        raise HTTPException(409, "该 API 正在生成回答，完成或停止后才能修改连接信息")
+    kind = body.provider_type or provider_type(provider)
+    name = body.name.strip() or provider["name"]
+    api_key = body.api_key.strip() or provider["api_key"]
+    if len(api_key) < 8:
+        raise HTTPException(400, "API Key 至少需要 8 个字符")
+    base = clean_base_url(body.base_url or provider["base_url"] or DEFAULT_BASE_URLS[kind])
+    selected_models = _clean_model_ids(body.selected_models)
+    if is_custom_provider(kind):
+        model = body.model.strip() or (selected_models[0] if selected_models else "")
+        if model and model not in selected_models:
+            selected_models.insert(0, model)
+        if not selected_models:
+            raise HTTPException(400, "请至少选择或填写一个 custom 模型")
+        settings_value = custom_settings_document(provider, selected_models)
+    else:
+        model = body.model.strip() or "deepseek-v4-flash"
+        selected_models = [model]
+        settings_value = {"models": selected_models}
+    validate_provider_selection(kind, model)
+    db.run(
+        """UPDATE providers
+           SET name=?,api_key=?,base_url=?,model=?,provider_type=?,settings_json=?
+           WHERE id=? AND user_id=?""",
+        (
+            name,
+            api_key,
+            base,
+            model,
+            kind,
+            json.dumps(settings_value, ensure_ascii=False),
+            provider_id,
+            user["id"],
+        ),
+    )
+    return public_provider(db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"])))
 
 
 @app.put("/api/providers/{provider_id}/models")

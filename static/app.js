@@ -753,7 +753,7 @@ async function loadProviders(){
   renderProviderList(); updateProviderUi();
 }
 function renderProviderList(){
-  $('#providerList').innerHTML=state.providers.map(p=>`<div class="list-item"><div class="list-item-main"><strong>${escapeHtml(p.name)} <span class="provider-kind">${providerLabel(p)}</span></strong><small>${escapeHtml(p.api_key_masked)} · ${escapeHtml(providerModels(p).join('、'))}</small></div><div class="item-actions"><button class="soft-btn" data-provider-edit="${p.id}">编辑模型</button><button class="danger-btn" data-provider-delete="${p.id}">删除</button></div></div>`).join('')||'<p class="muted">尚未添加 API。</p>';
+  $('#providerList').innerHTML=state.providers.map(p=>`<div class="list-item"><div class="list-item-main"><strong>${escapeHtml(p.name)} <span class="provider-kind">${providerLabel(p)}</span></strong><small>${escapeHtml(p.api_key_masked)} · ${escapeHtml(providerModels(p).join('、'))}</small></div><div class="item-actions"><button class="soft-btn" data-provider-edit="${p.id}">编辑 API</button><button class="danger-btn" data-provider-delete="${p.id}">删除</button></div></div>`).join('')||'<p class="muted">尚未添加 API。</p>';
   $$('[data-provider-edit]',$('#providerList')).forEach(b=>b.onclick=()=>editProviderModels(b.dataset.providerEdit));
   $$('[data-provider-delete]',$('#providerList')).forEach(b=>b.onclick=async()=>{if(!confirm('删除这个 API 配置？'))return;try{await api(`/api/providers/${b.dataset.providerDelete}`,{method:'DELETE'});if(String(state.editingProviderId)===String(b.dataset.providerDelete))resetProviderEditor();await loadProviders()}catch(err){toast(err.message)}})
 }
@@ -791,13 +791,12 @@ function editProviderModels(providerId){
   resetProviderEditor();state.editingProviderId=provider.id;
   $('#providerType').value=normalizeProviderType(provider.provider_type);syncProviderForm();
   $('#providerName').value=provider.name;$('#providerBase').value=provider.base_url;$('#providerKey').value='';
-  $('#providerName').disabled=true;$('#providerType').disabled=true;$('#providerKey').disabled=true;$('#providerKey').required=false;$('#providerBase').disabled=true;
-  $('#providerKey').placeholder=`沿用已保存密钥 ${provider.api_key_masked}`;
-  $('#providerModalTitle').textContent='编辑 API 模型';$('#providerSubmit').textContent='保存模型';$('#cancelProviderEdit').classList.remove('hidden');
+  $('#providerKey').required=false;$('#providerKey').placeholder=`留空沿用 ${provider.api_key_masked}；输入新 Key 可替换`;
+  $('#providerModalTitle').textContent='编辑 API';$('#providerSubmit').textContent='保存更改';$('#cancelProviderEdit').classList.remove('hidden');
   if(isCustomProviderType(provider.provider_type)){
     const models=providerModels(provider);renderCustomModels(models,models);$('#manualModel').value='';
   }else{$('#providerModel').value=provider.model||'deepseek-v4-flash'}
-  $('#providerStatus').textContent='连接信息和密钥保持不变；可重新测试模型列表、调整勾选或补充手填模型。';
+  $('#providerStatus').textContent='名称、Key、接口类型、地址和模型均可修改；Key 留空会沿用当前值。测试失败的手填模型也可以直接保存。';
   $('#providerForm').scrollIntoView({behavior:'smooth',block:'start'});
 }
 async function testProvider(){
@@ -807,7 +806,7 @@ async function testProvider(){
     const before=checkedCustomModels();
     const body=providerFormData();
     const result=editing
-      ? await api(`/api/providers/${editing.id}/test`,{method:'POST',body:{manual_models:manualModelList()}})
+      ? await api(`/api/providers/${editing.id}/test`,{method:'POST',body})
       : await api('/api/providers/test',{method:'POST',body});
     if(isCustomProviderType(providerType())){
       const selected=[...new Set([...before,...manualModelList()])];
@@ -819,10 +818,17 @@ async function testProvider(){
       if(!supported.includes($('#providerModel').value))$('#providerModel').value=supported[0]||'deepseek-v4-flash';
       $('#providerStatus').textContent=`连接成功，可用模型：${supported.join('、')}`;
     }
-  }catch(err){$('#providerStatus').textContent=err.message}finally{button.disabled=false}
+  }catch(err){
+    const manual=manualModelList();
+    if(isCustomProviderType(providerType())&&manual.length){
+      const selected=[...new Set([...checkedCustomModels(),...manual])];
+      renderCustomModels([...new Set([...selected,...manual])],selected);
+      $('#providerStatus').textContent=`${err.message}；手填模型已保留，可以直接点击“${state.editingProviderId?'保存更改':'保存 API'}”，无需测试通过。`;
+    }else{$('#providerStatus').textContent=err.message}
+  }finally{button.disabled=false}
 }
 function checkedCustomModels(){return $$('#customModelList input[type="checkbox"]:checked').map(input=>input.value)}
-function providerFormData(){const custom=isCustomProviderType(providerType());const manual=custom?manualModelList():[];const selected=custom?[...new Set([...checkedCustomModels(),...manual])]:[$('#providerModel').value||'deepseek-v4-flash'];return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:selected[0]||'deepseek-v4-flash',selected_models:selected,manual_models:manual}}
+function providerFormData(){const custom=isCustomProviderType(providerType());const manual=custom?manualModelList():[];const selected=custom?[...new Set([...checkedCustomModels(),...manual])]:[$('#providerModel').value||'deepseek-v4-flash'];return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:selected[0]||(custom?'':'deepseek-v4-flash'),selected_models:selected,manual_models:manual}}
 
 function customSettings(provider,model=selectedModel()){
   const defaults={thinking:'enabled',reasoning_effort_enabled:true,dsml_fallback_enabled:false,max_completion_tokens:65536,temperature:1,top_p:.95,web_tool_backend:'parallel'};
@@ -870,7 +876,7 @@ $('#stopButton').onclick=async()=>{if(state.job&&state.job.id){await api(`/api/j
 $('#providerButton').onclick=()=>{resetProviderEditor();$('#providerModal').showModal();renderProviderList()};$('#usersButton').onclick=()=>{loadUsers();$('#usersModal').showModal()};
 $('#customSettingsButton').onclick=openCustomSettings;$('#providerSelect').onchange=()=>{const provider=selectedProvider();if(provider){storeValue('active-provider',provider.id);storeValue('active-model',selectedModel())}updateProviderUi()};$('#providerType').onchange=syncProviderForm;$('#customThinking').onchange=syncCustomThinkingFields;$('#customReasoningEffortEnabled').onchange=syncCustomThinkingFields;$('#customWebToolBackend').onchange=syncCustomToolFields;$('#customModelFilter').oninput=e=>{const value=e.target.value.trim().toLowerCase();$$('.custom-model-option',$('#customModelList')).forEach(item=>item.dataset.hidden=value&&!item.dataset.model.includes(value)?'1':'0')};
 $$('.close-modal').forEach(b=>b.onclick=()=>b.closest('dialog').close());$$('dialog').forEach(d=>d.onclick=e=>{if(e.target===d)d.close()});
-$('#testProvider').onclick=testProvider;$('#cancelProviderEdit').onclick=resetProviderEditor;$('#providerForm').onsubmit=async e=>{e.preventDefault();try{const body=providerFormData();if(state.editingProviderId){await api(`/api/providers/${state.editingProviderId}/models`,{method:'PUT',body:{model:body.model,selected_models:body.selected_models,manual_models:body.manual_models}});resetProviderEditor();await loadProviders();toast('模型列表已更新')}else{await api('/api/providers',{method:'POST',body});resetProviderEditor();await loadProviders();toast('API 已保存')}}catch(err){$('#providerStatus').textContent=err.message}};
+$('#testProvider').onclick=testProvider;$('#cancelProviderEdit').onclick=resetProviderEditor;$('#providerForm').onsubmit=async e=>{e.preventDefault();try{const body=providerFormData();if(state.editingProviderId){await api(`/api/providers/${state.editingProviderId}`,{method:'PUT',body});resetProviderEditor();await loadProviders();toast('API 已更新')}else{await api('/api/providers',{method:'POST',body});resetProviderEditor();await loadProviders();toast('API 已保存')}}catch(err){$('#providerStatus').textContent=err.message}};
 $('#customForm').onsubmit=saveCustomSettings;
 $('#userForm').onsubmit=async e=>{e.preventDefault();try{await api('/api/users',{method:'POST',body:{username:$('#newUsername').value,password:$('#newPassword').value,is_admin:$('#newAdmin').checked}});e.target.reset();await loadUsers();toast('账号已新增')}catch(err){toast(err.message)}};
 $('#passwordForm').onsubmit=async e=>{e.preventDefault();const password=$('#changePassword').value;if(password!==$('#changePasswordAgain').value){$('#passwordError').textContent='两次输入的密码不一致';return}try{await api(`/api/users/${$('#passwordUserId').value}/password`,{method:'PUT',body:{password}});$('#passwordModal').close();toast('密码已修改')}catch(err){$('#passwordError').textContent=err.message}};

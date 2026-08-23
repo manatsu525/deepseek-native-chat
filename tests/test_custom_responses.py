@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from app import main
 from app.mimo_local import _normalize_responses_usage, _responses_input, _responses_tools
@@ -48,6 +49,37 @@ class CustomResponsesProtocolTests(unittest.TestCase):
         self.assertEqual(usage["total_tokens"], 14)
         self.assertEqual(usage["input_tokens_details"]["cached_tokens"], 7)
         self.assertEqual(usage["output_tokens_details"]["reasoning_tokens"], 3)
+
+
+class CustomResponsesConnectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_model_probe_respects_common_sixteen_token_minimum(self) -> None:
+        captured: dict = {}
+
+        class Response:
+            status_code = 200
+
+        class Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def post(self, url, *, headers, json):
+                captured.update({"url": url, "headers": headers, "json": json})
+                return Response()
+
+        with patch.object(main.httpx, "AsyncClient", return_value=Client()):
+            await main.test_custom_model(
+                "https://provider.invalid/v1",
+                "response-test-key",
+                "tencent/hy3",
+                api_protocol="responses",
+            )
+
+        self.assertTrue(captured["url"].endswith("/responses"))
+        self.assertEqual(captured["json"]["max_output_tokens"], 16)
+        self.assertEqual(captured["json"]["input"], "Reply only OK")
 
 
 if __name__ == "__main__":
