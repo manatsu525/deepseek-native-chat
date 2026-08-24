@@ -34,10 +34,22 @@ class ContextEfficiencyTests(unittest.TestCase):
         )
         self.assertNotIn("x-grok-conv-id", other)
 
-    def test_large_successful_write_is_compacted_before_replay(self) -> None:
+    def test_ordinary_successful_write_stays_available_for_self_review(self) -> None:
+        raw = json.dumps({"path": "app.js", "content": "x" * 10_000})
+        function = {"name": "write_file", "arguments": raw}
+        changed = _compact_workspace_call_arguments(
+            function,
+            name="write_file",
+            path="app.js",
+            succeeded=True,
+        )
+        self.assertFalse(changed)
+        self.assertEqual(function["arguments"], raw)
+
+    def test_very_large_successful_write_is_compacted_before_replay(self) -> None:
         function = {
             "name": "write_file",
-            "arguments": json.dumps({"path": "app.js", "content": "x" * 10_000}),
+            "arguments": json.dumps({"path": "app.js", "content": "x" * 100_000}),
         }
         changed = _compact_workspace_call_arguments(
             function,

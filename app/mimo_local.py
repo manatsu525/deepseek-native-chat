@@ -83,6 +83,11 @@ FINAL_ANSWER_ATTEMPTS = 2
 MAX_AGENT_TOOL_ROUNDS = 12
 PARALLEL_MAX_SEARCH_EXCERPT_CHARS = 1200
 WORKSPACE_ARGUMENT_COMPACT_THRESHOLD = 4096
+# Keep ordinary freshly-created files in the next requests so the model can
+# review what it just wrote without reading the workspace back in chunks. Very
+# large writes are still compacted, and the high-water checkpoint remains a
+# second safety valve for oversized agent histories.
+FRESH_WRITE_CONTEXT_THRESHOLD = 60_000
 AGENT_CONTEXT_COMPACT_THRESHOLD = 80_000
 WORKSPACE_MUTATION_TOOLS = {"write_file", "apply_line_edits", "apply_patch", "apply_patch_batch", "delete_file"}
 FINAL_ANSWER_PROMPT = (
@@ -215,7 +220,8 @@ def _compact_workspace_call_arguments(
             function["arguments"] = "{}"
             return True
         return False
-    if name not in WORKSPACE_MUTATION_TOOLS or len(raw) <= WORKSPACE_ARGUMENT_COMPACT_THRESHOLD:
+    compact_threshold = FRESH_WRITE_CONTEXT_THRESHOLD if name == "write_file" else WORKSPACE_ARGUMENT_COMPACT_THRESHOLD
+    if name not in WORKSPACE_MUTATION_TOOLS or len(raw) <= compact_threshold:
         return False
     compact: dict[str, Any] = {"path": path}
     if name == "write_file":
