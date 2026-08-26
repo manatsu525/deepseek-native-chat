@@ -11,8 +11,6 @@ from app.mimo import custom_auth_headers
 from app import mimo_local
 from app.mimo_local import (
     AGENT_CONTEXT_COMPACT_THRESHOLD,
-    CODING_ACTION_REASONING_CHAR_LIMIT,
-    _coding_action_requested,
     _compact_workspace_call_arguments,
     _maybe_compact_agent_context,
     stream_response,
@@ -21,29 +19,6 @@ from app.workspace import ConversationWorkspace
 
 
 class ContextEfficiencyTests(unittest.TestCase):
-    def test_coding_action_detection_requires_an_actual_change_request(self) -> None:
-        self.assertTrue(
-            _coding_action_requested(
-                [{"role": "user", "content": "用 HTML 写一个触屏游戏"}],
-                workspace_access="full",
-                workspace_has_files=False,
-            )
-        )
-        self.assertFalse(
-            _coding_action_requested(
-                [{"role": "user", "content": "解释一下 max output tokens 是什么"}],
-                workspace_access="full",
-                workspace_has_files=False,
-            )
-        )
-        self.assertTrue(
-            _coding_action_requested(
-                [{"role": "user", "content": "棋子还是不能移动，修一下"}],
-                workspace_access="full",
-                workspace_has_files=True,
-            )
-        )
-
     def test_xai_chat_uses_stable_conversation_routing(self) -> None:
         headers = custom_auth_headers(
             "secret",
@@ -162,112 +137,6 @@ class ContextEfficiencyTests(unittest.TestCase):
 
 
 class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
-    async def test_long_coding_plan_is_cut_off_and_retried_in_execution_mode(self) -> None:
-        def chat_response(delta: dict) -> list[str]:
-            return [
-                "data: " + json.dumps({"choices": [{"delta": delta}]}),
-                "data: [DONE]",
-            ]
-
-        responses = [
-            chat_response({"reasoning": "x" * (CODING_ACTION_REASONING_CHAR_LIMIT + 1)}),
-            chat_response({"content": "I will implement it now."}),
-            chat_response(
-                {
-                    "tool_calls": [
-                        {
-                            "index": 0,
-                            "id": "write-1",
-                            "type": "function",
-                            "function": {
-                                "name": "write_file",
-                                "arguments": json.dumps({"path": "index.html", "content": "<p>ok</p>"}),
-                            },
-                        }
-                    ]
-                }
-            ),
-            chat_response({"content": "完成"}),
-        ]
-        payloads: list[dict] = []
-
-        class FakeResponse:
-            status_code = 200
-
-            def __init__(self, lines: list[str]) -> None:
-                self.lines = lines
-
-            async def aiter_lines(self):
-                for line in self.lines:
-                    yield line
-
-            async def aread(self) -> bytes:
-                return b""
-
-        class FakeStreamContext:
-            def __init__(self, lines: list[str]) -> None:
-                self.response = FakeResponse(lines)
-
-            async def __aenter__(self):
-                return self.response
-
-            async def __aexit__(self, *_):
-                return False
-
-        class FakeAsyncClient:
-            def __init__(self, **_):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_):
-                return False
-
-            def stream(self, *_args, **kwargs):
-                payloads.append(kwargs["json"])
-                return FakeStreamContext(responses.pop(0))
-
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = ConversationWorkspace(1, "coding-action")
-            workspace.root = Path(directory)
-
-            async def update(_):
-                return None
-
-            with patch.object(mimo_local.httpx, "AsyncClient", FakeAsyncClient):
-                result = await stream_response(
-                    base_url="https://example.test/v1",
-                    api_key="test-key",
-                    model="xiaomi/mimo-v2.5:thinking",
-                    messages=[{"role": "user", "content": "用 HTML 写一个触屏游戏"}],
-                    timeout=30,
-                    stopped=lambda: False,
-                    update=update,
-                    settings={
-                        "thinking": "enabled",
-                        "max_completion_tokens": 8192,
-                        "coding_action_reasoning_char_limit": CODING_ACTION_REASONING_CHAR_LIMIT,
-                    },
-                    conversation_id="coding-action",
-                    workspace=workspace,
-                    web_enabled=False,
-                )
-
-            self.assertEqual((Path(directory) / "index.html").read_text(), "<p>ok</p>")
-
-        self.assertEqual(result["answer"], "完成")
-        self.assertEqual(len(result["reasoning"]), CODING_ACTION_REASONING_CHAR_LIMIT + 1)
-        self.assertEqual(len(payloads), 4)
-        self.assertEqual(payloads[0]["tool_choice"], "auto")
-        self.assertEqual(payloads[0]["thinking"], {"type": "enabled"})
-        self.assertEqual(payloads[1]["tool_choice"], "auto")
-        self.assertEqual(payloads[1]["thinking"], {"type": "disabled"})
-        self.assertEqual(payloads[2]["tool_choice"], "auto")
-        self.assertEqual(payloads[2]["thinking"], {"type": "disabled"})
-        self.assertEqual(payloads[3]["tool_choice"], "auto")
-        self.assertEqual(payloads[3]["thinking"], {"type": "enabled"})
-
     async def test_identical_validation_is_skipped_until_workspace_changes(self) -> None:
         class CountingWorkspace(ConversationWorkspace):
             validation_runs = 0

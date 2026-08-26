@@ -88,7 +88,6 @@ DEFAULT_SETTINGS = {
     "thinking": "enabled",
     "reasoning_effort_enabled": True,
     "dsml_fallback_enabled": False,
-    "coding_action_reasoning_char_limit": 8000,
     "max_completion_tokens": 65536,
     "temperature": 1.0,
     "top_p": 0.95,

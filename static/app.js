@@ -835,7 +835,7 @@ function checkedCustomModels(){return $$('#customModelList input[type="checkbox"
 function providerFormData(){const custom=isCustomProviderType(providerType());const manual=custom?manualModelList():[];const selected=custom?[...new Set([...checkedCustomModels(),...manual])]:[$('#providerModel').value||'deepseek-v4-flash'];return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:selected[0]||(custom?'':'deepseek-v4-flash'),selected_models:selected,manual_models:manual}}
 
 function customSettings(provider,model=selectedModel()){
-  const defaults={thinking:'enabled',reasoning_effort_enabled:true,dsml_fallback_enabled:false,coding_action_reasoning_char_limit:8000,max_completion_tokens:65536,temperature:1,top_p:.95,web_tool_backend:'parallel'};
+  const defaults={thinking:'enabled',reasoning_effort_enabled:true,dsml_fallback_enabled:false,max_completion_tokens:65536,temperature:1,top_p:.95,web_tool_backend:'parallel'};
   const byModel=provider&&provider.model_settings;
   const saved=byModel&&typeof byModel==='object'&&byModel[model]&&typeof byModel[model]==='object'
     ?byModel[model]
@@ -845,7 +845,7 @@ function customSettings(provider,model=selectedModel()){
 function fillCustomSettings(){
   const model=selectedModel(),config=customSettings(selectedProvider(),model);
   $('#customModalTitle').textContent=`Custom 参数 · ${model}`;$('#customModalTitle').title=model;$('#customStatus').textContent='';
-  $('#customThinking').value=config.thinking;$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customDsmlFallbackEnabled').checked=config.dsml_fallback_enabled;$('#customCodingActionReasoningLimit').value=config.coding_action_reasoning_char_limit;$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
+  $('#customThinking').value=config.thinking;$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customDsmlFallbackEnabled').checked=config.dsml_fallback_enabled;$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
   syncCustomThinkingFields();syncCustomToolFields();
 }
 function syncCustomThinkingFields(){const protocol=normalizeProviderType((selectedProvider()||{}).provider_type),responses=protocol==='custom_response',messages=protocol==='custom_messages',mimo=isMimoModel(selectedModel()),thinking=$('#customThinking').value==='enabled',effort=$('#customReasoningEffortEnabled').checked;$('#customThinking').disabled=responses;$('#customReasoningEffortEnabled').disabled=messages;$('#customTemperature').disabled=messages?thinking:!responses&&mimo&&thinking;$('#customTopP').disabled=messages?thinking:!responses&&mimo&&thinking;$('#customSamplingNote').textContent=responses?`Responses 协议不发送非标准 thinking 字段；reasoning.effort 将${effort?'按顶部所选档位发送':'不发送'}，temperature/top_p 正常发送。`:messages?`Messages 使用 Anthropic thinking 语法；开启 thinking 时不发送 temperature/top_p。该协议没有通用 reasoning_effort 字段。`:`thinking 将${thinking?'开启':'关闭'}；reasoning_effort 将${effort?'按顶部所选档位发送':'不发送'}。已知模型使用官方字段，其他 Custom 使用通用顶层字段；接口不支持时可在这里关闭。`}
@@ -854,7 +854,7 @@ function openCustomSettings(){if(!selectedProvider()||!isCustomProviderType(sele
 async function saveCustomSettings(event){
   event.preventDefault(); const provider=selectedProvider(); if(!provider)return;
   const model=selectedModel();
-  const body={model,thinking:$('#customThinking').value,reasoning_effort_enabled:$('#customReasoningEffortEnabled').checked,dsml_fallback_enabled:$('#customDsmlFallbackEnabled').checked,coding_action_reasoning_char_limit:Number($('#customCodingActionReasoningLimit').value),max_completion_tokens:Number($('#customMaxCompletion').value),temperature:Number($('#customTemperature').value),top_p:Number($('#customTopP').value),web_tool_backend:$('#customWebToolBackend').value};
+  const body={model,thinking:$('#customThinking').value,reasoning_effort_enabled:$('#customReasoningEffortEnabled').checked,dsml_fallback_enabled:$('#customDsmlFallbackEnabled').checked,max_completion_tokens:Number($('#customMaxCompletion').value),temperature:Number($('#customTemperature').value),top_p:Number($('#customTopP').value),web_tool_backend:$('#customWebToolBackend').value};
   try{const updated=await api(`/api/providers/${provider.id}/settings`,{method:'PUT',body});const index=state.providers.findIndex(x=>x.id===provider.id);if(index>=0)state.providers[index]=updated;$('#customModal').close();updateProviderUi();toast(`${model} 的 Custom 参数已保存`)}catch(err){$('#customStatus').textContent=err.message}
 }
 

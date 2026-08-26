@@ -98,7 +98,6 @@ class CustomModelSettingsTests(unittest.TestCase):
             "thinking": "enabled",
             "reasoning_effort_enabled": True,
             "dsml_fallback_enabled": False,
-            "coding_action_reasoning_char_limit": 12000,
             "max_completion_tokens": 8192,
             "temperature": temperature,
             "top_p": 0.9,

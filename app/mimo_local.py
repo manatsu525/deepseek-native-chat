@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -90,7 +89,6 @@ WORKSPACE_ARGUMENT_COMPACT_THRESHOLD = 4096
 # second safety valve for oversized agent histories.
 FRESH_WRITE_CONTEXT_THRESHOLD = 60_000
 AGENT_CONTEXT_COMPACT_THRESHOLD = 80_000
-CODING_ACTION_REASONING_CHAR_LIMIT = 8_000
 WORKSPACE_MUTATION_TOOLS = {"write_file", "apply_line_edits", "apply_patch", "apply_patch_batch", "delete_file"}
 FINAL_ANSWER_PROMPT = (
     "CRITICAL FINALIZATION INSTRUCTION: The tool-call budget is completely exhausted. No search, webpage-reading, "
@@ -99,18 +97,6 @@ FINAL_ANSWER_PROMPT = (
     "XML such as <tool_call>, function-call JSON, a search query, or prose saying that you will search/read next. "
     "Even if the evidence is incomplete or a previous tool failed, provide the best supported answer now and state "
     "the uncertainty explicitly. 工具调用额度已经全部耗尽；禁止继续搜索或读取网页，必须立即根据已有资料回答原问题。"
-)
-CODING_ACTION_PROMPT = (
-    "CODING EXECUTION REQUIREMENT: The user is asking for an actual coding change or artifact. "
-    "Keep private planning brief and call the next useful workspace tool immediately. Do not draft the whole implementation "
-    "in reasoning, announce that you are about to write it, or spend the response redesigning it. The workspace operation is "
-    "the deliverable. If the complete artifact may not fit in one tool call, save a functional foundation first and extend it "
-    "through later targeted edits."
-)
-CODING_ACTION_RETRY_PROMPT = (
-    "EXECUTION OVERRIDE: The preceding attempt was stopped because it spent too long planning without starting a workspace "
-    "operation. Do not repeat or summarize that plan. Call one appropriate workspace tool now; keep tool arguments valid and "
-    "complete."
 )
 NEMOTRON_LANGUAGE_PROMPT = (
     "LANGUAGE REQUIREMENT: Answer in the same language as the user's most recent message. "
@@ -207,65 +193,6 @@ def _looks_like_text_tool_call(value: str) -> bool:
         return False
     head = stripped[:2000]
     return "fetch_webpage" in head or "web_search" in head
-
-
-def _message_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-    parts: list[str] = []
-    for item in content:
-        if isinstance(item, str):
-            parts.append(item)
-        elif isinstance(item, dict) and item.get("type") in {"text", "input_text"}:
-            parts.append(str(item.get("text") or ""))
-    return "\n".join(parts)
-
-
-def _coding_action_requested(
-    messages: list[dict[str, Any]],
-    *,
-    workspace_access: str,
-    workspace_has_files: bool,
-) -> bool:
-    """Identify explicit implementation work without another model call."""
-    if workspace_access == "edit":
-        return True
-    if workspace_access != "full":
-        return False
-    latest = next(
-        (
-            _message_text(message.get("content")).strip().casefold()
-            for message in reversed(messages)
-            if str(message.get("role") or "").casefold() == "user"
-        ),
-        "",
-    )
-    if not latest:
-        return False
-    action_terms = (
-        "写", "创建", "生成", "开发", "实现", "制作", "搭建", "修改", "修复", "重构", "调试",
-        "write", "create", "build", "implement", "develop", "edit", "modify", "fix", "refactor", "debug",
-    )
-    artifact_terms = (
-        "代码", "程序", "项目", "文件", "网页", "网站", "脚本", "组件", "函数", "游戏",
-        "html", "css", "javascript", "typescript", "python", "code", "program", "project", "file", "script",
-        "webpage", "website", "component", "function",
-    )
-    explicit_action = any(term in latest for term in action_terms) and (
-        any(term in latest for term in artifact_terms)
-        or bool(re.search(r"(?:^|[\\s/])[^\\s/]+\\.[a-z0-9]{1,8}(?:$|[\\s,，。])", latest))
-    )
-    if explicit_action:
-        return True
-    if not workspace_has_files:
-        return False
-    followup_terms = (
-        "继续改", "修一下", "修好", "不能", "没法", "失败", "报错", "错误", "有 bug", "有bug", "崩溃",
-        "continue", "fix it", "broken", "doesn't work", "does not work", "error", "bug", "crash",
-    )
-    return any(term in latest for term in followup_terms)
 
 
 def _serialized_chars(messages: list[dict[str, Any]]) -> int:
@@ -657,9 +584,6 @@ async def stream_response(
     to the model instead of requiring an exact search-result URL match.
     """
     config = _settings(settings)
-    coding_action_reasoning_char_limit = int(
-        config.get("coding_action_reasoning_char_limit") or CODING_ACTION_REASONING_CHAR_LIMIT
-    )
     dsml_fallback_active = dsml_fallback_applies(
         base_url,
         model,
@@ -694,12 +618,6 @@ async def stream_response(
         _dated_system_prompt(base_prompt, user_timezone),
         model,
     )
-    workspace_has_files = bool(workspace.list_files()) if workspace is not None else False
-    coding_action_active = workspace is not None and _coding_action_requested(
-        messages,
-        workspace_access=workspace_access,
-        workspace_has_files=workspace_has_files,
-    )
     if workspace is not None and workspace_access != "none":
         workspace_prompt = (
             READ_ONLY_WORKSPACE_SYSTEM_PROMPT
@@ -709,8 +627,6 @@ async def stream_response(
             else WORKSPACE_SYSTEM_PROMPT
         )
         system_prompt = f"{system_prompt}\n\n{workspace_prompt}"
-    if coding_action_active:
-        system_prompt = f"{system_prompt}\n\n{CODING_ACTION_PROMPT}"
     if system_addendum.strip():
         system_prompt = f"{system_prompt}\n\n{system_addendum.strip()}"
     conversation: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}, *[dict(message) for message in messages]]
@@ -732,8 +648,6 @@ async def stream_response(
     reader_enabled = bool(known_urls)
     final_answer_attempts = 0
     force_final_answer = False
-    execution_retry_mode = False
-    execution_retry_attempts = 0
     workspace_reads: set[tuple[str, int, int | None]] = set()
     workspace_searches: set[str] = set()
     workspace_validations: set[tuple[int, str]] = set()
@@ -810,7 +724,6 @@ async def stream_response(
                             [item["path"] for item in workspace.list_files()],
                         )
             final_answer_only = force_final_answer or (tools_expected and not round_tools)
-            action_required = coding_action_active and workspace_generation == 0 and bool(round_tools) and not final_answer_only
             mimo_model = is_mimo_model(model)
             request_messages = conversation
             if final_answer_only:
@@ -823,11 +736,6 @@ async def stream_response(
                     *conversation,
                     {"role": "system", "content": FINAL_ANSWER_PROMPT + retry_note},
                 ]
-            elif action_required and execution_retry_mode:
-                request_messages = [
-                    *conversation,
-                    {"role": "system", "content": CODING_ACTION_RETRY_PROMPT},
-                ]
             responses_protocol = api_protocol == "responses"
             messages_protocol = api_protocol == "messages"
             if responses_protocol:
@@ -837,9 +745,7 @@ async def stream_response(
                     "max_output_tokens": int(config["max_completion_tokens"]),
                     "stream": True,
                 }
-                if execution_retry_mode and action_required:
-                    payload["reasoning"] = {"effort": "low"}
-                elif bool(config.get("reasoning_effort_enabled", True)):
+                if bool(config.get("reasoning_effort_enabled", True)):
                     payload["reasoning"] = {"effort": normalize_reasoning_effort(effort)}
                 payload["temperature"] = float(config["temperature"])
                 payload["top_p"] = float(config["top_p"])
@@ -856,7 +762,7 @@ async def stream_response(
                     "max_tokens": max_tokens,
                     "stream": True,
                 }
-                if config["thinking"] == "enabled" and not (execution_retry_mode and action_required):
+                if config["thinking"] == "enabled":
                     if max_tokens <= 1024:
                         raise ValueError("Messages 开启 thinking 时，最大生成 Token 必须大于 1024")
                     payload["thinking"] = {
@@ -883,15 +789,15 @@ async def stream_response(
                     payload,
                     base_url,
                     model,
-                    "disabled" if execution_retry_mode and action_required else config["thinking"],
+                    config["thinking"],
                     effort,
-                    bool(config.get("reasoning_effort_enabled", True)) and not (execution_retry_mode and action_required),
+                    bool(config.get("reasoning_effort_enabled", True)),
                     int(config["max_completion_tokens"]),
                 )
                 if round_tools:
                     payload["tools"] = round_tools
                     payload["tool_choice"] = "auto"
-                if not mimo_model or config["thinking"] == "disabled" or (execution_retry_mode and action_required):
+                if not mimo_model or config["thinking"] == "disabled":
                     payload["temperature"] = float(config["temperature"])
                     payload["top_p"] = float(config["top_p"])
 
@@ -902,7 +808,6 @@ async def stream_response(
             anthropic_usage: dict[str, Any] = {}
             anthropic_thinking_blocks: dict[int, dict[str, Any]] = {}
             round_tools_by_index: dict[int, dict[str, Any]] = {}
-            action_cutoff = False
             markup_stream = (
                 InklingStreamBuffer()
                 if inkling_compat_active
@@ -1029,27 +934,6 @@ async def stream_response(
                             _merge_tool_call(round_tools_by_index, call, index)
                         for index, call in enumerate(message.get("tool_calls") or []):
                             _merge_tool_call(round_tools_by_index, call, index)
-                    if (
-                        action_required
-                        and not execution_retry_mode
-                        and not round_tools_by_index
-                        and len(round_reasoning) >= coding_action_reasoning_char_limit
-                    ):
-                        # The output ceiling cannot reserve room for a later
-                        # tool call. Stop a planning-only stream before it can
-                        # consume the whole response, then retry once in a
-                        # low/no-thinking, tool-required execution mode.
-                        action_cutoff = True
-                        await update(
-                            {
-                                "answer": answer,
-                                "reasoning": reasoning + round_reasoning,
-                                "searches": steps,
-                                "usage": _merge_usage(usage, round_usage),
-                                "sources": list(sources.values()),
-                            }
-                        )
-                        break
                     preview_usage = _merge_usage(usage, round_usage)
                     await update(
                         {
@@ -1060,11 +944,6 @@ async def stream_response(
                             "sources": list(sources.values()),
                         }
                     )
-
-            if action_cutoff:
-                reasoning += round_reasoning
-                execution_retry_mode = True
-                continue
 
             usage = _merge_usage(usage, round_usage)
             calls = normalize_tool_calls(_tool_calls(round_tools_by_index, round_number))
@@ -1091,24 +970,6 @@ async def stream_response(
                     id_prefix=f"inkling-{round_number + 1}",
                     tools_available=bool(round_tools),
                 )
-            if action_required and execution_retry_mode and not calls:
-                # Some OpenAI-compatible gateways reject or fail to honour
-                # tool_choice=required. Keep the wire format broadly
-                # compatible and enforce progress in the agent loop instead.
-                execution_retry_attempts += 1
-                reasoning += round_reasoning
-                await update(
-                    {
-                        "answer": answer,
-                        "reasoning": reasoning,
-                        "searches": steps,
-                        "usage": usage,
-                        "sources": list(sources.values()),
-                    }
-                )
-                if execution_retry_attempts < 2:
-                    continue
-                raise RuntimeError("模型连续两次未按要求调用工作区工具，已停止空转")
             invalid_answer = not round_answer.strip() or _looks_like_text_tool_call(round_answer)
             if (final_answer_only and (calls or invalid_answer)) or (not calls and invalid_answer):
                 final_answer_attempts += 1
