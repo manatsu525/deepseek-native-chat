@@ -90,7 +90,7 @@ WORKSPACE_ARGUMENT_COMPACT_THRESHOLD = 4096
 # second safety valve for oversized agent histories.
 FRESH_WRITE_CONTEXT_THRESHOLD = 60_000
 AGENT_CONTEXT_COMPACT_THRESHOLD = 80_000
-CODING_ACTION_REASONING_CHAR_LIMIT = 3_000
+CODING_ACTION_REASONING_CHAR_LIMIT = 8_000
 WORKSPACE_MUTATION_TOOLS = {"write_file", "apply_line_edits", "apply_patch", "apply_patch_batch", "delete_file"}
 FINAL_ANSWER_PROMPT = (
     "CRITICAL FINALIZATION INSTRUCTION: The tool-call budget is completely exhausted. No search, webpage-reading, "
@@ -657,6 +657,9 @@ async def stream_response(
     to the model instead of requiring an exact search-result URL match.
     """
     config = _settings(settings)
+    coding_action_reasoning_char_limit = int(
+        config.get("coding_action_reasoning_char_limit") or CODING_ACTION_REASONING_CHAR_LIMIT
+    )
     dsml_fallback_active = dsml_fallback_applies(
         base_url,
         model,
@@ -730,6 +733,7 @@ async def stream_response(
     final_answer_attempts = 0
     force_final_answer = False
     execution_retry_mode = False
+    execution_retry_attempts = 0
     workspace_reads: set[tuple[str, int, int | None]] = set()
     workspace_searches: set[str] = set()
     workspace_validations: set[tuple[int, str]] = set()
@@ -841,7 +845,7 @@ async def stream_response(
                 payload["top_p"] = float(config["top_p"])
                 if round_tools:
                     payload["tools"] = _responses_tools(round_tools)
-                    payload["tool_choice"] = "required" if action_required and execution_retry_mode else "auto"
+                    payload["tool_choice"] = "auto"
             elif messages_protocol:
                 system_value, anthropic_history = _anthropic_messages(request_messages)
                 max_tokens = int(config["max_completion_tokens"])
@@ -865,7 +869,7 @@ async def stream_response(
                     payload["top_p"] = float(config["top_p"])
                 if round_tools:
                     payload["tools"] = _anthropic_tools(round_tools)
-                    payload["tool_choice"] = {"type": "any" if action_required and execution_retry_mode else "auto"}
+                    payload["tool_choice"] = {"type": "auto"}
             else:
                 payload = {
                     "model": model,
@@ -886,7 +890,7 @@ async def stream_response(
                 )
                 if round_tools:
                     payload["tools"] = round_tools
-                    payload["tool_choice"] = "required" if action_required and execution_retry_mode else "auto"
+                    payload["tool_choice"] = "auto"
                 if not mimo_model or config["thinking"] == "disabled" or (execution_retry_mode and action_required):
                     payload["temperature"] = float(config["temperature"])
                     payload["top_p"] = float(config["top_p"])
@@ -1029,7 +1033,7 @@ async def stream_response(
                         action_required
                         and not execution_retry_mode
                         and not round_tools_by_index
-                        and len(round_reasoning) >= CODING_ACTION_REASONING_CHAR_LIMIT
+                        and len(round_reasoning) >= coding_action_reasoning_char_limit
                     ):
                         # The output ceiling cannot reserve room for a later
                         # tool call. Stop a planning-only stream before it can
@@ -1087,6 +1091,24 @@ async def stream_response(
                     id_prefix=f"inkling-{round_number + 1}",
                     tools_available=bool(round_tools),
                 )
+            if action_required and execution_retry_mode and not calls:
+                # Some OpenAI-compatible gateways reject or fail to honour
+                # tool_choice=required. Keep the wire format broadly
+                # compatible and enforce progress in the agent loop instead.
+                execution_retry_attempts += 1
+                reasoning += round_reasoning
+                await update(
+                    {
+                        "answer": answer,
+                        "reasoning": reasoning,
+                        "searches": steps,
+                        "usage": usage,
+                        "sources": list(sources.values()),
+                    }
+                )
+                if execution_retry_attempts < 2:
+                    continue
+                raise RuntimeError("模型连续两次未按要求调用工作区工具，已停止空转")
             invalid_answer = not round_answer.strip() or _looks_like_text_tool_call(round_answer)
             if (final_answer_only and (calls or invalid_answer)) or (not calls and invalid_answer):
                 final_answer_attempts += 1

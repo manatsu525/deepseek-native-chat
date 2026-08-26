@@ -171,6 +171,7 @@ class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
 
         responses = [
             chat_response({"reasoning": "x" * (CODING_ACTION_REASONING_CHAR_LIMIT + 1)}),
+            chat_response({"content": "I will implement it now."}),
             chat_response(
                 {
                     "tool_calls": [
@@ -243,7 +244,11 @@ class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
                     timeout=30,
                     stopped=lambda: False,
                     update=update,
-                    settings={"thinking": "enabled", "max_completion_tokens": 8192},
+                    settings={
+                        "thinking": "enabled",
+                        "max_completion_tokens": 8192,
+                        "coding_action_reasoning_char_limit": CODING_ACTION_REASONING_CHAR_LIMIT,
+                    },
                     conversation_id="coding-action",
                     workspace=workspace,
                     web_enabled=False,
@@ -253,13 +258,15 @@ class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["answer"], "完成")
         self.assertEqual(len(result["reasoning"]), CODING_ACTION_REASONING_CHAR_LIMIT + 1)
-        self.assertEqual(len(payloads), 3)
+        self.assertEqual(len(payloads), 4)
         self.assertEqual(payloads[0]["tool_choice"], "auto")
         self.assertEqual(payloads[0]["thinking"], {"type": "enabled"})
-        self.assertEqual(payloads[1]["tool_choice"], "required")
+        self.assertEqual(payloads[1]["tool_choice"], "auto")
         self.assertEqual(payloads[1]["thinking"], {"type": "disabled"})
         self.assertEqual(payloads[2]["tool_choice"], "auto")
-        self.assertEqual(payloads[2]["thinking"], {"type": "enabled"})
+        self.assertEqual(payloads[2]["thinking"], {"type": "disabled"})
+        self.assertEqual(payloads[3]["tool_choice"], "auto")
+        self.assertEqual(payloads[3]["thinking"], {"type": "enabled"})
 
     async def test_identical_validation_is_skipped_until_workspace_changes(self) -> None:
         class CountingWorkspace(ConversationWorkspace):
