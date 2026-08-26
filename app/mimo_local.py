@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -68,8 +67,6 @@ from .reasoning_effort import normalize as normalize_reasoning_effort
 from .workspace import (
     EDIT_WORKSPACE_SYSTEM_PROMPT,
     EDIT_WORKSPACE_TOOL_NAMES,
-    PLANNING_WORKSPACE_SYSTEM_PROMPT,
-    PLANNING_WORKSPACE_TOOL_NAMES,
     READ_ONLY_WORKSPACE_SYSTEM_PROMPT,
     READ_ONLY_WORKSPACE_TOOL_NAMES,
     WORKSPACE_SYSTEM_PROMPT,
@@ -91,20 +88,6 @@ WORKSPACE_ARGUMENT_COMPACT_THRESHOLD = 4096
 # large writes are still compacted, and the high-water checkpoint remains a
 # second safety valve for oversized agent histories.
 FRESH_WRITE_CONTEXT_THRESHOLD = 60_000
-
-CODING_PLAN_MAX_TOOL_ROUNDS = 4
-CODING_PLAN_MAX_COMPLETION_TOKENS = 16_384
-CODING_PLAN_MAX_CHARS = 16_000
-CODING_PLAN_PROMPT = """CODING PLANNING PHASE: You are the planning half of a two-phase coding task. First understand the user's exact request and the current workspace, then return one concise implementation outline. You may list, read, and search files, but you must not create, edit, replace, delete, run, or validate anything. Do not emit complete source code, diffs, patches, tool-call JSON, or large code-like blocks.
-
-Return exactly one JSON object with this shape (no Markdown fence or extra prose):
-{"goal":"the user's requested outcome","files":[{"path":"workspace-relative path","purpose":"what will change"}],"steps":["ordered implementation step"],"acceptance_checks":["how the separate execution/review flow can verify it"],"constraints":["requirements and things not to change"],"risks":["important uncertainty or dependency"]}
-
-Keep every field concise. Preserve the user's exact names, files, versions, constraints, and requested scope. This is an outline, not an implementation; the next phase will receive this JSON as an immutable execution plan."""
-CODING_EXECUTION_PROMPT = """CODING EXECUTION PHASE: Implement the immutable plan below against the user's original request and the current workspace. Do not redesign the plan, reopen settled architectural choices, or produce a second outline. Keep internal planning limited to mapping each step to the next concrete workspace operation. If the plan conflicts with the actual files or the user's request, stop and report the conflict instead of silently changing the plan. Read only what is needed, make the requested edits, and then stop; the existing review and test flow remains responsible for validation.
-
-IMMUTABLE IMPLEMENTATION PLAN:
-"""
 AGENT_CONTEXT_COMPACT_THRESHOLD = 80_000
 WORKSPACE_MUTATION_TOOLS = {"write_file", "apply_line_edits", "apply_patch", "apply_patch_batch", "delete_file"}
 FINAL_ANSWER_PROMPT = (
@@ -210,160 +193,6 @@ def _looks_like_text_tool_call(value: str) -> bool:
         return False
     head = stripped[:2000]
     return "fetch_webpage" in head or "web_search" in head
-
-
-def _message_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-    parts: list[str] = []
-    for item in content:
-        if isinstance(item, str):
-            parts.append(item)
-        elif isinstance(item, dict) and item.get("type") in {"text", "input_text"}:
-            parts.append(str(item.get("text") or ""))
-    return "\n".join(parts)
-
-
-def _coding_action_requested(
-    messages: list[dict[str, Any]],
-    *,
-    workspace_access: str,
-    workspace_has_files: bool,
-) -> bool:
-    """Identify explicit implementation work without another model call."""
-    if workspace_access == "edit":
-        return True
-    if workspace_access != "full":
-        return False
-    latest = next(
-        (
-            _message_text(message.get("content")).strip().casefold()
-            for message in reversed(messages)
-            if str(message.get("role") or "").casefold() == "user"
-        ),
-        "",
-    )
-    if not latest:
-        return False
-    action_terms = (
-        "写", "创建", "生成", "开发", "实现", "制作", "搭建", "做", "修改", "修复", "重构", "调试",
-        "write", "create", "build", "make", "implement", "develop", "edit", "modify", "fix", "refactor", "debug",
-    )
-    artifact_terms = (
-        "代码", "程序", "项目", "文件", "网页", "网站", "页面", "落地页", "脚本", "组件", "函数", "游戏",
-        "前端", "后端", "接口", "应用", "服务", "模块", "配置", "readme", "markdown", "json", "yaml", "sql",
-        "html", "css", "javascript", "typescript", "python", "java", "golang", "rust", "shell", "bash", "vue", "react", "node", "api",
-        "code", "program", "project", "file", "script", "webpage", "website", "component", "function",
-    )
-    explicit_action = any(term in latest for term in action_terms) and (
-        any(term in latest for term in artifact_terms)
-        or bool(re.search(r"(?:^|[\s/])[^\s/]+\.[a-z0-9]{1,8}(?:$|[\s,，。])", latest))
-    )
-    if explicit_action:
-        return True
-    if not workspace_has_files:
-        return False
-    # Once a conversation already has files, users often name only the
-    # requested change (for example, “把颜色换成蓝色” or “继续”). Treat
-    # these direct change/follow-up verbs as coding work while leaving purely
-    # descriptive questions such as “看看这个文件” on the one-stage path.
-    existing_change_terms = (
-        "继续", "修改", "改成", "改为", "调整", "更换", "换成", "增加", "添加", "加上",
-        "删除", "移除", "重构", "优化", "更新", "替换", "修复", "修一下", "修好", "调试",
-        "不能", "没法", "失败", "报错", "错误", "有 bug", "有bug", "崩溃",
-        "continue", "change", "update", "add", "remove", "delete", "refactor", "improve",
-        "edit", "fix", "debug", "broken", "doesn't work", "does not work", "error", "bug", "crash",
-    )
-    return any(term in latest for term in existing_change_terms)
-
-
-def _extract_json_object(value: str) -> dict[str, Any]:
-    text = str(value or "").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text)
-    decoder = json.JSONDecoder()
-    for index, character in enumerate(text):
-        if character != "{":
-            continue
-        try:
-            decoded, _ = decoder.raw_decode(text[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(decoded, dict):
-            return decoded
-    raise ValueError("规划阶段没有返回有效的 JSON 大纲")
-
-
-def _plan_items(value: Any, *, limit: int, item_limit: int = 800) -> list[str]:
-    if isinstance(value, str):
-        values = [value]
-    elif isinstance(value, list):
-        values = value
-    else:
-        values = []
-    result: list[str] = []
-    for item in values:
-        if isinstance(item, dict):
-            item = item.get("step") or item.get("description") or item.get("text") or ""
-        text = " ".join(str(item or "").split()).strip()
-        if text:
-            result.append(text[:item_limit])
-        if len(result) >= limit:
-            break
-    return result
-
-
-def _normalize_coding_plan(value: str) -> dict[str, Any]:
-    raw_text = str(value or "").strip()
-    if not raw_text or len(raw_text) > CODING_PLAN_MAX_CHARS:
-        raise ValueError("规划阶段输出过长，未生成可执行大纲")
-    raw = _extract_json_object(raw_text)
-    goal = " ".join(str(raw.get("goal") or raw.get("objective") or "").split()).strip()
-    steps = _plan_items(raw.get("steps") or raw.get("implementation_steps") or raw.get("outline"), limit=16)
-    if not goal or not steps:
-        raise ValueError("规划大纲必须包含 goal 和至少一个 steps 项")
-    files: list[dict[str, str]] = []
-    raw_files = raw.get("files") or raw.get("file_changes") or []
-    if isinstance(raw_files, list):
-        for item in raw_files[:32]:
-            if isinstance(item, dict):
-                path = " ".join(str(item.get("path") or "").split()).strip()
-                purpose = " ".join(str(item.get("purpose") or item.get("description") or "").split()).strip()
-            else:
-                path = " ".join(str(item or "").split()).strip()
-                purpose = ""
-            if path:
-                files.append({"path": path[:300], "purpose": purpose[:800]})
-    plan = {
-        "goal": goal[:2_000],
-        "files": files,
-        "steps": steps,
-        "acceptance_checks": _plan_items(raw.get("acceptance_checks") or raw.get("checks"), limit=12),
-        "constraints": _plan_items(raw.get("constraints"), limit=12),
-        "risks": _plan_items(raw.get("risks") or raw.get("unknowns"), limit=12),
-    }
-    encoded = json.dumps(plan, ensure_ascii=False, separators=(",", ":"))
-    if len(encoded) > CODING_PLAN_MAX_CHARS:
-        raise ValueError("规划大纲过长，无法安全传递给执行阶段")
-    return plan
-
-
-def _phase_sources(*collections: Any) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for collection in collections:
-        for item in collection or []:
-            if not isinstance(item, dict):
-                continue
-            key = str(item.get("url") or "") or json.dumps(item, ensure_ascii=False, sort_keys=True)
-            if key in seen:
-                continue
-            seen.add(key)
-            result.append(item)
-    return result
 
 
 def _serialized_chars(messages: list[dict[str, Any]]) -> int:
@@ -723,7 +552,7 @@ def _normalize_anthropic_usage(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _stream_response_once(
+async def stream_response(
     *,
     base_url: str,
     api_key: str,
@@ -793,8 +622,6 @@ async def _stream_response_once(
         workspace_prompt = (
             READ_ONLY_WORKSPACE_SYSTEM_PROMPT
             if workspace_access == "read_only"
-            else PLANNING_WORKSPACE_SYSTEM_PROMPT
-            if workspace_access == "plan"
             else EDIT_WORKSPACE_SYSTEM_PROMPT
             if workspace_access == "edit"
             else WORKSPACE_SYSTEM_PROMPT
@@ -847,8 +674,6 @@ async def _stream_response_once(
     allowed_workspace_tools = (
         READ_ONLY_WORKSPACE_TOOL_NAMES
         if workspace_access == "read_only"
-        else PLANNING_WORKSPACE_TOOL_NAMES
-        if workspace_access == "plan"
         else EDIT_WORKSPACE_TOOL_NAMES
         if workspace_access == "edit"
         else WORKSPACE_TOOL_NAMES
@@ -1616,124 +1441,3 @@ async def _stream_response_once(
         "tool_trace": tool_trace,
         "response": {"tool_trace": tool_trace},
     }
-
-
-async def stream_response(*, coding_two_phase: bool = False, **kwargs: Any) -> dict[str, Any]:
-    """Run a coding request as a read-only planning phase followed by execution.
-
-    The two phases deliberately use separate upstream request histories.  Only
-    the validated, compact plan crosses the boundary; the planner's hidden
-    reasoning and read/tool transcript are not replayed to the executor.
-    """
-    workspace = kwargs.get("workspace")
-    workspace_access = str(kwargs.get("workspace_access") or "full")
-    messages = kwargs.get("messages") or []
-    if not coding_two_phase or workspace is None or workspace_access not in {"full", "edit"}:
-        return await _stream_response_once(**kwargs)
-    if workspace_access == "full" and not _coding_action_requested(
-        messages,
-        workspace_access=workspace_access,
-        workspace_has_files=bool(workspace.list_files()),
-    ):
-        return await _stream_response_once(**kwargs)
-
-    update = kwargs["update"]
-    base_addendum = str(kwargs.get("system_addendum") or "").strip()
-    configured_rounds = max(0, int(kwargs.get("max_tool_rounds") or MAX_AGENT_TOOL_ROUNDS))
-    plan_rounds = min(CODING_PLAN_MAX_TOOL_ROUNDS, max(0, configured_rounds - 1))
-    execution_rounds = max(0, configured_rounds - plan_rounds)
-    planner_settings = dict(kwargs.get("settings") or {})
-    configured_tokens = int(planner_settings.get("max_completion_tokens") or 65_536)
-    planner_settings["max_completion_tokens"] = min(configured_tokens, CODING_PLAN_MAX_COMPLETION_TOKENS)
-    planner_addendum = "\n\n".join(item for item in (base_addendum, CODING_PLAN_PROMPT) if item)
-
-    async def planning_update(state: dict[str, Any]) -> None:
-        partial_outline = str(state.get("answer") or "")[:CODING_PLAN_MAX_CHARS]
-        await update(
-            {
-                "answer": "",
-                "reasoning": "规划阶段（只读，仅输出大纲）：\n" + partial_outline,
-                "searches": state.get("searches") or [],
-                "sources": state.get("sources") or [],
-                "usage": state.get("usage") or {},
-            }
-        )
-
-    planner_kwargs = dict(kwargs)
-    planner_kwargs.update(
-        {
-            "workspace_access": "plan",
-            "system_addendum": planner_addendum,
-            "settings": planner_settings,
-            "max_tool_rounds": plan_rounds,
-            "update": planning_update,
-        }
-    )
-    plan_result = await _stream_response_once(**planner_kwargs)
-    try:
-        plan = _normalize_coding_plan(str(plan_result.get("answer") or ""))
-    except ValueError as exc:
-        raise RuntimeError(f"规划阶段失败：{exc}") from exc
-    plan_json = json.dumps(plan, ensure_ascii=False, separators=(",", ":"))
-    snapshot = json.dumps(workspace.list_files(), ensure_ascii=False, separators=(",", ":"))
-    execution_addendum = "\n\n".join(
-        item
-        for item in (
-            base_addendum,
-            CODING_EXECUTION_PROMPT + plan_json + "\n\n工作区规划快照（执行前请重新读取权威状态）：\n" + snapshot,
-        )
-        if item
-    )
-
-    async def execution_update(state: dict[str, Any]) -> None:
-        await update(
-            {
-                "answer": state.get("answer") or "",
-                "reasoning": "规划大纲（已冻结）：\n"
-                + plan_json
-                + "\n\n执行阶段：\n"
-                + str(state.get("reasoning") or ""),
-                "searches": [*(plan_result.get("searches") or []), *(state.get("searches") or [])],
-                "sources": _phase_sources(plan_result.get("sources"), state.get("sources")),
-                "usage": _merge_usage(plan_result.get("usage") or {}, state.get("usage") or {}),
-            }
-        )
-
-    await update(
-        {
-            "answer": "",
-            "reasoning": "规划阶段已完成，已冻结执行大纲：\n" + plan_json,
-            "searches": plan_result.get("searches") or [],
-            "sources": plan_result.get("sources") or [],
-            "usage": plan_result.get("usage") or {},
-        }
-    )
-    execution_kwargs = dict(kwargs)
-    execution_kwargs.update(
-        {
-            "workspace_access": workspace_access,
-            "system_addendum": execution_addendum,
-            "max_tool_rounds": execution_rounds,
-            "update": execution_update,
-        }
-    )
-    execution_result = await _stream_response_once(**execution_kwargs)
-    combined = dict(execution_result)
-    combined["reasoning"] = (
-        "规划大纲（已冻结）：\n"
-        + plan_json
-        + "\n\n执行阶段：\n"
-        + str(execution_result.get("reasoning") or "")
-    )
-    combined["searches"] = [*(plan_result.get("searches") or []), *(execution_result.get("searches") or [])]
-    combined["sources"] = _phase_sources(plan_result.get("sources"), execution_result.get("sources"))
-    combined["usage"] = _merge_usage(plan_result.get("usage") or {}, execution_result.get("usage") or {})
-    combined["tool_trace"] = [*(plan_result.get("tool_trace") or []), *(execution_result.get("tool_trace") or [])]
-    combined["coding_plan"] = plan
-    combined["coding_phases"] = ["planning", "execution"]
-    combined["response"] = {
-        **(execution_result.get("response") or {}),
-        "coding_plan": plan,
-        "coding_phases": ["planning", "execution"],
-    }
-    return combined
