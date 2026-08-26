@@ -337,6 +337,49 @@ def _apply_model_system_prompt(system_prompt: str, model: str) -> str:
     return system_prompt
 
 
+
+_OPENROUTER_DYNAMIC_VARIANTS = {"floor", "nitro", "exacto"}
+
+
+def _floor_model_id(model: str) -> str:
+    """Append OpenRouter's price-routing variant without duplicating it."""
+    value = str(model or "")
+    head, separator, suffix = value.rpartition(":")
+    if separator and suffix.casefold() in _OPENROUTER_DYNAMIC_VARIANTS:
+        return f"{head}:floor"
+    if value.casefold().endswith(":floor"):
+        return value
+    return f"{value}:floor"
+
+
+def _apply_lowest_price_routing(
+    payload: dict[str, Any],
+    model: str,
+    config: dict[str, Any],
+) -> None:
+    """Apply manually selected aggregator-specific lowest-price routing.
+
+    Custom settings deliberately opt in by aggregator instead of guessing from
+    an endpoint URL. OpenRouter uses its ``:floor`` model variant; Vercel AI
+    Gateway exposes the equivalent as ``providerOptions.gateway.sort=cost``.
+    """
+    raw_aggregators = config.get("lowest_price_aggregators") or []
+    if isinstance(raw_aggregators, str):
+        raw_aggregators = [raw_aggregators]
+    selected = {str(value).strip().casefold() for value in raw_aggregators}
+    if "openrouter" in selected:
+        payload["model"] = _floor_model_id(model)
+    if "vercel" in selected:
+        provider_options = payload.get("providerOptions")
+        if not isinstance(provider_options, dict):
+            provider_options = {}
+            payload["providerOptions"] = provider_options
+        gateway = provider_options.get("gateway")
+        if not isinstance(gateway, dict):
+            gateway = {}
+            provider_options["gateway"] = gateway
+        gateway["sort"] = "cost"
+
 def _apply_thinking_options(
     payload: dict[str, Any],
     base_url: str,
@@ -801,6 +844,7 @@ async def stream_response(
                     payload["temperature"] = float(config["temperature"])
                     payload["top_p"] = float(config["top_p"])
 
+            _apply_lowest_price_routing(payload, model, config)
             round_answer = ""
             round_preview = ""
             round_reasoning = ""

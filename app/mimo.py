@@ -16,6 +16,7 @@ from curl_cffi import requests as curl_requests
 
 MIMO_MAX_COMPLETION_TOKENS = 131072
 MIMO_MAX_TOOL_ROUNDS = 6
+LOWEST_PRICE_AGGREGATORS = ("openrouter", "vercel")
 MIMO_MAX_SEARCHES = 3
 MIMO_MAX_SEARCH_RESULTS = 10
 JINA_READER_PREFIX = "https://r.jina.ai/"
@@ -88,6 +89,7 @@ DEFAULT_SETTINGS = {
     "thinking": "enabled",
     "reasoning_effort": "high",
     "reasoning_effort_enabled": True,
+    "lowest_price_aggregators": [],
     "dsml_fallback_enabled": False,
     "max_completion_tokens": 65536,
     "temperature": 1.0,

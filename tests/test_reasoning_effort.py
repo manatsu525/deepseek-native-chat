@@ -7,7 +7,7 @@ import unittest
 from fastapi import HTTPException
 
 from app.main import ChatBody, validate_effort
-from app.mimo_local import _apply_thinking_options
+from app.mimo_local import _apply_lowest_price_routing, _apply_thinking_options
 from app.reasoning_effort import DEFAULT, LEVELS, normalize
 
 
@@ -68,6 +68,48 @@ class ReasoningEffortTests(unittest.TestCase):
             65536,
         )
         self.assertNotIn("reasoning_effort", payload)
+
+    def test_openrouter_lowest_price_uses_floor_suffix(self) -> None:
+        payload = {"model": "anthropic/claude-sonnet:thinking"}
+        _apply_lowest_price_routing(
+            payload,
+            "anthropic/claude-sonnet:thinking",
+            {"lowest_price_aggregators": ["openrouter"]},
+        )
+        self.assertEqual(payload["model"], "anthropic/claude-sonnet:thinking:floor")
+        self.assertNotIn("providerOptions", payload)
+
+    def test_openrouter_lowest_price_replaces_existing_dynamic_variant(self) -> None:
+        payload = {"model": "anthropic/claude-sonnet:nitro"}
+        _apply_lowest_price_routing(
+            payload,
+            "anthropic/claude-sonnet:nitro",
+            {"lowest_price_aggregators": ["openrouter"]},
+        )
+        self.assertEqual(payload["model"], "anthropic/claude-sonnet:floor")
+
+    def test_vercel_lowest_price_uses_gateway_cost_sort(self) -> None:
+        payload = {"model": "anthropic/claude-sonnet"}
+        _apply_lowest_price_routing(
+            payload,
+            "anthropic/claude-sonnet",
+            {"lowest_price_aggregators": ["vercel"]},
+        )
+        self.assertEqual(payload["model"], "anthropic/claude-sonnet")
+        self.assertEqual(payload["providerOptions"], {"gateway": {"sort": "cost"}})
+
+    def test_lowest_price_routing_is_opt_in_and_can_combine_manual_choices(self) -> None:
+        payload = {"model": "openai/gpt-5"}
+        _apply_lowest_price_routing(payload, "openai/gpt-5", {})
+        self.assertEqual(payload, {"model": "openai/gpt-5"})
+
+        _apply_lowest_price_routing(
+            payload,
+            "openai/gpt-5",
+            {"lowest_price_aggregators": ["openrouter", "vercel"]},
+        )
+        self.assertEqual(payload["model"], "openai/gpt-5:floor")
+        self.assertEqual(payload["providerOptions"], {"gateway": {"sort": "cost"}})
 
 
 if __name__ == "__main__":

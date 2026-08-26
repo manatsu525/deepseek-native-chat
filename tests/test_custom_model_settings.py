@@ -92,12 +92,13 @@ class CustomModelSettingsTests(unittest.TestCase):
             ),
         )
 
-    def settings_body(self, model: str, *, temperature: float, backend: str, effort: str = "high") -> dict:
+    def settings_body(self, model: str, *, temperature: float, backend: str, effort: str = "high", aggregators: tuple[str, ...] = ()) -> dict:
         return {
             "model": model,
             "thinking": "enabled",
             "reasoning_effort": effort,
             "reasoning_effort_enabled": True,
+            "lowest_price_aggregators": list(aggregators),
             "dsml_fallback_enabled": False,
             "max_completion_tokens": 8192,
             "temperature": temperature,
@@ -124,6 +125,8 @@ class CustomModelSettingsTests(unittest.TestCase):
         self.assertEqual(stored["model_settings"]["model-b"]["temperature"], 0.4)
         self.assertEqual(stored["model_settings"]["model-a"]["reasoning_effort"], "high")
         self.assertEqual(stored["model_settings"]["model-b"]["reasoning_effort"], "high")
+        self.assertEqual(stored["model_settings"]["model-a"]["lowest_price_aggregators"], [])
+        self.assertEqual(stored["model_settings"]["model-b"]["lowest_price_aggregators"], [])
 
         response = self.client.put(
             f"/api/providers/{provider_id}/settings",
@@ -152,17 +155,19 @@ class CustomModelSettingsTests(unittest.TestCase):
         main.migrate_custom_provider_settings()
         response = self.client.put(
             f"/api/providers/{provider_id}/settings",
-            json=self.settings_body("model-a", temperature=1.1, backend="parallel", effort="xhigh"),
+            json=self.settings_body("model-a", temperature=1.1, backend="parallel", effort="xhigh", aggregators=("openrouter",)),
         )
         self.assertEqual(response.status_code, 200, response.text)
         response = self.client.put(
             f"/api/providers/{provider_id}/settings",
-            json=self.settings_body("model-b", temperature=0.7, backend="parallel", effort="low"),
+            json=self.settings_body("model-b", temperature=0.7, backend="parallel", effort="low", aggregators=("vercel",)),
         )
         self.assertEqual(response.status_code, 200, response.text)
         provider = response.json()
         self.assertEqual(provider["model_settings"]["model-a"]["reasoning_effort"], "xhigh")
         self.assertEqual(provider["model_settings"]["model-b"]["reasoning_effort"], "low")
+        self.assertEqual(provider["model_settings"]["model-a"]["lowest_price_aggregators"], ["openrouter"])
+        self.assertEqual(provider["model_settings"]["model-b"]["lowest_price_aggregators"], ["vercel"])
         calls: list[dict] = []
 
         async def fake_custom_stream_response(**kwargs):
@@ -194,6 +199,7 @@ class CustomModelSettingsTests(unittest.TestCase):
         self.assertEqual(calls[0]["settings"]["temperature"], 0.7)
         self.assertEqual(calls[0]["settings"]["web_tool_backend"], "parallel")
         self.assertEqual(calls[0]["settings"]["reasoning_effort"], "low")
+        self.assertEqual(calls[0]["settings"]["lowest_price_aggregators"], ["vercel"])
         self.assertEqual(calls[0]["effort"], "low")
         self.assertNotEqual(calls[0]["settings"]["temperature"], 1.1)
 

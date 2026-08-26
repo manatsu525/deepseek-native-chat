@@ -28,7 +28,7 @@ from .deepseek import stream_response as deepseek_stream_response
 from .custom_responses import stream_response as custom_responses_stream_response
 from .custom_messages import stream_response as custom_messages_stream_response
 from .mimo import DEFAULT_SETTINGS as CUSTOM_DEFAULT_SETTINGS
-from .mimo import MIMO_MAX_COMPLETION_TOKENS, custom_auth_headers, is_mimo_model, list_models as custom_list_models
+from .mimo import LOWEST_PRICE_AGGREGATORS, MIMO_MAX_COMPLETION_TOKENS, custom_auth_headers, is_mimo_model, list_models as custom_list_models
 from .mimo_local import stream_response as custom_stream_response
 from .multi_agent import run_collaboration
 from .reasoning_effort import DEFAULT as DEFAULT_REASONING_EFFORT
@@ -110,6 +110,7 @@ class CustomSettingsBody(BaseModel):
     thinking: Literal["enabled", "disabled"] = "enabled"
     reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] = DEFAULT_REASONING_EFFORT
     reasoning_effort_enabled: bool = True
+    lowest_price_aggregators: list[Literal["openrouter", "vercel"]] = Field(default_factory=list, max_length=2)
     dsml_fallback_enabled: bool = False
     max_completion_tokens: int = Field(default=65536, ge=256, le=MIMO_MAX_COMPLETION_TOKENS)
     temperature: float = Field(default=1.0, ge=0, le=1.5)
@@ -151,6 +152,15 @@ def normalize_custom_settings(value: Any = None) -> dict[str, Any]:
         data.update(value.model_dump())
     elif isinstance(value, dict):
         data.update(value)
+    raw_aggregators = data.get("lowest_price_aggregators", [])
+    if isinstance(raw_aggregators, str):
+        raw_aggregators = [raw_aggregators]
+    if not isinstance(raw_aggregators, (list, tuple, set)):
+        raw_aggregators = []
+    selected_aggregators = {str(value).strip().casefold() for value in raw_aggregators}
+    data["lowest_price_aggregators"] = [
+        name for name in LOWEST_PRICE_AGGREGATORS if name in selected_aggregators
+    ]
     if data.get("reasoning_effort") not in REASONING_EFFORT_LEVELS:
         data["reasoning_effort"] = DEFAULT_REASONING_EFFORT
     return CustomSettingsBody(**data).model_dump()
