@@ -224,7 +224,7 @@ def _public_agents(agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     fields = {
         "id", "role", "label", "status", "task", "answer", "reasoning",
         "searches", "sources", "usage", "verdict", "error", "decision_action",
-        "decision_reason",
+        "decision_reason", "coding_plan", "coding_phases",
     }
     return [{key: value for key, value in agent.items() if key in fields} for agent in agents]
 
@@ -342,7 +342,20 @@ async def run_collaboration(
         if budget.remaining <= reserve_calls:
             raise ModelCallLimitExceeded(f"模型调用剩余 {budget.remaining} 次，必须预留 {reserve_calls} 次完成协作")
         role_call_allowance = budget.remaining - reserve_calls
-        effective_tool_rounds = min(tool_round_limits[role], max(0, role_call_allowance - 1))
+        # A programmer call is deliberately split into planning and execution.
+        # Each phase keeps the existing two final-answer retry slots, so the
+        # two-phase wrapper may consume up to ``tool_rounds + 4`` upstream
+        # calls in the worst case. Reserve those slots here; otherwise a late
+        # programmer invocation could exhaust the shared collaboration budget
+        # before Sentinel and Nexus get their reserved turns.
+        if role == "programmer":
+            if role_call_allowance < 4:
+                raise ModelCallLimitExceeded(
+                    f"模型调用剩余 {role_call_allowance} 次，不足以完成程序员的规划和执行两个阶段"
+                )
+            effective_tool_rounds = min(tool_round_limits[role], max(0, role_call_allowance - 4))
+        else:
+            effective_tool_rounds = min(tool_round_limits[role], max(0, role_call_allowance - 1))
         if role == "researcher":
             effective_tool_rounds = min(effective_tool_rounds, max(0, web_limits[2]))
         start_model_calls = budget.used
@@ -386,6 +399,7 @@ async def run_collaboration(
                 user_timezone=user_timezone,
                 effort=effort,
                 workspace=workspace if workspace_access != "none" else None,
+                coding_two_phase=role == "programmer",
                 web_enabled=web_enabled,
                 workspace_access=workspace_access,
                 system_addendum=system_prompt,
@@ -415,6 +429,9 @@ async def run_collaboration(
         record["usage"]["model_calls"] = budget.used - start_model_calls
         if result.get("tool_trace"):
             record["tool_trace"] = result["tool_trace"]
+        if result.get("coding_plan"):
+            record["coding_plan"] = result["coding_plan"]
+            record["coding_phases"] = result.get("coding_phases") or ["planning", "execution"]
         await emit()
         return result
 
@@ -511,7 +528,11 @@ async def run_collaboration(
                 budget_exhausted = True
                 break
         elif action == "program":
-            if budget.remaining < 5:
+            # Forge now needs four minimum upstream turns for the two phases
+            # (two final-answer retry slots per phase), in addition to four
+            # post-program turns reserved for Nexus's next decision, Sentinel,
+            # and the final Nexus summary.
+            if budget.remaining < 9:
                 guard_message = "模型调用预算不足以执行编程、检查和最终汇总，请立即 finish 并说明未完成项。"
                 continue
             role_counts[action] += 1
@@ -524,7 +545,7 @@ async def run_collaboration(
                 + shared_state(pending_inspection=pending_inspection, blocker=blocker)
             )
             try:
-                await run_role("programmer", safe_task, packet, reserve_calls=3)
+                await run_role("programmer", safe_task, packet, reserve_calls=4)
             except ModelCallLimitExceeded:
                 budget_exhausted = True
                 break

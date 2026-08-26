@@ -22,6 +22,8 @@ WORKSPACE_SYSTEM_PROMPT = """A persistent, isolated coding workspace is availabl
 
 READ_ONLY_WORKSPACE_SYSTEM_PROMPT = """A persistent coding workspace is available in read-only review mode. You may list, read, and search files and run the supplied validation tools, but you must not create, edit, replace, or delete files. Report concrete findings with file paths and test evidence. If a change is needed, describe it for the programmer instead of attempting the mutation yourself."""
 
+PLANNING_WORKSPACE_SYSTEM_PROMPT = """A persistent coding workspace is available in planning-only mode. You may list, read, and search files to understand the current state, but you must not create, edit, replace, delete, run, or validate anything. Produce an implementation outline only; do not emit complete source files, diffs, patches, or tool-call JSON. The outline will be passed to a separate execution phase."""
+
 EDIT_WORKSPACE_SYSTEM_PROMPT = """A persistent coding workspace is available in implementation-only mode. You may list, read, search, create, edit, and delete workspace files as needed to implement the requested change. Keep planning proportional to the next concrete action: once you know the next useful workspace operation, call the tool immediately. Do not mentally draft the entire implementation, repeatedly redesign it, or continue self-reviewing before the first file operation. Never respond with a promise such as "I will create the file" or "the file is being created"; perform the operation in the current turn. Runtime execution and syntax-validation tools are intentionally unavailable because a separate reviewer is responsible for verification. Read only what is needed, make the actual edits, and then report the changed files without beginning a self-review or test loop."""
 
 
@@ -141,6 +143,7 @@ READ_ONLY_WORKSPACE_TOOL_NAMES = {
     "run_python",
     "check_web_syntax",
 }
+PLANNING_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search_files"}
 EDIT_WORKSPACE_TOOL_NAMES = WORKSPACE_TOOL_NAMES - {"run_python", "check_web_syntax"}
 
 
@@ -202,6 +205,8 @@ class ConversationWorkspace:
         tools = [*WORKSPACE_TOOLS, RUN_PYTHON_TOOL, CHECK_WEB_SYNTAX_TOOL]
         if access == "read_only":
             tools = [item for item in tools if item["function"]["name"] in READ_ONLY_WORKSPACE_TOOL_NAMES]
+        elif access == "plan":
+            tools = [item for item in tools if item["function"]["name"] in PLANNING_WORKSPACE_TOOL_NAMES]
         elif access == "edit":
             tools = [item for item in tools if item["function"]["name"] in EDIT_WORKSPACE_TOOL_NAMES]
         elif access != "full":

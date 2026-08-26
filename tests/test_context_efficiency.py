@@ -11,6 +11,7 @@ from app.mimo import custom_auth_headers
 from app import mimo_local
 from app.mimo_local import (
     AGENT_CONTEXT_COMPACT_THRESHOLD,
+    _coding_action_requested,
     _compact_workspace_call_arguments,
     _maybe_compact_agent_context,
     stream_response,
@@ -134,6 +135,140 @@ class ContextEfficiencyTests(unittest.TestCase):
                 self.assertEqual(checkpoint["workspace_files"][0]["path"], "app.py")
             finally:
                 workspace_module.WORKSPACES_DIR = original
+
+
+class TwoPhaseCodingTests(unittest.IsolatedAsyncioTestCase):
+    def test_existing_workspace_change_requests_enter_two_phase_path(self) -> None:
+        self.assertTrue(
+            _coding_action_requested(
+                [{"role": "user", "content": "把颜色换成蓝色"}],
+                workspace_access="full",
+                workspace_has_files=True,
+            )
+        )
+        self.assertFalse(
+            _coding_action_requested(
+                [{"role": "user", "content": "看看这个文件"}],
+                workspace_access="full",
+                workspace_has_files=True,
+            )
+        )
+
+    async def test_planning_and_execution_use_separate_histories_and_tools(self) -> None:
+        def chat_response(delta: dict) -> list[str]:
+            return [
+                "data: " + json.dumps({"choices": [{"delta": delta}]}),
+                "data: [DONE]",
+            ]
+
+        plan = json.dumps(
+            {
+                "goal": "创建页面",
+                "files": [{"path": "index.html", "purpose": "实现页面"}],
+                "steps": ["写入页面文件"],
+                "acceptance_checks": ["确认文件存在"],
+                "constraints": ["只修改工作区"],
+                "risks": [],
+            },
+            ensure_ascii=False,
+        )
+        responses = [
+            chat_response({"content": plan}),
+            chat_response(
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "write-1",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": json.dumps({"path": "index.html", "content": "<p>ok</p>"}),
+                            },
+                        }
+                    ]
+                }
+            ),
+            chat_response({"content": "完成"}),
+        ]
+        payloads: list[dict] = []
+
+        class FakeResponse:
+            status_code = 200
+
+            def __init__(self, lines: list[str]) -> None:
+                self.lines = lines
+
+            async def aiter_lines(self):
+                for line in self.lines:
+                    yield line
+
+            async def aread(self) -> bytes:
+                return b""
+
+        class FakeStreamContext:
+            def __init__(self, lines: list[str]) -> None:
+                self.response = FakeResponse(lines)
+
+            async def __aenter__(self):
+                return self.response
+
+            async def __aexit__(self, *_):
+                return False
+
+        class FakeAsyncClient:
+            def __init__(self, **_):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            def stream(self, *_args, **kwargs):
+                payloads.append(json.loads(json.dumps(kwargs["json"])))
+                return FakeStreamContext(responses.pop(0))
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "two-phase")
+            workspace.root = Path(directory)
+            updates: list[dict] = []
+
+            async def update(state: dict) -> None:
+                updates.append(state)
+
+            with patch.object(mimo_local.httpx, "AsyncClient", FakeAsyncClient):
+                result = await stream_response(
+                    base_url="https://example.test/v1",
+                    api_key="test-key",
+                    model="test-model",
+                    messages=[{"role": "user", "content": "请创建一个 HTML 页面"}],
+                    timeout=30,
+                    stopped=lambda: False,
+                    update=update,
+                    settings={"thinking": "disabled", "max_completion_tokens": 4096},
+                    conversation_id="two-phase",
+                    workspace=workspace,
+                    web_enabled=False,
+                    coding_two_phase=True,
+                    max_tool_rounds=6,
+                )
+
+            self.assertEqual((Path(directory) / "index.html").read_text(), "<p>ok</p>")
+
+        self.assertEqual(result["answer"], "完成")
+        self.assertEqual(result["coding_phases"], ["planning", "execution"])
+        self.assertEqual([message["role"] for message in payloads[0]["messages"]], ["system", "user"])
+        self.assertEqual([message["role"] for message in payloads[1]["messages"]], ["system", "user"])
+        plan_tools = {item["function"]["name"] for item in payloads[0]["tools"]}
+        execution_tools = {item["function"]["name"] for item in payloads[1]["tools"]}
+        self.assertEqual(plan_tools, {"list_files", "read_file", "search_files"})
+        self.assertIn("write_file", execution_tools)
+        self.assertNotIn("IMMUTABLE IMPLEMENTATION PLAN", payloads[0]["messages"][0]["content"])
+        self.assertIn("IMMUTABLE IMPLEMENTATION PLAN", payloads[1]["messages"][0]["content"])
+        self.assertTrue(any("规划阶段" in item["reasoning"] for item in updates))
+        self.assertTrue(any(item["answer"] == "完成" for item in updates))
 
 
 class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):

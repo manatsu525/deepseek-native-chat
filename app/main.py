@@ -501,6 +501,7 @@ async def _execute_job(job_id: str) -> None:
                 user_timezone=job.get("timezone") or "UTC",
                 effort=job["effort"],
                 workspace=job_workspace,
+                coding_two_phase=True,
             )
         else:
             result = await deepseek_stream_response(
@@ -513,7 +514,7 @@ async def _execute_job(job_id: str) -> None:
                 stopped=stopped,
                 update=update,
             )
-        meta = {"job_id": job_id, "conversation_id": job["conversation_id"], "provider_id": job["provider_id"], "provider_type": kind, "model": job["model"], "chat_mode": job.get("chat_mode") or "standard", "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"], "agents": result.get("agents", []), "workspace_files": job_workspace.list_files()}
+        meta = {"job_id": job_id, "conversation_id": job["conversation_id"], "provider_id": job["provider_id"], "provider_type": kind, "model": job["model"], "chat_mode": job.get("chat_mode") or "standard", "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"], "agents": result.get("agents", []), "coding_plan": result.get("coding_plan"), "coding_phases": result.get("coding_phases", []), "workspace_files": job_workspace.list_files()}
         if result.get("tool_trace"):
             meta["tool_trace"] = result["tool_trace"]
         db.run(

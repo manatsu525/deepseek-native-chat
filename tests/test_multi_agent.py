@@ -184,6 +184,8 @@ class MultiAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(not item["web_enabled"] and item["workspace_access"] == "read_only" for item in inspector_calls))
         programmer_calls = [item for item in calls if item["system_addendum"] == PROGRAMMER_PROMPT]
         self.assertTrue(all(not item["web_enabled"] and item["workspace_access"] == "edit" for item in programmer_calls))
+        self.assertTrue(all(item["coding_two_phase"] for item in programmer_calls))
+        self.assertTrue(all(not item["coding_two_phase"] for item in calls if item["system_addendum"] != PROGRAMMER_PROMPT))
         edit_tool_names = {item["function"]["name"] for item in workspace.tool_definitions("edit")}
         self.assertIn("write_file", edit_tool_names)
         self.assertIn("apply_line_edits", edit_tool_names)
