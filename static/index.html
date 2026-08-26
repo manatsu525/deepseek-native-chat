@@ -104,7 +104,7 @@
         <button id="openSidebar" class="icon-btn mobile-only" aria-label="菜单">☰</button>
         <div class="title-block"><h2 id="conversationTitle">新对话</h2><span id="statusText" class="status-dot">标准模式 · 外部搜索工具已就绪</span></div>
         <div class="top-actions">
-          <label class="compact-select" title="控制模型的 reasoning effort"><span id="effortLabel">推理</span><select id="effort" aria-label="推理档位"><option value="low">低</option><option value="medium">中</option><option value="high" selected>高</option><option value="xhigh">很高</option><option value="max">最大</option></select></label>
+          <label id="effortControl" class="compact-select" title="控制 DeepSeek 模型的 reasoning effort"><span id="effortLabel">推理</span><select id="effort" aria-label="DeepSeek 推理档位"><option value="low">低</option><option value="medium">中</option><option value="high" selected>高</option><option value="xhigh">很高</option><option value="max">最大</option></select></label>
           <button id="workspaceButton" class="soft-btn hidden" type="button">文件 <span id="workspaceCount">0</span></button>
           <button id="providerButton" class="soft-btn">API</button>
           <button id="customSettingsButton" class="soft-btn hidden">Custom 参数</button>
@@ -178,6 +178,7 @@
     <div class="modal-head"><div><p class="eyebrow">CUSTOM WEB TOOLS</p><h3 id="customModalTitle">Custom 参数</h3></div><button class="icon-btn close-modal">×</button></div>
     <form id="customForm" class="form-grid">
       <label>思考模式<select id="customThinking"><option value="enabled">开启</option><option value="disabled">关闭</option></select></label>
+      <label>推理强度<select id="customReasoningEffort" aria-label="Custom reasoning effort"><option value="low">低</option><option value="medium">中</option><option value="high" selected>高</option><option value="xhigh">很高</option><option value="max">最大</option></select></label>
       <label class="check"><input id="customReasoningEffortEnabled" type="checkbox" checked> 发送 reasoning_effort</label>
       <label class="check wide"><input id="customDsmlFallbackEnabled" type="checkbox"> OpenCode DeepSeek V4 Flash：启用 DSML 工具调用兜底</label>
       <label>最大生成 Token<input id="customMaxCompletion" type="number" min="256" max="131072" step="256" value="65536"></label>

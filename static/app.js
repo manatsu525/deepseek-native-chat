@@ -562,7 +562,7 @@ async function retryAnswer(messageIndex,items){
   const promptMessageId=prompt.id;
   state.retryingAnswer=true;setRunning(false);renderMessages();
   try{
-    const data=await api(`/api/conversations/${encodeURIComponent(conversationId)}/retry`,{method:'POST',body:{prompt_message_id:promptMessageId,provider_id:provider.id,model,effort:$('#effort').value,timezone:browserTimezone(),chat_mode:state.chatMode}});
+    const data=await api(`/api/conversations/${encodeURIComponent(conversationId)}/retry`,{method:'POST',body:{prompt_message_id:promptMessageId,provider_id:provider.id,model,effort:selectedReasoningEffort(),timezone:browserTimezone(),chat_mode:state.chatMode}});
     if(!state.conversation||String(state.conversation.id)!==String(conversationId)){
       toast('已在原对话中开始重新回答');loadHistory(1);return;
     }
@@ -649,7 +649,7 @@ async function submitPrompt(value) {
   state.messages.push({role:'user',content,meta:{attachments:pendingSnapshot}});state.job={status:'queued',trace_key:traceKey,provider_type:provider.provider_type,provider_id:provider.id,model,chat_mode:state.chatMode,agents:[],answer:'',reasoning:'',searches:[],sources:[],usage:{}};renderMessages();
   $('#chatScroll').scrollTop=$('#chatScroll').scrollHeight;setRunning(true);
   try{
-    const data=await api('/api/chat',{method:'POST',body:{conversation_id:(state.conversation&&state.conversation.id)||null,content,attachment_ids:attachmentIds,provider_id:provider.id,model,effort:$('#effort').value,timezone:browserTimezone(),chat_mode:state.chatMode}});
+    const data=await api('/api/chat',{method:'POST',body:{conversation_id:(state.conversation&&state.conversation.id)||null,content,attachment_ids:attachmentIds,provider_id:provider.id,model,effort:selectedReasoningEffort(),timezone:browserTimezone(),chat_mode:state.chatMode}});
     if(!state.conversation){state.conversation={id:data.conversation_id,title:content.slice(0,36)};state.workspaceFiles=[];renderWorkspaceState()}
     state.messages[state.messages.length-1].id=data.message_id;
     state.pendingAttachments=[];state.attachmentDraftId=null;storeValue('attachment-draft',null);renderPendingAttachments();setAttachmentStatus('');
@@ -686,6 +686,7 @@ function providerModels(provider){const models=Array.isArray(provider&&provider.
 function selectedOption(){return $('#providerSelect').selectedOptions[0]||null}
 function selectedProvider(){const option=selectedOption();const id=option&&option.dataset.providerId||$('#providerSelect').value;return state.providers.find(x=>String(x.id)===String(id))}
 function selectedModel(){const option=selectedOption();const provider=selectedProvider();return option&&option.dataset.model||providerModels(provider)[0]||''}
+function selectedReasoningEffort(){const provider=selectedProvider();if(provider&&isCustomProviderType(provider.provider_type)){return String(customSettings(provider,selectedModel()).reasoning_effort||'high')}return $('#effort').value}
 function selectProvider(providerId, persist=true, model='') {
   const provider=state.providers.find(x=>String(x.id)===String(providerId));
   if(!provider) return null;
@@ -728,12 +729,13 @@ const customWebToolInfo={
 };
 function selectedWebToolInfo(provider=selectedProvider()){const key=customSettings(provider).web_tool_backend;return customWebToolInfo[key]||customWebToolInfo.parallel}
 function updateProviderUi(){
-  const provider=selectedProvider(), custom=provider&&isCustomProviderType(provider.provider_type), protocol=provider&&normalizeProviderType(provider.provider_type), responses=protocol==='custom_response', messages=protocol==='custom_messages', customEffort=custom&&!messages&&customSettings(provider).reasoning_effort_enabled;
+  const provider=selectedProvider(), custom=provider&&isCustomProviderType(provider.provider_type), protocol=provider&&normalizeProviderType(provider.provider_type), responses=protocol==='custom_response', messages=protocol==='custom_messages';
   const webInfo=custom?selectedWebToolInfo(provider):null;
   const collaborative=state.chatMode==='multi_agent';
   $('#customSettingsButton').classList.toggle('hidden',!custom);
-  $('#effort').disabled=!!custom&&!customEffort;
-  $('#effort').title=custom?(customEffort?'控制发送给 Custom 模型的 reasoning_effort':'Custom 参数中已关闭 reasoning_effort'):'控制 DeepSeek 模型推理投入';
+  $('#effortControl').classList.toggle('hidden',!!custom);
+  $('#effort').disabled=!!custom;
+  $('#effort').title=custom?'Custom 模型请在“Custom 参数”中设置 reasoning effort':'控制 DeepSeek 模型推理投入';
   $('#nativePill').textContent=collaborative?(custom?'● 4 Agents':'⚠ 仅 Custom'):custom?`● ${webInfo.label}`:'● Native Web';
   $('#welcomeOrbitMark').textContent=collaborative?'4A':custom?'CU':'DS';
   $('#welcomeEyebrow').textContent=collaborative?'NEXUS · ATLAS · FORGE · SENTINEL':responses?'CUSTOM · RESPONSES':messages?'CUSTOM · MESSAGES':custom?'CUSTOM · CHAT COMPLETIONS': 'DEEPSEEK V4 FLASH';
@@ -835,7 +837,7 @@ function checkedCustomModels(){return $$('#customModelList input[type="checkbox"
 function providerFormData(){const custom=isCustomProviderType(providerType());const manual=custom?manualModelList():[];const selected=custom?[...new Set([...checkedCustomModels(),...manual])]:[$('#providerModel').value||'deepseek-v4-flash'];return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:selected[0]||(custom?'':'deepseek-v4-flash'),selected_models:selected,manual_models:manual}}
 
 function customSettings(provider,model=selectedModel()){
-  const defaults={thinking:'enabled',reasoning_effort_enabled:true,dsml_fallback_enabled:false,max_completion_tokens:65536,temperature:1,top_p:.95,web_tool_backend:'parallel'};
+  const defaults={thinking:'enabled',reasoning_effort:'high',reasoning_effort_enabled:true,dsml_fallback_enabled:false,max_completion_tokens:65536,temperature:1,top_p:.95,web_tool_backend:'parallel'};
   const byModel=provider&&provider.model_settings;
   const saved=byModel&&typeof byModel==='object'&&byModel[model]&&typeof byModel[model]==='object'
     ?byModel[model]
@@ -845,16 +847,16 @@ function customSettings(provider,model=selectedModel()){
 function fillCustomSettings(){
   const model=selectedModel(),config=customSettings(selectedProvider(),model);
   $('#customModalTitle').textContent=`Custom 参数 · ${model}`;$('#customModalTitle').title=model;$('#customStatus').textContent='';
-  $('#customThinking').value=config.thinking;$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customDsmlFallbackEnabled').checked=config.dsml_fallback_enabled;$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
+  $('#customThinking').value=config.thinking;$('#customReasoningEffort').value=config.reasoning_effort||'high';$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customDsmlFallbackEnabled').checked=config.dsml_fallback_enabled;$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
   syncCustomThinkingFields();syncCustomToolFields();
 }
-function syncCustomThinkingFields(){const protocol=normalizeProviderType((selectedProvider()||{}).provider_type),responses=protocol==='custom_response',messages=protocol==='custom_messages',mimo=isMimoModel(selectedModel()),thinking=$('#customThinking').value==='enabled',effort=$('#customReasoningEffortEnabled').checked;$('#customThinking').disabled=responses;$('#customReasoningEffortEnabled').disabled=messages;$('#customTemperature').disabled=messages?thinking:!responses&&mimo&&thinking;$('#customTopP').disabled=messages?thinking:!responses&&mimo&&thinking;$('#customSamplingNote').textContent=responses?`Responses 协议不发送非标准 thinking 字段；reasoning.effort 将${effort?'按顶部所选档位发送':'不发送'}，temperature/top_p 正常发送。`:messages?`Messages 使用 Anthropic thinking 语法；开启 thinking 时不发送 temperature/top_p。该协议没有通用 reasoning_effort 字段。`:`thinking 将${thinking?'开启':'关闭'}；reasoning_effort 将${effort?'按顶部所选档位发送':'不发送'}。已知模型使用官方字段，其他 Custom 使用通用顶层字段；接口不支持时可在这里关闭。`}
+function syncCustomThinkingFields(){const protocol=normalizeProviderType((selectedProvider()||{}).provider_type),responses=protocol==='custom_response',messages=protocol==='custom_messages',mimo=isMimoModel(selectedModel()),thinking=$('#customThinking').value==='enabled',effortEnabled=$('#customReasoningEffortEnabled').checked;$('#customThinking').disabled=responses;$('#customReasoningEffort').disabled=messages||!effortEnabled;$('#customReasoningEffortEnabled').disabled=messages;$('#customTemperature').disabled=messages?thinking:!responses&&mimo&&thinking;$('#customTopP').disabled=messages?thinking:!responses&&mimo&&thinking;$('#customSamplingNote').textContent=responses?`Responses 协议不发送非标准 thinking 字段；reasoning.effort 将${effortEnabled?'使用当前模型档位':'不发送'}，temperature/top_p 正常发送。`:messages?`Messages 使用 Anthropic thinking 语法；开启 thinking 时不发送 temperature/top_p。该协议没有通用 reasoning_effort 字段。`:`当前模型的 thinking ${thinking?'开启':'关闭'}；reasoning_effort ${effortEnabled?'使用下方独立档位':'不发送'}。已知模型使用官方字段，其他 Custom 使用通用顶层字段；接口不支持时可在这里关闭。`}
 function syncCustomToolFields(){const info=customWebToolInfo[$('#customWebToolBackend').value]||customWebToolInfo.parallel;$('#customToolNote').textContent=`${info.description} 不需要 API Key；不会自动切换、并发调用或回退到其他方案。`}
 function openCustomSettings(){if(!selectedProvider()||!isCustomProviderType(selectedProvider().provider_type)){toast('请先选择 Custom API');return}fillCustomSettings();$('#customModal').showModal()}
 async function saveCustomSettings(event){
   event.preventDefault(); const provider=selectedProvider(); if(!provider)return;
   const model=selectedModel();
-  const body={model,thinking:$('#customThinking').value,reasoning_effort_enabled:$('#customReasoningEffortEnabled').checked,dsml_fallback_enabled:$('#customDsmlFallbackEnabled').checked,max_completion_tokens:Number($('#customMaxCompletion').value),temperature:Number($('#customTemperature').value),top_p:Number($('#customTopP').value),web_tool_backend:$('#customWebToolBackend').value};
+  const body={model,thinking:$('#customThinking').value,reasoning_effort:$('#customReasoningEffort').value,reasoning_effort_enabled:$('#customReasoningEffortEnabled').checked,dsml_fallback_enabled:$('#customDsmlFallbackEnabled').checked,max_completion_tokens:Number($('#customMaxCompletion').value),temperature:Number($('#customTemperature').value),top_p:Number($('#customTopP').value),web_tool_backend:$('#customWebToolBackend').value};
   try{const updated=await api(`/api/providers/${provider.id}/settings`,{method:'PUT',body});const index=state.providers.findIndex(x=>x.id===provider.id);if(index>=0)state.providers[index]=updated;$('#customModal').close();updateProviderUi();toast(`${model} 的 Custom 参数已保存`)}catch(err){$('#customStatus').textContent=err.message}
 }
 

@@ -173,7 +173,9 @@ class RetryInPlaceTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["api_key"], "current-provider-token")
         self.assertEqual(calls[0]["base_url"], "https://provider.invalid/v1")
-        self.assertEqual(calls[0]["effort"], "max")
+        # Custom reasoning effort comes from the selected model settings;
+        # the legacy per-request field is ignored for Custom providers.
+        self.assertEqual(calls[0]["effort"], "high")
         self.assertEqual(
             [(item["role"], item["content"]) for item in calls[0]["messages"]],
             [

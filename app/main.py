@@ -108,6 +108,7 @@ class ProviderEditBody(BaseModel):
 
 class CustomSettingsBody(BaseModel):
     thinking: Literal["enabled", "disabled"] = "enabled"
+    reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] = DEFAULT_REASONING_EFFORT
     reasoning_effort_enabled: bool = True
     dsml_fallback_enabled: bool = False
     max_completion_tokens: int = Field(default=65536, ge=256, le=MIMO_MAX_COMPLETION_TOKENS)
@@ -150,6 +151,8 @@ def normalize_custom_settings(value: Any = None) -> dict[str, Any]:
         data.update(value.model_dump())
     elif isinstance(value, dict):
         data.update(value)
+    if data.get("reasoning_effort") not in REASONING_EFFORT_LEVELS:
+        data["reasoning_effort"] = DEFAULT_REASONING_EFFORT
     return CustomSettingsBody(**data).model_dump()
 
 
@@ -481,7 +484,7 @@ async def _execute_job(job_id: str) -> None:
                 settings=provider_settings,
                 conversation_id=job["conversation_id"],
                 user_timezone=job.get("timezone") or "UTC",
-                effort=job["effort"],
+                effort=provider_settings.get("reasoning_effort") or job["effort"],
                 workspace=job_workspace,
                 streamer=custom_streamer(kind),
             )
@@ -499,7 +502,7 @@ async def _execute_job(job_id: str) -> None:
                 settings=provider_settings,
                 conversation_id=job["conversation_id"],
                 user_timezone=job.get("timezone") or "UTC",
-                effort=job["effort"],
+                effort=provider_settings.get("reasoning_effort") or job["effort"],
                 workspace=job_workspace,
             )
         else:

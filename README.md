@@ -18,7 +18,7 @@
 - 最多 3 个账号，管理员可在前端新增或删除账号
 - 各账号的对话和 API 配置相互隔离
 - 前端测试 API、读取 `/models` 全部模型并勾选、手动填写模型名、重新编辑已保存 API 的模型列表、删除 API
-- Custom 参数：所有模型均可开关 `thinking`，可独立开关 `reasoning_effort` 并使用顶部 Low/Medium/High/Extra High/Max 五档，另有普通采样参数、默认 65,536 的生成上限和联网方案切换
+- Custom 参数：每个模型均可独立设置 `thinking`、`reasoning_effort`（Low/Medium/High/Extra High/Max 五档）及开关，另有普通采样参数、默认 65,536 的生成上限和联网方案切换
 - Custom 匿名联网方案：Parallel Search + Fetch、Keenable Search + Live Fetch、Tavily Keyless Search + Extract、Firecrawl Keyless Search + Scrape、You Search + Jina Fetch、DDG Search + Jina Fetch
 - SQLite 单文件数据库、自签 HTTPS、systemd 守护
 - 手机和桌面端响应式界面
@@ -87,7 +87,7 @@ Custom 每个工具轮最多执行 1 个工具，最多 6 个工具轮；每个�
 
 前端发起问题时会同时提交浏览器的 IANA 时区（如 `Asia/Shanghai`）。后端只把“当前本地日期 + 时区”追加到 Custom 的固定系统提示词末尾，并要求模型把“今天、昨天、明天、目前、最新”等相对时间转换为绝对日期，核对来源的发布/事件日期，禁止把搜索返回的最新一篇误当作当天资料。日期每天只变化一次，且放在静态提示之后，以尽量保留固定前缀的缓存价值；旧客户端未提交时区时使用 UTC。
 
-Custom 的 `thinking` 和 `reasoning_effort` 都由用户控制：`thinking` 开/关会发送给每个模型，`reasoning_effort` 有独立开关，开启时使用顶部 Low、Medium、High、Extra High 或 Max，默认 High，浏览器会记住每个账号最后选择的档位。MiMo、NVIDIA DeepSeek V4 和 NVIDIA Nemotron 3 Ultra 使用其官方请求方言，其他 Custom 使用通用顶层 `thinking` / `reasoning_effort`；OpenAI 兼容协议本身并未标准化这两个扩展字段，因此不兼容的供应商可能返回参数错误，此时可在 Custom 参数中分别关闭。后端兼容解析 `reasoning` / `reasoning_content` 输出。工具额度结束后，后端会强制进入最终作答阶段；模型若把工具请求伪装成 `<tool_call>` 文本，该输出不会被保存为答案，而会进行一次受限纠正。
+Custom 的 `thinking` 和 `reasoning_effort` 都由用户控制：每个模型在“Custom 参数”中独立保存 `thinking` 开/关、`reasoning_effort` 档位和发送开关，档位为 Low、Medium、High、Extra High 或 Max，默认 High。DeepSeek 仍使用顶部推理档位。MiMo、NVIDIA DeepSeek V4 和 NVIDIA Nemotron 3 Ultra 使用其官方请求方言，其他 Custom 使用通用顶层 `thinking` / `reasoning_effort`；OpenAI 兼容协议本身并未标准化这两个扩展字段，因此不兼容的供应商可能返回参数错误，此时可在 Custom 参数中分别关闭。后端兼容解析 `reasoning` / `reasoning_content` 输出。工具额度结束后，后端会强制进入最终作答阶段；模型若把工具请求伪装成 `<tool_call>` 文本，该输出不会被保存为答案，而会进行一次受限纠正。
 
 备用方案的 `fetch_webpage` 把公开 URL 交给 `https://r.jina.ai/`，得到干净 Markdown 后作为 `tool` 结果回传给 Custom。Jina Reader 不需要 API Key；后端按约 20 次/分钟做进程级节流，每个回答最多读取 3 页，每页最多保留约 8,000 字符，并设置 `X-Respond-With: markdown`、`X-Timeout: 30` 和 `X-Remove-Selector`，自动移除常见 header、nav、aside、footer、sidebar、菜单、广告和 cookie 弹窗元素。Jina 官方支持通过 `X-Remove-Selector` 排除这些 CSS 选择器；如果目标站点有明确的文章容器，后续还可以针对该站点增加 `X-Target-Selector`。
 

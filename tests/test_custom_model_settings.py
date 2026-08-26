@@ -92,10 +92,11 @@ class CustomModelSettingsTests(unittest.TestCase):
             ),
         )
 
-    def settings_body(self, model: str, *, temperature: float, backend: str) -> dict:
+    def settings_body(self, model: str, *, temperature: float, backend: str, effort: str = "high") -> dict:
         return {
             "model": model,
             "thinking": "enabled",
+            "reasoning_effort": effort,
             "reasoning_effort_enabled": True,
             "dsml_fallback_enabled": False,
             "max_completion_tokens": 8192,
@@ -121,6 +122,8 @@ class CustomModelSettingsTests(unittest.TestCase):
         self.assertEqual(set(stored), {"models", "model_settings"})
         self.assertEqual(stored["model_settings"]["model-a"]["temperature"], 0.4)
         self.assertEqual(stored["model_settings"]["model-b"]["temperature"], 0.4)
+        self.assertEqual(stored["model_settings"]["model-a"]["reasoning_effort"], "high")
+        self.assertEqual(stored["model_settings"]["model-b"]["reasoning_effort"], "high")
 
         response = self.client.put(
             f"/api/providers/{provider_id}/settings",
@@ -149,9 +152,17 @@ class CustomModelSettingsTests(unittest.TestCase):
         main.migrate_custom_provider_settings()
         response = self.client.put(
             f"/api/providers/{provider_id}/settings",
-            json=self.settings_body("model-a", temperature=1.1, backend="parallel"),
+            json=self.settings_body("model-a", temperature=1.1, backend="parallel", effort="xhigh"),
         )
         self.assertEqual(response.status_code, 200, response.text)
+        response = self.client.put(
+            f"/api/providers/{provider_id}/settings",
+            json=self.settings_body("model-b", temperature=0.7, backend="parallel", effort="low"),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        provider = response.json()
+        self.assertEqual(provider["model_settings"]["model-a"]["reasoning_effort"], "xhigh")
+        self.assertEqual(provider["model_settings"]["model-b"]["reasoning_effort"], "low")
         calls: list[dict] = []
 
         async def fake_custom_stream_response(**kwargs):
@@ -169,7 +180,9 @@ class CustomModelSettingsTests(unittest.TestCase):
                     "content": "offline test",
                     "provider_id": provider_id,
                     "model": "model-b",
-                    "effort": "high",
+                    # The legacy request field is intentionally different;
+                    # Custom execution must use model-b's saved setting.
+                    "effort": "xhigh",
                     "timezone": "UTC",
                 },
             )
@@ -178,8 +191,10 @@ class CustomModelSettingsTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["model"], "model-b")
-        self.assertEqual(calls[0]["settings"]["temperature"], 0.4)
-        self.assertEqual(calls[0]["settings"]["web_tool_backend"], "you")
+        self.assertEqual(calls[0]["settings"]["temperature"], 0.7)
+        self.assertEqual(calls[0]["settings"]["web_tool_backend"], "parallel")
+        self.assertEqual(calls[0]["settings"]["reasoning_effort"], "low")
+        self.assertEqual(calls[0]["effort"], "low")
         self.assertNotEqual(calls[0]["settings"]["temperature"], 1.1)
 
     def test_settings_reject_a_model_not_enabled_for_the_api(self) -> None:
