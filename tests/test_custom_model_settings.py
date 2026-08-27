@@ -69,6 +69,7 @@ class CustomModelSettingsTests(unittest.TestCase):
         settings = {
             "models": ["model-a", "model-b"],
             "thinking": "disabled",
+            "thinking_budget_tokens": 4096,
             "reasoning_effort_enabled": False,
             "dsml_fallback_enabled": True,
             "max_completion_tokens": 4096,
@@ -125,6 +126,7 @@ class CustomModelSettingsTests(unittest.TestCase):
         self.assertEqual(stored["model_settings"]["model-b"]["temperature"], 0.4)
         self.assertEqual(stored["model_settings"]["model-a"]["reasoning_effort"], "high")
         self.assertEqual(stored["model_settings"]["model-b"]["reasoning_effort"], "high")
+        self.assertNotIn("thinking_budget_tokens", stored["model_settings"]["model-a"])
         self.assertEqual(stored["model_settings"]["model-a"]["lowest_price_aggregators"], [])
         self.assertEqual(stored["model_settings"]["model-b"]["lowest_price_aggregators"], [])
 

@@ -179,7 +179,7 @@
     <form id="customForm" class="form-grid">
       <label>思考模式<select id="customThinking"><option value="enabled">开启</option><option value="disabled">关闭</option></select></label>
       <label>推理强度<select id="customReasoningEffort" aria-label="Custom reasoning effort"><option value="low">低</option><option value="medium">中</option><option value="high" selected>高</option><option value="xhigh">很高</option><option value="max">最大</option></select></label>
-      <label class="check"><input id="customReasoningEffortEnabled" type="checkbox" checked> 发送 reasoning_effort</label>
+      <label class="check"><input id="customReasoningEffortEnabled" type="checkbox" checked> 发送推理强度</label>
       <div class="wide custom-models-panel custom-routing-panel">
         <div class="custom-models-head"><strong>最低价路由（手动选择聚合商）</strong></div>
         <label class="check"><input id="customLowestPriceOpenRouter" type="checkbox"> OpenRouter（追加 <code>:floor</code>）</label>
@@ -230,6 +230,6 @@
 
   <div id="toast" class="toast"></div>
   <script src="/assets/vendor/katex/katex.min.js" defer></script>
-  <script src="/assets/app.js?v=20260823-provider-type" defer></script>
+  <script src="/assets/app.js?v=20260827-anthropic-adaptive" defer></script>
 </body>
 </html>

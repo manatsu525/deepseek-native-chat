@@ -869,12 +869,12 @@ async def stream_response(
                     "stream": True,
                 }
                 if config["thinking"] == "enabled":
-                    if max_tokens <= 1024:
-                        raise ValueError("Messages 开启 thinking 时，最大生成 Token 必须大于 1024")
-                    payload["thinking"] = {
-                        "type": "enabled",
-                        "budget_tokens": min(16384, max_tokens - 1),
-                    }
+                    # Claude adaptive thinking uses the same reasoning-level
+                    # setting as the other Custom protocols. The deprecated
+                    # manual budget setting is intentionally omitted.
+                    payload["thinking"] = {"type": "adaptive"}
+                    if bool(config.get("reasoning_effort_enabled", True)):
+                        payload["output_config"] = {"effort": normalize_reasoning_effort(effort)}
                 else:
                     payload["thinking"] = {"type": "disabled"}
                     payload["temperature"] = float(config["temperature"])
