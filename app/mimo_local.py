@@ -48,6 +48,7 @@ from .mimo import (
     _user_urls,
     _normalize_usage,
     _url,
+    custom_output_token_field,
     is_mimo_model,
 )
 from .parallel_mcp import ParallelMCPClient
@@ -842,11 +843,12 @@ async def stream_response(
                 ]
             responses_protocol = api_protocol == "responses"
             messages_protocol = api_protocol == "messages"
+            output_token_field = custom_output_token_field(api_protocol)
             if responses_protocol:
                 payload = {
                     "model": model,
                     "input": _responses_input(request_messages),
-                    "max_output_tokens": int(config["max_completion_tokens"]),
+                    output_token_field: int(config["max_completion_tokens"]),
                     "stream": True,
                 }
                 if bool(config.get("reasoning_effort_enabled", True)):
@@ -863,7 +865,7 @@ async def stream_response(
                     "model": model,
                     "system": system_value,
                     "messages": anthropic_history,
-                    "max_tokens": max_tokens,
+                    output_token_field: max_tokens,
                     "stream": True,
                 }
                 if config["thinking"] == "enabled":
@@ -884,9 +886,7 @@ async def stream_response(
                 payload = {
                     "model": model,
                     "messages": request_messages,
-                    # Older MiMo gateways use max_completion_tokens; the generic
-                    # OpenAI-compatible spelling remains max_tokens.
-                    "max_completion_tokens" if mimo_model else "max_tokens": int(config["max_completion_tokens"]),
+                    output_token_field: int(config["max_completion_tokens"]),
                     "stream": True,
                 }
                 _apply_thinking_options(

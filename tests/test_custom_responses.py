@@ -2,10 +2,16 @@ import unittest
 from unittest.mock import patch
 
 from app import main
+from app.mimo import custom_output_token_field
 from app.mimo_local import _normalize_responses_usage, _responses_input, _responses_tools
 
 
 class CustomResponsesProtocolTests(unittest.TestCase):
+    def test_output_token_field_matches_each_custom_protocol(self) -> None:
+        self.assertEqual(custom_output_token_field("chat_completions"), "max_completion_tokens")
+        self.assertEqual(custom_output_token_field("responses"), "max_output_tokens")
+        self.assertEqual(custom_output_token_field("messages"), "max_tokens")
+
     def test_provider_type_is_independent_custom_protocol(self) -> None:
         self.assertTrue(main.is_custom_provider("custom"))
         self.assertTrue(main.is_custom_provider("custom_response"))
@@ -79,7 +85,46 @@ class CustomResponsesConnectionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(captured["url"].endswith("/responses"))
         self.assertEqual(captured["json"]["max_output_tokens"], 16)
+        self.assertNotIn("max_tokens", captured["json"])
         self.assertEqual(captured["json"]["input"], "Reply only OK")
+
+    async def test_manual_chat_and_anthropic_probes_use_their_protocol_fields(self) -> None:
+        captured: list[dict] = []
+
+        class Response:
+            status_code = 200
+
+        class Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def post(self, url, *, headers, json):
+                captured.append({"url": url, "headers": headers, "json": json})
+                return Response()
+
+        with patch.object(main.httpx, "AsyncClient", return_value=Client()):
+            await main.test_custom_model(
+                "https://provider.invalid/v1",
+                "chat-test-key",
+                "xiaomi/mimo-v2.5:thinking",
+                api_protocol="chat_completions",
+            )
+            await main.test_custom_model(
+                "https://provider.invalid/v1",
+                "anthropic-test-key",
+                "claude-sonnet-4-6",
+                api_protocol="messages",
+            )
+
+        self.assertTrue(captured[0]["url"].endswith("/chat/completions"))
+        self.assertEqual(captured[0]["json"]["max_completion_tokens"], 1)
+        self.assertNotIn("max_tokens", captured[0]["json"])
+        self.assertTrue(captured[1]["url"].endswith("/messages"))
+        self.assertEqual(captured[1]["json"]["max_tokens"], 1)
+        self.assertNotIn("max_completion_tokens", captured[1]["json"])
 
 
 if __name__ == "__main__":

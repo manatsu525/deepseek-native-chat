@@ -126,6 +126,21 @@ def is_mimo_model(value: Any) -> bool:
     return model.startswith("mimo-")
 
 
+def custom_output_token_field(api_protocol: str) -> str:
+    """Return the output-token field for a Custom provider protocol.
+
+    Custom Chat Completions follow OpenAI's current spelling. Responses use
+    the Responses-specific field, while Anthropic Messages keeps its native
+    ``max_tokens`` field.
+    """
+    protocol = str(api_protocol or "chat_completions").strip().casefold()
+    if protocol == "responses":
+        return "max_output_tokens"
+    if protocol == "messages":
+        return "max_tokens"
+    return "max_completion_tokens"
+
+
 def _settings(value: dict[str, Any] | None) -> dict[str, Any]:
     result = dict(DEFAULT_SETTINGS)
     if value:

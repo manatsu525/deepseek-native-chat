@@ -28,7 +28,14 @@ from .deepseek import stream_response as deepseek_stream_response
 from .custom_responses import stream_response as custom_responses_stream_response
 from .custom_messages import stream_response as custom_messages_stream_response
 from .mimo import DEFAULT_SETTINGS as CUSTOM_DEFAULT_SETTINGS
-from .mimo import LOWEST_PRICE_AGGREGATORS, MIMO_MAX_COMPLETION_TOKENS, custom_auth_headers, is_mimo_model, list_models as custom_list_models
+from .mimo import (
+    LOWEST_PRICE_AGGREGATORS,
+    MIMO_MAX_COMPLETION_TOKENS,
+    custom_auth_headers,
+    custom_output_token_field,
+    is_mimo_model,
+    list_models as custom_list_models,
+)
 from .mimo_local import stream_response as custom_stream_response
 from .multi_agent import run_collaboration
 from .reasoning_effort import DEFAULT as DEFAULT_REASONING_EFFORT
@@ -862,15 +869,15 @@ def provider_api_key(
 async def test_custom_model(base_url: str, api_key: str, model: str, *, api_protocol: str = "chat_completions") -> None:
     """Validate a manually entered model with a minimal protocol-appropriate request."""
     mimo_model = is_mimo_model(model)
-    token_field = "max_completion_tokens" if mimo_model else "max_tokens"
+    token_field = custom_output_token_field(api_protocol)
     if api_protocol == "responses":
         # OpenAI accepts this small value, while aggregators such as NanoGPT
         # enforce a protocol minimum of 16 output tokens even for a connection
         # test. The instruction keeps actual generation much shorter.
-        payload = {"model": model, "input": "Reply only OK", "max_output_tokens": 16, "stream": False}
+        payload = {"model": model, "input": "Reply only OK", token_field: 16, "stream": False}
         endpoint = "/responses"
     elif api_protocol == "messages":
-        payload = {"model": model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 1, "stream": False}
+        payload = {"model": model, "messages": [{"role": "user", "content": "Reply OK"}], token_field: 1, "stream": False}
         endpoint = "/messages"
     else:
         payload = {
