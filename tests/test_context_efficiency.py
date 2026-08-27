@@ -12,13 +12,50 @@ from app import mimo_local
 from app.mimo_local import (
     AGENT_CONTEXT_COMPACT_THRESHOLD,
     _compact_workspace_call_arguments,
+    _final_answer_prompt,
     _maybe_compact_agent_context,
+    _select_round_tool_calls,
     stream_response,
 )
 from app.workspace import ConversationWorkspace
 
 
 class ContextEfficiencyTests(unittest.TestCase):
+    def test_final_answer_prompt_describes_enabled_tool_families(self) -> None:
+        all_tools = _final_answer_prompt(web_enabled=True, workspace_enabled=True)
+        self.assertIn("工具调用额度已经全部耗尽；搜索、网页读取和工作区文件操作均已不可用", all_tools)
+        self.assertIn(
+            "Unavailable tools now: search, webpage-reading, workspace file operations.",
+            all_tools,
+        )
+
+        workspace_only = _final_answer_prompt(web_enabled=False, workspace_enabled=True)
+        self.assertIn("工作区文件操作均已不可用", workspace_only)
+        self.assertNotIn("搜索、网页读取和工作区文件操作", workspace_only)
+
+    def test_round_selector_keeps_workspace_calls_and_one_web_call(self) -> None:
+        def call(call_id: str, name: str) -> dict:
+            return {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": "{}"},
+            }
+
+        calls = [
+            call("web-1", "web_search"),
+            call("read-1", "read_file"),
+            call("fetch-1", "fetch_webpage"),
+            call("write-1", "write_file"),
+            call("web-2", "web_search"),
+            call("patch-1", "apply_line_edits"),
+        ]
+        selected = _select_round_tool_calls(calls, {})
+        self.assertEqual(
+            [item["function"]["name"] for item in selected],
+            ["web_search", "read_file", "write_file", "apply_line_edits"],
+        )
+
+
     def test_xai_chat_uses_stable_conversation_routing(self) -> None:
         headers = custom_auth_headers(
             "secret",
@@ -249,6 +286,103 @@ class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(read_trace["returned_from_line"], 1)
         self.assertEqual(read_trace["returned_through_line"], 1)
         self.assertFalse(read_trace["truncated"])
+
+
+    async def test_multiple_workspace_calls_run_in_one_model_round(self) -> None:
+        def tool_response(calls: list[tuple[str, str, dict]]) -> list[str]:
+            event_calls = []
+            for index, (call_id, name, arguments) in enumerate(calls):
+                event_calls.append(
+                    {
+                        "index": index,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(arguments)},
+                    }
+                )
+            event = {"choices": [{"delta": {"tool_calls": event_calls}}]}
+            return ["data: " + json.dumps(event), "data: [DONE]"]
+
+        class FakeResponse:
+            status_code = 200
+
+            def __init__(self, lines: list[str]) -> None:
+                self.lines = lines
+
+            async def aiter_lines(self):
+                for line in self.lines:
+                    yield line
+
+            async def aread(self) -> bytes:
+                return b""
+
+        class FakeStreamContext:
+            def __init__(self, lines: list[str]) -> None:
+                self.response = FakeResponse(lines)
+
+            async def __aenter__(self):
+                return self.response
+
+            async def __aexit__(self, *_):
+                return False
+
+        responses = [
+            tool_response(
+                [
+                    ("write-1", "write_file", {"path": "one.txt", "content": "one"}),
+                    ("write-2", "write_file", {"path": "two.txt", "content": "two"}),
+                ]
+            ),
+            ["data: " + json.dumps({"choices": [{"delta": {"content": "完成"}}]}), "data: [DONE]"],
+        ]
+
+        class FakeAsyncClient:
+            calls = 0
+
+            def __init__(self, **_):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            def stream(self, *_args, **_kwargs):
+                type(self).calls += 1
+                return FakeStreamContext(responses.pop(0))
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "multi-call")
+            workspace.root = Path(directory)
+
+            async def update(_):
+                return None
+
+            with patch.object(mimo_local.httpx, "AsyncClient", FakeAsyncClient):
+                result = await stream_response(
+                    base_url="https://example.test/v1",
+                    api_key="test-key",
+                    model="test-model",
+                    messages=[{"role": "user", "content": "创建两个文件"}],
+                    timeout=30,
+                    stopped=lambda: False,
+                    update=update,
+                    settings={"thinking": "disabled", "max_completion_tokens": 1024},
+                    conversation_id="multi-call",
+                    workspace=workspace,
+                    web_enabled=False,
+                )
+
+            self.assertEqual((workspace.root / "one.txt").read_text(), "one")
+            self.assertEqual((workspace.root / "two.txt").read_text(), "two")
+
+        self.assertEqual(FakeAsyncClient.calls, 2)
+        self.assertEqual(result["answer"], "完成")
+        self.assertEqual(
+            [item["name"] for item in result["tool_trace"]],
+            ["write_file", "write_file"],
+        )
 
 
 if __name__ == "__main__":
