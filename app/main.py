@@ -521,8 +521,11 @@ async def _execute_job(job_id: str) -> None:
                 conversation_id=job["conversation_id"],
                 user_timezone=job.get("timezone") or "UTC",
                 effort=provider_settings.get("reasoning_effort") or job["effort"],
-                workspace=None,
-                workspace_access="none",
+                # Agent keeps root host access through extra_tools while also
+                # exposing the current conversation workspace for deliverables
+                # that must appear in the UI's workspace panel.
+                workspace=job_workspace,
+                workspace_access="full",
                 agent_mode=True,
                 extra_tools=runtime.tool_definitions,
                 extra_tool_handler=runtime.execute,
