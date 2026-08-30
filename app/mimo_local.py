@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import uuid
 from collections.abc import Awaitable, Callable
@@ -94,23 +93,6 @@ WORKSPACE_ARGUMENT_COMPACT_THRESHOLD = 4096
 FRESH_WRITE_CONTEXT_THRESHOLD = 60_000
 AGENT_CONTEXT_COMPACT_THRESHOLD = 80_000
 WORKSPACE_MUTATION_TOOLS = {"write_file", "apply_line_edits", "apply_patch", "apply_patch_batch", "delete_file"}
-# Agent host tools are intentionally broad, so a model can keep emitting a
-# valid-looking read/validation call even after the requested edit is done.
-# Stop that kind of no-progress loop after a small number of consecutive
-# effective no-ops, while leaving ordinary chat/workspace scheduling intact.
-AGENT_NO_PROGRESS_LIMIT = 3
-AGENT_STATE_MUTATION_TOOLS = {
-    "host_write_file",
-    "host_apply_patch",
-    "host_delete_path",
-    "frontend_write_page",
-    "skill_install",
-    "skill_enable",
-    "skill_remove",
-    "conversation_create",
-    "conversation_rename",
-    "conversation_delete",
-}
 FINAL_ANSWER_PROMPT = (
     "CRITICAL FINALIZATION INSTRUCTION: The tool-call budget is completely exhausted. "
     "Requesting another tool cannot succeed. You MUST stop using tools and answer the "
@@ -119,51 +101,6 @@ FINAL_ANSWER_PROMPT = (
     "or prose saying that you will search/read next. Even if the evidence is incomplete or "
     "a previous tool failed, provide the best supported answer now and state the uncertainty explicitly."
 )
-
-
-def _agent_tool_signature(name: str, arguments: dict[str, Any], result_text: str, status: str) -> str:
-    """Return a compact signature for detecting repeated host operations.
-
-    Host reads and command output can be large. Hashing large string values
-    keeps the detector cheap without placing another copy of full file
-    contents in the long-lived loop state.
-    """
-    compact_arguments: dict[str, Any] = {}
-    for key, value in arguments.items():
-        if isinstance(value, str) and len(value) > WORKSPACE_ARGUMENT_COMPACT_THRESHOLD:
-            encoded = value.encode("utf-8", errors="replace")
-            compact_arguments[key] = {
-                "sha256": hashlib.sha256(encoded).hexdigest(),
-                "length": len(value),
-            }
-        else:
-            compact_arguments[key] = value
-    result_digest = hashlib.sha256(result_text.encode("utf-8", errors="replace")).hexdigest()
-    payload = json.dumps(
-        [name, compact_arguments, status, result_digest],
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _agent_tool_changed_state(name: str, arguments: dict[str, Any], result_text: str, status: str) -> bool:
-    """Identify successful Agent calls that should reset the no-progress streak."""
-    if status != "completed" or name not in AGENT_STATE_MUTATION_TOOLS:
-        return False
-    try:
-        result = json.loads(result_text)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return False
-    if not isinstance(result, dict) or result.get("ok") is not True:
-        return False
-    if result.get("unchanged") or result.get("skipped"):
-        return False
-    if name == "host_apply_patch" and str(arguments.get("old_text") or "") == str(arguments.get("new_text") or ""):
-        return False
-    return True
 
 
 def _final_answer_prompt(
@@ -558,7 +495,13 @@ def _responses_content(content: Any, role: str) -> Any:
 
 
 def _responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert the agent's internal Chat history into Responses API input."""
+    """Convert internal history while preserving native Responses output items.
+
+    Reasoning models can return hidden ``reasoning`` items alongside function
+    calls. When context is managed manually, those output items must be sent
+    back unchanged on the next request; reconstructing only assistant text and
+    function calls discards the model's tool-turn reasoning state.
+    """
     result: list[dict[str, Any]] = []
     for message in messages:
         role = str(message.get("role") or "user")
@@ -573,14 +516,30 @@ def _responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         tool_calls = message.get("tool_calls") or []
         content = message.get("content")
-        if content not in (None, "", []):
+        raw_output_items = [
+            dict(item)
+            for item in message.get("responses_output_items") or []
+            if isinstance(item, dict) and item.get("type")
+        ]
+        if raw_output_items:
+            result.extend(raw_output_items)
+        raw_has_message = any(item.get("type") == "message" for item in raw_output_items)
+        raw_call_ids = {
+            str(item.get("call_id") or item.get("id") or "")
+            for item in raw_output_items
+            if item.get("type") == "function_call"
+        }
+        if content not in (None, "", []) and not raw_has_message:
             result.append({"role": role, "content": _responses_content(content, role)})
         for call in tool_calls:
             function = call.get("function") or {}
+            call_id = str(call.get("id") or "")
+            if call_id in raw_call_ids:
+                continue
             result.append(
                 {
                     "type": "function_call",
-                    "call_id": str(call.get("id") or ""),
+                    "call_id": call_id,
                     "name": str(function.get("name") or ""),
                     "arguments": str(function.get("arguments") or "{}"),
                 }
@@ -830,10 +789,6 @@ async def stream_response(
     workspace_validations: set[tuple[int, str]] = set()
     workspace_list_generations: set[int] = set()
     workspace_generation = 0
-    agent_mutation_seen = False
-    agent_no_progress_streak = 0
-    agent_last_signature = ""
-    agent_no_progress_triggered = False
     parallel_session_id = (f"conversation_{conversation_id}" if conversation_id else f"response_{uuid.uuid4().hex}")[:100]
     last_search_objective = ""
     last_search_queries: list[str] = []
@@ -914,9 +869,7 @@ async def stream_response(
             request_messages = conversation
             if final_answer_only:
                 retry_note = (
-                    " A no-progress circuit breaker stopped further Agent operations; summarize what was completed and what remains."
-                    if agent_no_progress_triggered
-                    else " Your preceding finalization attempt still tried to call a tool and was discarded."
+                    " Your preceding finalization attempt still tried to call a tool and was discarded."
                     if final_answer_attempts
                     else ""
                 )
@@ -944,6 +897,11 @@ async def stream_response(
                 }
                 if bool(config.get("reasoning_effort_enabled", True)):
                     payload["reasoning"] = {"effort": normalize_reasoning_effort(effort)}
+                    # This client manages tool-turn context manually instead
+                    # of relying on previous_response_id. Request the opaque
+                    # reasoning state so hidden-reasoning models can continue
+                    # the same plan after a function_call_output.
+                    payload["include"] = ["reasoning.encrypted_content"]
                 payload["temperature"] = float(config["temperature"])
                 payload["top_p"] = float(config["top_p"])
                 if round_tools:
@@ -1004,6 +962,7 @@ async def stream_response(
             anthropic_usage: dict[str, Any] = {}
             anthropic_thinking_blocks: dict[int, dict[str, Any]] = {}
             round_tools_by_index: dict[int, dict[str, Any]] = {}
+            responses_output_items_by_index: dict[int, dict[str, Any]] = {}
             markup_stream = (
                 InklingStreamBuffer()
                 if inkling_compat_active
@@ -1039,7 +998,12 @@ async def stream_response(
                     event_type = str(data.get("type") or "")
                     raw_usage = data.get("usage")
                     if event_type in {"response.completed", "response.incomplete"}:
-                        raw_usage = (data.get("response") or {}).get("usage") or raw_usage
+                        completed_response = data.get("response") or {}
+                        raw_usage = completed_response.get("usage") or raw_usage
+                        if responses_protocol:
+                            for output_index, output_item in enumerate(completed_response.get("output") or []):
+                                if isinstance(output_item, dict) and output_item.get("type"):
+                                    responses_output_items_by_index[output_index] = dict(output_item)
                     if messages_protocol and event_type == "message_start":
                         raw_usage = (data.get("message") or {}).get("usage") or raw_usage
                     if isinstance(raw_usage, dict):
@@ -1058,8 +1022,10 @@ async def stream_response(
                             round_reasoning += str(data.get("delta") or "")
                         elif event_type in {"response.output_item.added", "response.output_item.done"}:
                             item = data.get("item") or {}
+                            index = int(data.get("output_index") or 0)
+                            if event_type == "response.output_item.done" and isinstance(item, dict) and item.get("type"):
+                                responses_output_items_by_index[index] = dict(item)
                             if item.get("type") == "function_call":
-                                index = int(data.get("output_index") or 0)
                                 current = round_tools_by_index.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
                                 current["id"] = str(item.get("call_id") or item.get("id") or current.get("id") or "")
                                 current["function"]["name"] = str(item.get("name") or current["function"].get("name") or "")
@@ -1209,6 +1175,11 @@ async def stream_response(
             if messages_protocol and anthropic_thinking_blocks:
                 assistant_message["anthropic_thinking_blocks"] = [
                     anthropic_thinking_blocks[index] for index in sorted(anthropic_thinking_blocks)
+                ]
+            if responses_protocol and responses_output_items_by_index:
+                assistant_message["responses_output_items"] = [
+                    responses_output_items_by_index[index]
+                    for index in sorted(responses_output_items_by_index)
                 ]
             conversation.append(assistant_message)
             tool_rounds_used += 1
@@ -1629,34 +1600,6 @@ async def stream_response(
                             trace_item[field] = step[field]
                 tool_trace.append(trace_item)
                 conversation.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
-                if agent_mode and is_extra:
-                    signature = _agent_tool_signature(name, arguments, result_text, step["status"])
-                    changed_state = _agent_tool_changed_state(name, arguments, result_text, step["status"])
-                    if changed_state and signature != agent_last_signature:
-                        agent_mutation_seen = True
-                        agent_no_progress_streak = 0
-                    elif agent_mutation_seen:
-                        # Once an edit has happened, three consecutive host
-                        # operations without another effective state change
-                        # are treated as an Agent no-progress loop. This is
-                        # deliberately based on state change, not on the
-                        # model's wording, so repeated reads and validations
-                        # cannot keep the loop alive with different text.
-                        agent_no_progress_streak += 1
-                    else:
-                        # Before the first mutation, permit normal discovery
-                        # (listing/reading/searching). Repeated identical
-                        # calls are still bounded so read-only Agent tasks
-                        # cannot spin forever.
-                        agent_no_progress_streak = (
-                            agent_no_progress_streak + 1
-                            if signature == agent_last_signature
-                            else 0
-                        )
-                    agent_last_signature = signature
-                    if agent_no_progress_streak >= AGENT_NO_PROGRESS_LIMIT:
-                        agent_no_progress_triggered = True
-                        force_final_answer = True
                 await update(
                     {
                         "answer": answer,
