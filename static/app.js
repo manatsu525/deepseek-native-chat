@@ -30,7 +30,7 @@ function storeValue(name, value) {
   } catch {}
 }
 function setChatMode(value,persist=true){
-  const mode=value==='multi_agent'?'multi_agent':'standard';
+  const mode=value==='agent'?'agent':'standard';
   if(state.job&&['queued','running'].includes(state.job.status)){toast('请先停止当前回答再切换模式');return false}
   state.chatMode=mode;if(persist)storeValue('chat-mode',mode);
   $$('[data-chat-mode]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.chatMode===mode)));
@@ -369,12 +369,13 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
   const searches = meta.searches || [];
   if (!reasoning && !searches.length && !active) return '';
   const status = active ? '进行中' : (meta.stopped ? '已停止' : '已完成');
+  const agentLabels={host_list_files:'列出主机文件',host_read_file:'读取主机文件',host_write_file:'写入主机文件',host_apply_patch:'修改主机文件',host_search_files:'搜索主机文件',host_run_command:'运行主机命令',host_delete_path:'删除主机路径',conversation_list:'列出对话',conversation_read:'读取对话',conversation_create:'创建对话',conversation_rename:'重命名对话',conversation_delete:'删除对话',skill_list:'列出 Skill',skill_read:'读取 Skill',skill_install:'安装 Skill',skill_enable:'启用/禁用 Skill',skill_remove:'删除 Skill',frontend_list_pages:'列出前端页面',frontend_read_page:'读取前端页面',frontend_write_page:'写入前端页面',frontend_validate_page:'检查前端页面'};
   const searchHtml = searches.map((s,i) => {
     const workspaceLabels={list_files:'列出文件',read_file:'读取文件',write_file:'写入文件',apply_patch:'修改文件',apply_patch_batch:'批量修改文件',search_files:'搜索文件',delete_file:'删除文件',run_python:'运行 Python',check_web_syntax:'检查网页语法'};
-    const label=s.action==='workspace'?(workspaceLabels[s.tool]||'工作区操作'):s.action==='open_page'?'读取网页':'联网搜索';
+    const label=s.action==='workspace'?(workspaceLabels[s.tool]||'工作区操作'):s.action==='agent'?(agentLabels[s.tool]||s.tool||'Agent 操作'):s.action==='open_page'?'读取网页':'联网搜索';
     const searchKey=`${detailKey}-search-${s.id || i}`;
     const searchOpen=detailState.get(searchKey) ? ' open' : '';
-    const detail=s.action==='workspace'?escapeHtml(s.path||'工作区'):s.url?`<a href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(s.url)}</a>`:escapeHtml(Array.isArray(s.query)?s.query.filter(x=>!String(x).startsWith('ws_call_id=')).join('；'):(s.query||'DeepSeek 未返回查询词'));
+    const detail=s.action==='workspace'||s.action==='agent'?escapeHtml(s.path||s.query||(s.action==='agent'?'Agent 操作':'工作区')):s.url?`<a href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(s.url)}</a>`:escapeHtml(Array.isArray(s.query)?s.query.filter(x=>!String(x).startsWith('ws_call_id=')).join('；'):(s.query||'DeepSeek 未返回查询词'));
     const error=s.error?`<div class="search-error">${escapeHtml(s.error)}</div>`:'';
     const statusLabels={running:'进行中',searching:'搜索中',completed:'已完成',failed:'失败',rejected:'已拒绝',skipped:'已跳过'};
     return `<details class="search-step" data-detail-key="${escapeHtml(searchKey)}"${searchOpen}><summary>${label} ${i+1} · ${escapeHtml(statusLabels[s.status] || s.status || '已完成')}</summary><div class="search-detail">${detail}${error}</div></details>`;
@@ -383,7 +384,8 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
   const searchCount=searches.filter(item=>item.action==='search').length;
   const readCount=searches.filter(item=>item.action==='open_page'&&item.status==='completed').length;
   const fileCount=searches.filter(item=>item.action==='workspace').length;
-  const activity=`${searchCount ? ` · ${searchCount} 次搜索` : ''}${readCount ? ` · ${readCount} 次读取` : ''}${fileCount ? ` · ${fileCount} 次文件操作` : ''}`;
+  const agentCount=searches.filter(item=>item.action==='agent').length;
+  const activity=`${searchCount ? ` · ${searchCount} 次搜索` : ''}${readCount ? ` · ${readCount} 次读取` : ''}${fileCount ? ` · ${fileCount} 次文件操作` : ''}${agentCount ? ` · ${agentCount} 次 Agent 操作` : ''}`;
   return `<details class="trace" data-detail-key="${escapeHtml(detailKey)}"${traceOpen}><summary>思考与工具 · ${status}${activity}</summary><div class="trace-body">${reasoning ? `<div class="reasoning-text" data-scroll-key="${escapeHtml(detailKey)}-reasoning">${escapeHtml(reasoning)}</div>` : active ? '<div class="typing"><i></i><i></i><i></i></div>' : ''}${searchHtml}</div></details>`;
 }
 
@@ -412,23 +414,6 @@ function workspaceArtifactsHtml(meta={}) {
   return `<div class="message-workspace"><div class="message-workspace-head"><span>工作区文件 · ${files.length}</span><a data-workspace-download href="/api/conversations/${encodeURIComponent(conversationId)}/workspace.zip" target="_blank" rel="noopener">下载全部 ZIP</a></div><div class="message-workspace-files">${links}</div></div>`;
 }
 
-function agentRunsHtml(meta={},active=false,detailKey='trace'){
-  if(meta.chat_mode!=='multi_agent')return '';
-  const agents=Array.isArray(meta.agents)?meta.agents:[];
-  const statusLabels={running:'工作中',completed:'已完成',failed:'失败',stopped:'已停止'};
-  const actionLabels={research:'调研',program:'编程',inspect:'检查',finish:'结束'};
-  const toolLabels={list_files:'列出文件',read_file:'读取文件',write_file:'写入文件',apply_line_edits:'局部修改',apply_patch:'修改文件',apply_patch_batch:'批量修改',search_files:'搜索文件',delete_file:'删除文件',run_python:'运行 Python',check_web_syntax:'检查网页语法',web_search:'联网搜索',fetch_webpage:'读取网页'};
-  const runs=agents.map((agent,index)=>{
-    const status=agent.status||'completed',verdict=String(agent.verdict||'').toUpperCase();
-    const activities=(agent.searches||[]).map(step=>`<span>${escapeHtml(toolLabels[step.tool]||(step.action==='search'?'联网搜索':step.action==='open_page'?'读取网页':'工具'))} · ${escapeHtml(step.status||'完成')}</span>`).join('');
-    const decision=agent.decision_action?`<div class="agent-decision">决策：${escapeHtml(actionLabels[agent.decision_action]||agent.decision_action)}${agent.decision_reason?` · ${escapeHtml(agent.decision_reason)}`:''}</div>`:'';
-    return `<article class="agent-run" data-agent-id="${escapeHtml(agent.id||String(index))}"><div class="agent-run-head"><strong>${escapeHtml(agent.label||agent.role||'Agent')}</strong>${verdict?`<span class="agent-verdict ${verdict.toLowerCase()}">${escapeHtml(verdict)}</span>`:''}<span class="agent-status ${escapeHtml(status)}">${escapeHtml(statusLabels[status]||status)}</span></div>${agent.task?`<p class="agent-task">${escapeHtml(agent.task)}</p>`:''}${decision}${agent.reasoning?`<div class="agent-reasoning" data-scroll-key="${escapeHtml(detailKey)}-agent-${index}-reasoning">${escapeHtml(agent.reasoning)}</div>`:''}${activities?`<div class="agent-activity">${activities}</div>`:''}${agent.answer?`<div class="agent-output" data-scroll-key="${escapeHtml(detailKey)}-agent-${index}-output">${escapeHtml(agent.answer)}</div>`:''}${agent.error?`<div class="agent-error">${escapeHtml(agent.error)}</div>`:''}</article>`;
-  }).join('');
-  const running=agents.find(agent=>agent.status==='running');
-  const summary=running?`${running.label||running.role}正在工作`:(active?'Nexus 正在决定下一步':'协作已结束');
-  return `<section class="agent-team"><div class="agent-team-head"><strong>Nexus 协作编队</strong><span>${escapeHtml(summary)}</span></div>${runs?`<div class="agent-runs">${runs}</div>`:'<div class="agent-team-waiting">正在启动 Nexus…</div>'}</section>`;
-}
-
 function messageHtml(message, index, live=false, retryable=false) {
   const assistant = message.role === 'assistant';
   const meta = message.meta || {};
@@ -436,12 +421,12 @@ function messageHtml(message, index, live=false, retryable=false) {
   const detailKey = meta.trace_key || `trace-${meta.job_id || `message-${index}`}`;
   const messageAttachments = Array.isArray(meta.attachments) && meta.attachments.length ? `<div class="message-attachments">${attachmentChips(meta.attachments)}</div>` : '';
   const custom = isCustomProviderType(meta.provider_type);
-  const collaborative=meta.chat_mode==='multi_agent';
-  const assistantName = collaborative ? 'Nexus' : custom ? 'Custom' : 'DeepSeek';
+  const agent=meta.chat_mode==='agent'||meta.chat_mode==='multi_agent';
+  const assistantName = agent ? 'Agent' : custom ? 'Custom' : 'DeepSeek';
   return `<article class="message ${assistant ? 'assistant' : 'user'}${live ? ' live-message' : ''}" data-index="${index}">
-    <div class="message-icon">${assistant ? (custom ? 'CU' : 'DS') : escapeHtml(((state.me && state.me.username) || 'U')[0].toUpperCase())}</div>
+    <div class="message-icon">${assistant ? (agent ? 'AG' : custom ? 'CU' : 'DS') : escapeHtml(((state.me && state.me.username) || 'U')[0].toUpperCase())}</div>
     <div class="message-body"><div class="message-head"><strong>${assistant ? assistantName : escapeHtml((state.me && state.me.username) || '你')}</strong></div>
-    ${assistant ? (collaborative ? agentRunsHtml(meta,live,detailKey) : traceHtml(meta, live, detailKey)) : ''}${messageAttachments}<div class="message-content">${assistant ? (content ? markdown(content, detailKey) : live ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div>${assistant ? sourcesHtml(meta,detailKey) : ''}${assistant && !live ? workspaceArtifactsHtml(meta) : ''}${assistant && !live ? usageHtml(meta.usage || {}) : ''}<div class="message-actions"><button type="button" data-action="copy">复制</button>${retryable ? `<button type="button" data-action="retry" ${state.retryingAnswer ? 'disabled' : ''}>重新回答</button>` : ''}</div>
+    ${assistant ? traceHtml(meta, live, detailKey) : ''}${messageAttachments}<div class="message-content">${assistant ? (content ? markdown(content, detailKey) : live ? '<div class="typing"><i></i><i></i><i></i></div>' : '') : `<p>${escapeHtml(content).replace(/\n/g,'<br>')}</p>`}</div>${assistant ? sourcesHtml(meta,detailKey) : ''}${assistant && !live ? workspaceArtifactsHtml(meta) : ''}${assistant && !live ? usageHtml(meta.usage || {}) : ''}<div class="message-actions"><button type="button" data-action="copy">复制</button>${retryable ? `<button type="button" data-action="retry" ${state.retryingAnswer ? 'disabled' : ''}>重新回答</button>` : ''}</div>
     ${meta.error ? `<p class="job-error">${escapeHtml(meta.error)}</p>` : ''}</div></article>`;
 }
 
@@ -557,7 +542,7 @@ async function retryAnswer(messageIndex,items){
   if(!prompt||!prompt.id){toast('找不到这条消息对应的问题，请刷新后重试');return}
   const provider=selectedProvider();if(!provider){$('#providerModal').showModal();toast('请先添加 API 配置');return}
   const model=selectedModel();if(!model){$('#providerModal').showModal();toast('请先选择模型');return}
-  if(state.chatMode==='multi_agent'&&!isCustomProviderType(provider.provider_type)){toast('多智能体协作模式仅支持 Custom 模型');return}
+  if(state.chatMode==='agent'&&!isCustomProviderType(provider.provider_type)){toast('Agent 模式仅支持 Custom 模型');return}
   const conversationId=state.conversation.id;
   const promptMessageId=prompt.id;
   state.retryingAnswer=true;setRunning(false);renderMessages();
@@ -640,7 +625,7 @@ async function submitPrompt(value) {
   const content=rawContent||'请分析这些附件。';
   const provider=selectedProvider(); if(!provider){$('#providerModal').showModal();toast('请先添加 API 配置');return}
   const model=selectedModel(); if(!model){$('#providerModal').showModal();toast('请先选择模型');return}
-  if(state.chatMode==='multi_agent'&&!isCustomProviderType(provider.provider_type)){toast('多智能体协作模式仅支持 Custom 模型');return}
+  if(state.chatMode==='agent'&&!isCustomProviderType(provider.provider_type)){toast('Agent 模式仅支持 Custom 模型');return}
   if(state.job && ['queued','running'].includes(state.job.status)){toast('请先停止当前回答');return}
   const pendingSnapshot=state.pendingAttachments.map(item=>({...item}));
   const attachmentIds=pendingSnapshot.map(item=>item.id);
@@ -731,18 +716,18 @@ function selectedWebToolInfo(provider=selectedProvider()){const key=customSettin
 function updateProviderUi(){
   const provider=selectedProvider(), custom=provider&&isCustomProviderType(provider.provider_type), protocol=provider&&normalizeProviderType(provider.provider_type), responses=protocol==='custom_response', messages=protocol==='custom_messages';
   const webInfo=custom?selectedWebToolInfo(provider):null;
-  const collaborative=state.chatMode==='multi_agent';
+  const agent=state.chatMode==='agent';
   $('#customSettingsButton').classList.toggle('hidden',!custom);
   $('#effortControl').classList.toggle('hidden',!!custom);
   $('#effort').disabled=!!custom;
   $('#effort').title=custom?'Custom 模型请在“Custom 参数”中设置 reasoning effort':'控制 DeepSeek 模型推理投入';
-  $('#nativePill').textContent=collaborative?(custom?'● 4 Agents':'⚠ 仅 Custom'):custom?`● ${webInfo.label}`:'● Native Web';
-  $('#welcomeOrbitMark').textContent=collaborative?'4A':custom?'CU':'DS';
-  $('#welcomeEyebrow').textContent=collaborative?'NEXUS · ATLAS · FORGE · SENTINEL':responses?'CUSTOM · RESPONSES':messages?'CUSTOM · MESSAGES':custom?'CUSTOM · CHAT COMPLETIONS': 'DEEPSEEK V4 FLASH';
-  $('#welcomeTitle').textContent=collaborative?'让四个智能体协同完成任务':custom?'使用 Custom 本地联网':'问点需要查证的问题';
-  $('#welcomeDescription').textContent=collaborative?(custom?'Nexus 动态调度 Atlas、Forge 与 Sentinel；所有角色使用当前 Custom 模型及共享工作区。':'多智能体协作仅支持 Custom 模型，请先切换下方 API。'):custom?`模型通过标准 ${responses?'Responses':messages?'Anthropic Messages':'Chat Completions'} 协议调用 ${webInfo.label} 搜索与读取真实来源。`:'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
-  if($('#statusText'))$('#statusText').textContent=collaborative?(custom?'多智能体协作 · Nexus 动态调度':'多智能体协作 · 等待 Custom 模型'):'标准模式 · 外部搜索工具已就绪';
-  if($('#footnote'))$('#footnote').textContent=collaborative?'多智能体协作仅用于 Custom 模型；Nexus 统筹，Atlas 渐进调研，Forge 工程执行，Sentinel 独立审查并触发返修。':'标准模式：Custom API 使用你选择的搜索与网页抓取方案；DeepSeek 使用服务端原生联网。';
+  $('#nativePill').textContent=agent?(custom?'● Agent · 全权限':'⚠ 仅 Custom'):custom?`● ${webInfo.label}`:'● Native Web';
+  $('#welcomeOrbitMark').textContent=agent?'AG':custom?'CU':'DS';
+  $('#welcomeEyebrow').textContent=agent?'HOST AGENT · SKILLS':responses?'CUSTOM · RESPONSES':messages?'CUSTOM · MESSAGES':custom?'CUSTOM · CHAT COMPLETIONS': 'DEEPSEEK V4 FLASH';
+  $('#welcomeTitle').textContent=agent?'让 Agent 直接管理代码与服务器':custom?'使用 Custom 本地联网':'问点需要查证的问题';
+  $('#welcomeDescription').textContent=agent?(custom?'Agent 直接使用主机文件、Shell、对话、Skill 和前端管理工具。':'Agent 模式仅支持 Custom 模型，请先切换下方 API。'):custom?`模型通过标准 ${responses?'Responses':messages?'Anthropic Messages':'Chat Completions'} 协议调用 ${webInfo.label} 搜索与读取真实来源。`:'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
+  if($('#statusText'))$('#statusText').textContent=agent?(custom?'Agent 模式 · 主机工具已就绪':'Agent 模式 · 等待 Custom 模型'):'标准模式 · 外部搜索工具已就绪';
+  if($('#footnote'))$('#footnote').textContent=agent?'Agent 模式拥有主机级文件和命令权限，并内置编程、对话、Skill、前端管理能力；每轮最多执行一次联网工具，其他工具按顺序执行。':'标准模式：Custom API 使用你选择的搜索与网页抓取方案；DeepSeek 使用服务端原生联网。';
 }
 
 async function loadProviders(){
@@ -865,7 +850,7 @@ async function loadUsers(){const users=await api('/api/users');$('#userList').in
 function resizePrompt(){const p=$('#prompt');p.style.height='auto';p.style.height=Math.min(p.scrollHeight,180)+'px'}
 function openSidebar(){$('#sidebar').classList.add('open')}function closeSidebar(){$('#sidebar').classList.remove('open')}
 
-async function boot(){try{state.me=await api('/api/me');$('#loginView').classList.add('hidden');$('#appView').classList.remove('hidden');$('#accountName').textContent=state.me.username;$('#accountRole').textContent=state.me.is_admin?'管理员':'用户';$('#avatar').textContent=state.me.username[0].toUpperCase();$('#usersButton').classList.toggle('hidden',!state.me.is_admin);const savedEffort=storedValue('reasoning-effort');if(['low','medium','high','xhigh','max'].includes(savedEffort))$('#effort').value=savedEffort;state.chatMode=storedValue('chat-mode')==='multi_agent'?'multi_agent':'standard';$$('[data-chat-mode]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.chatMode===state.chatMode)));await Promise.all([loadProviders(),loadHistory(1)]);const stored=storedValue('active-conversation');const activeId=stored==='__new__'?null:(stored||state.latestConversationId);const restored=activeId?await openConversation(activeId):false;if(!restored){renderMessages();await loadPendingAttachments()}}catch{$('#loginView').classList.remove('hidden');$('#appView').classList.add('hidden')}}
+async function boot(){try{state.me=await api('/api/me');$('#loginView').classList.add('hidden');$('#appView').classList.remove('hidden');$('#accountName').textContent=state.me.username;$('#accountRole').textContent=state.me.is_admin?'管理员':'用户';$('#avatar').textContent=state.me.username[0].toUpperCase();$('#usersButton').classList.toggle('hidden',!state.me.is_admin);const savedEffort=storedValue('reasoning-effort');if(['low','medium','high','xhigh','max'].includes(savedEffort))$('#effort').value=savedEffort;const savedMode=storedValue('chat-mode');state.chatMode=savedMode==='agent'||savedMode==='multi_agent'?'agent':'standard';$$('[data-chat-mode]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.chatMode===state.chatMode)));await Promise.all([loadProviders(),loadHistory(1)]);const stored=storedValue('active-conversation');const activeId=stored==='__new__'?null:(stored||state.latestConversationId);const restored=activeId?await openConversation(activeId):false;if(!restored){renderMessages();await loadPendingAttachments()}}catch{$('#loginView').classList.remove('hidden');$('#appView').classList.add('hidden')}}
 
 $('#loginForm').onsubmit=async e=>{e.preventDefault();$('#loginError').textContent='';try{await api('/api/login',{method:'POST',body:{username:$('#loginUser').value,password:$('#loginPass').value}});await boot()}catch(err){$('#loginError').textContent=err.message}};
 $('#logout').onclick=async()=>{await api('/api/logout',{method:'POST'});location.reload()};

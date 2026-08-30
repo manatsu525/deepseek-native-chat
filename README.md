@@ -29,12 +29,13 @@
 - 所有发往 `opencode.ai` 及其子域名的 Custom 请求固定发送 `User-Agent: opencode/1.18.16`，覆盖模型列表、连接测试和正式聊天流；其他供应商不发送该自定义 UA
 - NVIDIA Nemotron 3 Ultra 使用 `enable_thinking`、工具兼容标志和 16K reasoning budget；GLM-5.2 使用 `thinking.enabled` 与所选 `reasoning_effort` 档位
 - 每个对话拥有隔离且持久的编码工作区。Custom 模型可列出、读取、搜索、创建、原子批量修改和删除 UTF-8 文本文件；网页端支持单文件和 ZIP 下载。Python 文件可在 systemd 动态用户、断网、限时限内存的一次性副本中运行验证；HTML 会解析并用 Node.js 检查内联脚本、事件处理器和本地 JS，独立 JavaScript 文件也可做语法检查。运行产生的文件不会写回持久工作区。删除对话时同步清理
+- Custom 的 Agent 模式直接在真实主机上工作，拥有 root 级文件、Shell、服务、对话、Skill 和前端页面管理工具；内置编程、调试、验证、React、网页设计、对话管理和 Skill 管理 Skills，并可从 Git 或本地目录安装新 Skill。普通聊天仍使用隔离工作区，不受 Agent 权限影响。Agent 每轮最多执行一次联网工具，其余工具调用按模型发出的顺序串行执行
 - 模型名包含 `minimax` 时启用私有工具标记 fallback：标准 `tool_calls` 始终优先，泄露到正文的 `]<]minimax[>[` 调用会被隐藏并恢复；可用 `MINIMAX_TOOL_FALLBACK=0` 整体关闭
 - 模型名包含 `inkling` 时启用独立工具兼容层：解析官方 `<|content_invoke_tool_json|>` typed block；工作区不超过 12 个文件时，把补丁工具显式预绑定到具体文件，避免模型遗漏 `path`。标准 `tool_calls` 始终优先，可用 `INKLING_TOOL_COMPAT=0` 整体关闭
 
 ## 资源占用
 
-运行时只有一个 Python/FastAPI 进程，不需要 Docker。systemd 默认限制最大内存为 180 MB，适合约 350 MB 内存并带有 Swap 的小型 VPS。SQLite 使用 WAL 模式，不需要独立数据库服务。附件原始数据流式落盘，图片和文档处理串行执行，带附件的模型任务也全局串行，避免多账号同时构造图片请求导致内存峰值叠加。
+运行时只有一个 Python/FastAPI 进程，不需要 Docker。普通聊天的工作区运行验证仍使用一次性限资源副本；Agent 模式为满足主机级管理需求，不在 systemd 层套沙箱，命令和文件操作仍有单次输出、文件大小与超时上限。SQLite 使用 WAL 模式，不需要独立数据库服务。附件原始数据流式落盘，图片和文档处理串行执行，带附件的模型任务也全局串行，避免多账号同时构造图片请求导致内存峰值叠加。
 
 ## 安装
 
@@ -79,11 +80,11 @@ sudo ./uninstall.sh --yes
 
 ## 设计说明
 
-DeepSeek 使用官方 `/responses` 路由及原生联网。Custom Chat 使用标准 `/chat/completions`，Custom Responses 使用标准 `/responses`，Custom Messages 使用 Anthropic `/messages`；三种 Custom 都由本机后端提供 `web_search`、`fetch_webpage` 和工作区工具，并共享相同的工具限额、多智能体协作及模型级参数。Messages 会转换 system、图片、tool use/tool result、thinking 及签名块，并发送 `x-api-key` 和 `anthropic-version` 请求头。默认方案匿名连接 Parallel 官方 Streamable HTTP MCP；也可以手动选择 Keenable、Tavily Keyless、Firecrawl Keyless、You.com Free 或 DDG + Jina。选择后，搜索与抓取固定使用对应的一组实现，不自动切换、不 fallback、不同 provider 之间不并发。You.com Free 只提供搜索，因此它是唯一复用现有 Jina Reader 抓取的新增方案。查询词和待读取 URL 会发送给当前选择的服务。
+DeepSeek 使用官方 `/responses` 路由及原生联网。Custom Chat 使用标准 `/chat/completions`，Custom Responses 使用标准 `/responses`，Custom Messages 使用 Anthropic `/messages`；普通 Custom 聊天由本机后端提供 `web_search`、`fetch_webpage` 和隔离工作区工具。单独的 Custom Agent 模式改为提供真实主机工具、对话管理、Skill 管理和前端页面管理，不再使用四智能体协作；普通模式的路由、提示词和工具额度保持独立。Messages 会转换 system、图片、tool use/tool result、thinking 及签名块，并发送 `x-api-key` 和 `anthropic-version` 请求头。默认方案匿名连接 Parallel 官方 Streamable HTTP MCP；也可以手动选择 Keenable、Tavily Keyless、Firecrawl Keyless、You.com Free 或 DDG + Jina。选择后，搜索与抓取固定使用对应的一组实现，不自动切换、不 fallback、不同 provider 之间不并发。You.com Free 只提供搜索，因此它是唯一复用现有 Jina Reader 抓取的新增方案。查询词和待读取 URL 会发送给当前选择的服务。
 
 新增匿名 MCP 由独立的轻量客户端适配：Keenable 调用 `https://api.keenable.ai/mcp` 的 `search_web_pages` / `fetch_page_content`，抓取固定发送 `live=true`；Tavily 调用 `https://mcp.tavily.com/mcp/` 的 `tavily_search` / `tavily_extract`，每次请求固定发送 `X-Tavily-Access-Mode: keyless`；Firecrawl 调用 `https://mcp.firecrawl.dev/v2/mcp`，只使用 `firecrawl_search` / `firecrawl_scrape`；You.com 调用 `https://api.you.com/mcp?profile=free` 的 `you-search`，抓取则直接复用原来的 Jina Reader。四种服务的原始响应都会归一化为相同的标题、URL、摘要和正文格式，再作为 `tool` 消息回传给 LLM。
 
-Custom 每个工具轮最多执行 1 个工具，最多 6 个工具轮；每个回答最多搜索 3 次、最多读取 3 个网页，每次搜索最多向模型返回 10 条结果。模型可以在资料足够时直接停止工具调用。搜索查询按标准化文本去重，不会重复请求同一组查询。`fetch_webpage` 只能读取用户提供或当前搜索方案返回的 URL，搜索引擎结果页、编造 URL、本机和内网地址都会被拒绝；同一个 URL 也不会重复注入正文。Parallel 搜索每条摘录最多保留约 1,200 字符，读取默认使用相关摘录而非完整页面，每页最多约 8,000 字符，以限制上下文增长。
+普通 Custom 每个工具轮最多执行 1 个工具，最多 6 个工具轮；每个回答最多搜索 3 次、最多读取 3 个网页，每次搜索最多向模型返回 10 条结果。Agent 只保留两条调度约束：每轮最多执行一次 `web_search` 或 `fetch_webpage`，其余主机、对话、Skill 和前端工具按模型发出的顺序串行执行。模型可以在资料足够时直接停止工具调用。搜索查询按标准化文本去重，不会重复请求同一组查询。`fetch_webpage` 只能读取用户提供或当前搜索方案返回的 URL，搜索引擎结果页、编造 URL、本机和内网地址都会被拒绝；同一个 URL 也不会重复注入正文。Parallel 搜索每条摘录最多保留约 1,200 字符，读取默认使用相关摘录而非完整页面，每页最多约 8,000 字符，以限制上下文增长。
 
 前端发起问题时会同时提交浏览器的 IANA 时区（如 `Asia/Shanghai`）。后端只把“当前本地日期 + 时区”追加到 Custom 的固定系统提示词末尾，并要求模型把“今天、昨天、明天、目前、最新”等相对时间转换为绝对日期，核对来源的发布/事件日期，禁止把搜索返回的最新一篇误当作当天资料。日期每天只变化一次，且放在静态提示之后，以尽量保留固定前缀的缓存价值；旧客户端未提交时区时使用 UTC。
 

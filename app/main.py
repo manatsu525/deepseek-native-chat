@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import attachments
+from .agent import AgentRuntime, build_agent_skills_prompt
 from .config import settings
 from .db import Database
 from .deepseek import list_models as deepseek_list_models
@@ -37,7 +38,6 @@ from .mimo import (
     list_models as custom_list_models,
 )
 from .mimo_local import stream_response as custom_stream_response
-from .multi_agent import run_collaboration
 from .reasoning_effort import DEFAULT as DEFAULT_REASONING_EFFORT
 from .reasoning_effort import LEVELS as REASONING_EFFORT_LEVELS
 from .security import load_secret, make_token, password_hash, password_ok, read_token
@@ -137,7 +137,7 @@ class ChatBody(BaseModel):
     model: str = ""
     effort: str = DEFAULT_REASONING_EFFORT
     timezone: str = Field(default="UTC", min_length=1, max_length=64)
-    chat_mode: Literal["standard", "multi_agent"] = "standard"
+    chat_mode: Literal["standard", "agent"] = "standard"
 
 
 class RetryBody(BaseModel):
@@ -146,7 +146,7 @@ class RetryBody(BaseModel):
     model: str = ""
     effort: str = DEFAULT_REASONING_EFFORT
     timezone: str = Field(default="UTC", min_length=1, max_length=64)
-    chat_mode: Literal["standard", "multi_agent"] = "standard"
+    chat_mode: Literal["standard", "agent"] = "standard"
 
 
 class PinBody(BaseModel):
@@ -383,6 +383,10 @@ def public_job(row: dict[str, Any]) -> dict[str, Any]:
     row["stop_requested"] = bool(row["stop_requested"])
     if row.get("provider_type") == "mimo":
         row["provider_type"] = "custom"
+    # Historical jobs used the removed four-agent mode. Keep their records
+    # readable without exposing that mode as a new runtime option.
+    if row.get("chat_mode") == "multi_agent":
+        row["chat_mode"] = "agent"
     if row.get("status") in {"completed", "failed", "stopped"} and row.get("user_id") and row.get("conversation_id"):
         row["workspace_files"] = ConversationWorkspace(row["user_id"], row["conversation_id"]).list_files()
     return row
@@ -426,6 +430,10 @@ async def _execute_job(job_id: str) -> None:
     job = db.one("SELECT * FROM jobs WHERE id=?", (job_id,))
     if not job or job["status"] not in {"queued", "running"}:
         return
+    # Jobs queued by the removed four-agent release continue in the new
+    # single-Agent runtime instead of silently falling back to standard chat.
+    if job.get("chat_mode") == "multi_agent":
+        job["chat_mode"] = "agent"
     attachment_records = db.attachments_for_job(job["user_id"], job_id)
     provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (job["provider_id"], job["user_id"]))
     if not provider:
@@ -488,9 +496,10 @@ async def _execute_job(job_id: str) -> None:
                 attachment_records,
                 is_custom_provider(kind),
             )
-        if is_custom_provider(kind) and job.get("chat_mode") == "multi_agent":
+        if is_custom_provider(kind) and job.get("chat_mode") == "agent":
             provider_settings = custom_settings_for_model(provider, job["model"])
-            result = await run_collaboration(
+            runtime = AgentRuntime(db, job["user_id"], job["conversation_id"])
+            result = await custom_streamer(kind)(
                 base_url=provider["base_url"],
                 api_key=provider["api_key"],
                 model=job["model"],
@@ -502,8 +511,16 @@ async def _execute_job(job_id: str) -> None:
                 conversation_id=job["conversation_id"],
                 user_timezone=job.get("timezone") or "UTC",
                 effort=provider_settings.get("reasoning_effort") or job["effort"],
-                workspace=job_workspace,
-                streamer=custom_streamer(kind),
+                workspace=None,
+                workspace_access="none",
+                agent_mode=True,
+                extra_tools=runtime.tool_definitions,
+                extra_tool_handler=runtime.execute,
+                max_tool_rounds=96,
+                web_search_limit=96,
+                web_fetch_limit=96,
+                web_tool_round_limit=96,
+                system_addendum=build_agent_skills_prompt(),
             )
         elif is_custom_provider(kind):
             provider_settings = custom_settings_for_model(provider, job["model"])
@@ -1223,8 +1240,8 @@ async def retry_answer(
     if kind == "deepseek" and model != provider["model"]:
         raise HTTPException(400, "当前回答使用的模型与 API 配置不一致，请重新选择模型配置")
     validate_provider_selection(kind, model, provider)
-    if body.chat_mode == "multi_agent" and not is_custom_provider(kind):
-        raise HTTPException(400, "多智能体协作模式仅支持 Custom 模型")
+    if body.chat_mode == "agent" and not is_custom_provider(kind):
+        raise HTTPException(400, "Agent 模式仅支持 Custom 模型")
     validate_effort(body.effort)
     timezone_name = clean_timezone(body.timezone)
     job_id = uuid.uuid4().hex
@@ -1332,8 +1349,8 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
     if kind == "deepseek" and model != provider["model"]:
         raise HTTPException(400, "当前回答使用的模型与 API 配置不一致，请重新选择模型配置")
     validate_provider_selection(kind, model, provider)
-    if body.chat_mode == "multi_agent" and not is_custom_provider(kind):
-        raise HTTPException(400, "多智能体协作模式仅支持 Custom 模型")
+    if body.chat_mode == "agent" and not is_custom_provider(kind):
+        raise HTTPException(400, "Agent 模式仅支持 Custom 模型")
     validate_effort(body.effort)
     content = body.content.strip()
     attachment_ids = list(dict.fromkeys(body.attachment_ids))

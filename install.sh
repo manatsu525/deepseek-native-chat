@@ -32,7 +32,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 python3-venv opens
 mkdir -p "$INSTALL_DIR" "$DATA_DIR/tls"
 if [[ $SOURCE_DIR != "$INSTALL_DIR" ]]; then
   find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name data -exec rm -rf -- {} +
-  cp -a "$SOURCE_DIR/app" "$SOURCE_DIR/static" "$SOURCE_DIR/requirements.txt" "$SOURCE_DIR/run.sh" "$SOURCE_DIR/.env.example" "$INSTALL_DIR/"
+  cp -a "$SOURCE_DIR/app" "$SOURCE_DIR/static" "$SOURCE_DIR/skills" "$SOURCE_DIR/requirements.txt" "$SOURCE_DIR/run.sh" "$SOURCE_DIR/.env.example" "$INSTALL_DIR/"
 fi
 chmod +x "$INSTALL_DIR/run.sh"
 
@@ -73,11 +73,11 @@ EnvironmentFile=$INSTALL_DIR/.env
 ExecStart=$INSTALL_DIR/run.sh
 Restart=on-failure
 RestartSec=3
-MemoryMax=180M
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ReadWritePaths=$DATA_DIR
+# Agent 模式需要直接管理主机、项目文件和服务；不要在 systemd 层套沙箱。
+NoNewPrivileges=false
+PrivateTmp=false
+ProtectSystem=off
+ProtectHome=false
 
 [Install]
 WantedBy=multi-user.target

@@ -13,6 +13,7 @@ import httpx
 from curl_cffi import requests as curl_requests
 
 from .custom_tool_normalization import normalize_tool_calls
+from .agent import AGENT_SYSTEM_PROMPT
 from .keyless_web import (
     KEYLESS_CUSTOM_SYSTEM_PROMPT,
     KEYLESS_FETCH_WEBPAGE_TOOL,
@@ -82,6 +83,7 @@ class ToolQuotaExceeded(RuntimeError):
 
 FINAL_ANSWER_ATTEMPTS = 2
 MAX_AGENT_TOOL_ROUNDS = 12
+AGENT_HOST_TOOL_ROUNDS = 96
 PARALLEL_MAX_SEARCH_EXCERPT_CHARS = 1200
 WORKSPACE_ARGUMENT_COMPACT_THRESHOLD = 4096
 # Keep ordinary freshly-created files in the next requests so the model can
@@ -105,6 +107,7 @@ def _final_answer_prompt(
     *,
     web_enabled: bool,
     workspace_enabled: bool,
+    extra_tools_enabled: bool = False,
     retry_note: str = "",
 ) -> str:
     unavailable_en: list[str] = []
@@ -115,6 +118,9 @@ def _final_answer_prompt(
     if workspace_enabled:
         unavailable_en.append("workspace file operations")
         unavailable_zh.append("工作区文件操作")
+    if extra_tools_enabled:
+        unavailable_en.append("host, conversation, Skill, and frontend operations")
+        unavailable_zh.append("主机、对话、Skill 和前端操作")
 
     if unavailable_en:
         english = "Unavailable tools now: " + ", ".join(unavailable_en) + "."
@@ -672,6 +678,9 @@ async def stream_response(
     web_tool_round_limit: int = MIMO_MAX_TOOL_ROUNDS,
     before_model_call: Callable[[], None] | None = None,
     api_protocol: str = "chat_completions",
+    agent_mode: bool = False,
+    extra_tools: list[dict[str, Any]] | None = None,
+    extra_tool_handler: Callable[[str, dict[str, Any]], str] | None = None,
 ) -> dict[str, Any]:
     """Run a custom OpenAI-compatible model with local web tools.
 
@@ -681,6 +690,12 @@ async def stream_response(
     to the model instead of requiring an exact search-result URL match.
     """
     config = _settings(settings)
+    extra_tools = list(extra_tools or [])
+    extra_tool_names = {
+        str((item.get("function") or {}).get("name") or "")
+        for item in extra_tools
+        if isinstance(item, dict)
+    }
     dsml_fallback_active = dsml_fallback_applies(
         base_url,
         model,
@@ -711,6 +726,8 @@ async def stream_response(
         base_prompt = LEGACY_CUSTOM_SYSTEM_PROMPT
     else:
         base_prompt = KEYLESS_CUSTOM_SYSTEM_PROMPT
+    if agent_mode:
+        base_prompt = f"{base_prompt}\n\n{AGENT_SYSTEM_PROMPT}"
     system_prompt = _apply_model_system_prompt(
         _dated_system_prompt(base_prompt, user_timezone),
         model,
@@ -768,7 +785,8 @@ async def stream_response(
     parallel_context = ParallelMCPClient() if web_enabled and parallel_mode else _AsyncNullContext()
     keyless_context = KeylessWebProvider(web_tool_backend) if web_enabled and keyless_mode else _AsyncNullContext()
     workspace_tools_expected = workspace is not None and workspace_access != "none"
-    tools_expected = web_enabled or workspace_tools_expected
+    extra_tools_expected = bool(extra_tools and extra_tool_handler is not None)
+    tools_expected = web_enabled or workspace_tools_expected or extra_tools_expected
     allowed_workspace_tools = (
         READ_ONLY_WORKSPACE_TOOL_NAMES
         if workspace_access == "read_only"
@@ -776,10 +794,11 @@ async def stream_response(
         if workspace_access == "edit"
         else WORKSPACE_TOOL_NAMES
     )
-    role_tool_round_limit = max(0, min(MAX_AGENT_TOOL_ROUNDS, int(max_tool_rounds)))
-    search_limit = max(0, min(MIMO_MAX_SEARCHES, int(web_search_limit)))
-    fetch_limit = max(0, min(JINA_MAX_FETCHES_PER_RESPONSE, int(web_fetch_limit)))
-    web_round_limit = max(0, min(MIMO_MAX_TOOL_ROUNDS, int(web_tool_round_limit)))
+    round_cap = AGENT_HOST_TOOL_ROUNDS if agent_mode else MAX_AGENT_TOOL_ROUNDS
+    role_tool_round_limit = max(0, min(round_cap, int(max_tool_rounds)))
+    search_limit = max(0, int(web_search_limit)) if agent_mode else max(0, min(MIMO_MAX_SEARCHES, int(web_search_limit)))
+    fetch_limit = max(0, int(web_fetch_limit)) if agent_mode else max(0, min(JINA_MAX_FETCHES_PER_RESPONSE, int(web_fetch_limit)))
+    web_round_limit = max(0, int(web_tool_round_limit)) if agent_mode else max(0, min(MIMO_MAX_TOOL_ROUNDS, int(web_tool_round_limit)))
     async with (
         httpx.AsyncClient(timeout=api_limits) as api_client,
         search_context as search_client,
@@ -787,10 +806,10 @@ async def stream_response(
         parallel_context as parallel_client,
         keyless_context as keyless_client,
     ):
-        # Web calls keep their existing six-round budget. Coding workspaces
-        # may use more rounds because multi-file edits commonly require several
-        # reads and patches. Two answer-only attempts remain reserved after all
-        # tools have been removed.
+        # Standard mode keeps its existing compact budget. Host Agent mode has
+        # a larger transport budget for real multi-file work; the two scheduling
+        # rules remain enforced independently of that budget. Two answer-only
+        # attempts remain reserved after all tools have been removed.
         for round_number in range(role_tool_round_limit + FINAL_ANSWER_ATTEMPTS):
             if stopped():
                 raise asyncio.CancelledError
@@ -821,6 +840,8 @@ async def stream_response(
                             round_tools,
                             [item["path"] for item in workspace.list_files()],
                         )
+                if extra_tools_expected and tool_rounds_used < role_tool_round_limit:
+                    round_tools.extend(extra_tools)
             final_answer_only = force_final_answer or (tools_expected and not round_tools)
             mimo_model = is_mimo_model(model)
             request_messages = conversation
@@ -837,6 +858,7 @@ async def stream_response(
                         "content": _final_answer_prompt(
                             web_enabled=web_enabled,
                             workspace_enabled=workspace_tools_expected,
+                            extra_tools_enabled=extra_tools_expected,
                             retry_note=retry_note,
                         ),
                     },
@@ -1128,10 +1150,11 @@ async def stream_response(
                 workspace_name, bound_path = inkling_patch_bindings.get(name, (name, ""))
                 is_search = name == "web_search"
                 is_workspace = workspace_name in WORKSPACE_TOOL_NAMES
+                is_extra = name in extra_tool_names
                 step: dict[str, Any] = {
                     "id": call_id,
                     "status": "running",
-                    "action": "workspace" if is_workspace else "search" if is_search else "open_page",
+                    "action": "workspace" if is_workspace else "search" if is_search else "agent" if is_extra else "open_page",
                     "query": "",
                     "url": "",
                     "path": "",
@@ -1140,7 +1163,7 @@ async def stream_response(
                 }
                 if is_search:
                     search_steps.append(step)
-                elif not is_workspace:
+                elif not is_workspace and not is_extra:
                     fetch_steps.append(step)
                 steps.append(step)
                 await update(
@@ -1189,6 +1212,20 @@ async def stream_response(
                     arguments = json.loads(str(function.get("arguments") or "{}"))
                     if not isinstance(arguments, dict):
                         raise ValueError("工具参数必须是 JSON 对象")
+                    if is_extra:
+                        # Keep the live trace useful for host operations without
+                        # copying complete file contents or command arguments.
+                        hint = (
+                            arguments.get("path")
+                            or arguments.get("cwd")
+                            or arguments.get("skill_id")
+                            or arguments.get("conversation_id")
+                            or arguments.get("source")
+                            or arguments.get("command")
+                        )
+                        if hint:
+                            step["path"] = str(hint)[:500]
+                        step["query"] = name
                     if is_workspace:
                         if workspace is None:
                             raise ValueError("当前对话没有可用的编码工作区")
@@ -1462,6 +1499,11 @@ async def stream_response(
                             step["status"] = "completed"
                             if fetch_count >= fetch_limit:
                                 reader_enabled = False
+                    elif is_extra:
+                        if extra_tool_handler is None:
+                            raise ValueError("当前 Agent 没有可用的主机工具处理器")
+                        result_text = await asyncio.to_thread(extra_tool_handler, name, arguments)
+                        step["status"] = "completed"
                     else:
                         raise ValueError(f"不支持的工具：{name or '未命名工具'}")
                 except asyncio.CancelledError:
@@ -1482,6 +1524,8 @@ async def stream_response(
                         result_text = f"{engine} 搜索失败：{str(exc)[:1000]}。可以改写查询继续，或根据已有资料回答。"
                     elif is_workspace:
                         result_text = f"工作区操作失败：{str(exc)[:1000]}。请先读取当前文件并修正参数后重试。"
+                    elif is_extra:
+                        result_text = f"Agent 工具操作失败：{str(exc)[:1000]}。请根据错误结果修正参数后重试。"
                     else:
                         result_text = f"读取网页失败：{str(exc)[:1000]}。请根据已有搜索结果继续回答，必要时选择其他来源。"
                 compacted_arguments = False
@@ -1541,5 +1585,6 @@ async def stream_response(
         "usage": usage,
         "tool_calls": [],
         "tool_trace": tool_trace,
-        "response": {"tool_trace": tool_trace},
+        "agent_mode": bool(agent_mode),
+        "response": {"tool_trace": tool_trace, "agent_mode": bool(agent_mode)},
     }
