@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import re
 import shutil
 from copy import deepcopy
@@ -12,11 +13,13 @@ from .config import settings
 
 
 WORKSPACES_DIR = settings.data_dir / "workspaces"
+AGENT_WORKSPACE_ROOT = Path(os.getenv("AGENT_WORKSPACE_ROOT", "/home/share"))
 MAX_FILES = 200
 MAX_FILE_BYTES = 512 * 1024
 MAX_TOTAL_BYTES = 10 * 1024 * 1024
 MAX_READ_CHARS = 60_000
 MAX_SEARCH_RESULTS = 20
+AGENT_MAX_FILES = 4_000
 
 WORKSPACE_SYSTEM_PROMPT = """A persistent, isolated coding workspace is available for this conversation. When the user asks you to create code or a multi-file project, use the workspace tools to save the actual files instead of only printing complete files in chat. Keep planning proportional to the next concrete action: once you know the next useful workspace operation, call the tool immediately. For an implementation request, start with the smallest useful workspace operation—list_files or read_file—and make the first concrete edit as soon as its target and revision are known. When several workspace operations are needed, emit calls with known arguments in dependency order; the server executes workspace calls serially in this turn. Never respond with a promise such as "I will create the file" or "the file is being created"; perform the operation in the current turn. On later requests, inspect the existing workspace files and modify only what needs to change. Do not recreate or overwrite unrelated files. Every workspace tool call must include every field marked required in its JSON schema. File tools must include a non-empty workspace-relative path exactly as listed by list_files (or the intended new relative path for write_file), except when a tool's own description explicitly says its path is already bound; a pre-bound tool must not receive path. read_file returns numbered lines and an opaque revision. For an existing file, use one apply_line_edits call with that exact revision and all non-overlapping edits from the same read; do not use write_file to replace the whole file for a local change. If the revision is stale, read the file again. Saved Python programs can be verified with run_python. Saved HTML and JavaScript must be checked with check_web_syntax when that tool is available; it parses HTML and runs Node.js syntax checks on inline, event-handler, and local JavaScript without executing it. These tools run without network in disposable resource-limited copies. Treat a nonzero exit or ok=false as a real failure and fix it before claiming success. After a successful validation, answer the user. Repeat a read, search, or validation only when a new edit or new evidence requires it. A failed validation may justify inspection and an edit, but rerunning it without changing the workspace is not progress. Syntax success does not prove browser behavior is correct, so state that limitation. After editing, briefly summarize changed files; the UI supplies download links automatically."""
 
@@ -494,6 +497,72 @@ class ConversationWorkspace:
         else:
             raise WorkspaceError(f"不支持的工作区工具：{name}")
         return json.dumps(result, ensure_ascii=False)
+
+
+class AgentSharedWorkspace:
+    """Read-only display view of the host-level Agent workspace.
+
+    Agent mode deliberately does not use ``ConversationWorkspace``.  Its host
+    tools operate directly on the shared ``/home/share`` directory, while this
+    view only provides the authenticated UI with a safe listing and download
+    resolver for that same directory.
+    """
+
+    def __init__(self, root: Path | None = None) -> None:
+        self.root = Path(root or AGENT_WORKSPACE_ROOT)
+
+    @staticmethod
+    def _clean_path(value: Any, *, allow_root: bool = False) -> PurePosixPath:
+        raw = str(value or "").strip()
+        if allow_root and raw in {"", "."}:
+            return PurePosixPath(".")
+        if not raw or "\x00" in raw or "\\" in raw:
+            raise WorkspaceError("文件路径无效")
+        path = PurePosixPath(raw)
+        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+            raise WorkspaceError("只能使用 Agent 工作区内的相对路径")
+        if len(path.as_posix()) > 500:
+            raise WorkspaceError("文件路径过长")
+        return path
+
+    def resolve(self, value: Any, *, allow_root: bool = False) -> tuple[Path, str]:
+        relative = self._clean_path(value, allow_root=allow_root)
+        candidate = self.root if relative == PurePosixPath(".") else self.root.joinpath(*relative.parts)
+        root_resolved = self.root.resolve(strict=False)
+        resolved = candidate.resolve(strict=False)
+        if resolved != root_resolved and root_resolved not in resolved.parents:
+            raise WorkspaceError("文件路径越过 Agent 工作区边界")
+        return candidate, "" if relative == PurePosixPath(".") else relative.as_posix()
+
+    def list_files(self) -> list[dict[str, Any]]:
+        if not self.root.is_dir() or self.root.is_symlink():
+            return []
+        result: list[dict[str, Any]] = []
+        for current, directories, files in os.walk(self.root, followlinks=False):
+            current_path = Path(current)
+            directories[:] = [
+                directory for directory in directories
+                if not (current_path / directory).is_symlink()
+            ]
+            for filename in files:
+                path = current_path / filename
+                if path.is_symlink() or not path.is_file():
+                    continue
+                try:
+                    size = path.stat().st_size
+                    relative = path.relative_to(self.root).as_posix()
+                except (OSError, ValueError):
+                    continue
+                result.append({"path": relative, "size": size, "backend": "agent"})
+                if len(result) >= AGENT_MAX_FILES:
+                    return sorted(result, key=lambda item: item["path"].casefold())
+        return sorted(result, key=lambda item: item["path"].casefold())
+
+    def resolve_file(self, path: Any) -> tuple[Path, str]:
+        target, relative = self.resolve(path)
+        if not target.is_file() or target.is_symlink():
+            raise WorkspaceError("Agent 工作区文件不存在")
+        return target, relative
 
 
 def delete_conversation_workspace(user_id: int, conversation_id: str) -> None:

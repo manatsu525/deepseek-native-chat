@@ -42,7 +42,7 @@ from .reasoning_effort import DEFAULT as DEFAULT_REASONING_EFFORT
 from .reasoning_effort import LEVELS as REASONING_EFFORT_LEVELS
 from .security import load_secret, make_token, password_hash, password_ok, read_token
 from .skills import SkillRegistry
-from .workspace import ConversationWorkspace, WorkspaceError, delete_conversation_workspace, delete_user_workspaces
+from .workspace import AgentSharedWorkspace, ConversationWorkspace, WorkspaceError, delete_conversation_workspace, delete_user_workspaces
 
 
 db = Database(settings.db_path)
@@ -398,7 +398,10 @@ def public_job(row: dict[str, Any]) -> dict[str, Any]:
     if row.get("chat_mode") == "multi_agent":
         row["chat_mode"] = "agent"
     if row.get("status") in {"completed", "failed", "stopped"} and row.get("user_id") and row.get("conversation_id"):
-        row["workspace_files"] = ConversationWorkspace(row["user_id"], row["conversation_id"]).list_files()
+        if row.get("chat_mode") == "agent":
+            row["workspace_files"] = AgentSharedWorkspace().list_files()
+        else:
+            row["workspace_files"] = ConversationWorkspace(row["user_id"], row["conversation_id"]).list_files()
     return row
 
 
@@ -450,7 +453,10 @@ async def _execute_job(job_id: str) -> None:
         db.update_job(job_id, status="failed", error="API 配置不存在")
         return
     kind = provider_type(provider)
-    job_workspace = ConversationWorkspace(job["user_id"], job["conversation_id"])
+    agent_job = is_custom_provider(kind) and job.get("chat_mode") == "agent"
+    # Agent jobs never create or mount an ordinary per-conversation workspace.
+    job_workspace: ConversationWorkspace | None = None if agent_job else ConversationWorkspace(job["user_id"], job["conversation_id"])
+    agent_workspace = AgentSharedWorkspace()
     history_rows = db.all(
         "SELECT role, content, meta_json FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 20",
         (job["conversation_id"],),
@@ -521,11 +527,11 @@ async def _execute_job(job_id: str) -> None:
                 conversation_id=job["conversation_id"],
                 user_timezone=job.get("timezone") or "UTC",
                 effort=provider_settings.get("reasoning_effort") or job["effort"],
-                # Agent keeps root host access through extra_tools while also
-                # exposing the current conversation workspace for deliverables
-                # that must appear in the UI's workspace panel.
-                workspace=job_workspace,
-                workspace_access="full",
+                # Agent mode intentionally keeps the host-tool contract used by
+                # the original Agent implementation.  Its shared /home/share
+                # directory is displayed separately from ordinary workspaces.
+                workspace=None,
+                workspace_access="none",
                 agent_mode=True,
                 extra_tools=runtime.tool_definitions,
                 extra_tool_handler=runtime.execute,
@@ -563,7 +569,8 @@ async def _execute_job(job_id: str) -> None:
                 stopped=stopped,
                 update=update,
             )
-        meta = {"job_id": job_id, "conversation_id": job["conversation_id"], "provider_id": job["provider_id"], "provider_type": kind, "model": job["model"], "chat_mode": job.get("chat_mode") or "standard", "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"], "agents": result.get("agents", []), "workspace_files": job_workspace.list_files()}
+        display_files = agent_workspace.list_files() if agent_job else job_workspace.list_files()
+        meta = {"job_id": job_id, "conversation_id": job["conversation_id"], "provider_id": job["provider_id"], "provider_type": kind, "model": job["model"], "chat_mode": job.get("chat_mode") or "standard", "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"], "agents": result.get("agents", []), "workspace_files": display_files}
         if result.get("tool_trace"):
             meta["tool_trace"] = result["tool_trace"]
         db.run(
@@ -597,6 +604,7 @@ async def _execute_job(job_id: str) -> None:
                 "sources": db.decode(partial.get("sources_json", "[]"), []),
                 "usage": db.decode(partial.get("usage_json", "{}"), {}),
                 "agents": partial_agents,
+                "workspace_files": agent_workspace.list_files() if agent_job else job_workspace.list_files(),
             }
             db.run(
                 "INSERT INTO messages(conversation_id, role, content, meta_json, created_at) VALUES(?,?,?,?,?)",
@@ -624,7 +632,7 @@ async def _execute_job(job_id: str) -> None:
             "sources": db.decode(partial.get("sources_json", "[]"), []),
             "usage": db.decode(partial.get("usage_json", "{}"), {}),
             "agents": db.decode(partial.get("agents_json", "[]"), []),
-            "workspace_files": job_workspace.list_files(),
+            "workspace_files": agent_workspace.list_files() if agent_job else job_workspace.list_files(),
         }
         failed_at = now()
         with db.lock, db.connect() as connection:
@@ -1233,8 +1241,16 @@ def conversation(conversation_id: str, user: dict[str, Any] = Depends(current_us
     for row in rows:
         row["meta"] = db.decode(row.pop("meta_json"), {})
     active = db.one("SELECT * FROM jobs WHERE conversation_id=? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1", (conversation_id,))
-    workspace_files = ConversationWorkspace(user["id"], conversation_id).list_files()
-    if workspace_files:
+    latest_job = db.one(
+        "SELECT chat_mode FROM jobs WHERE conversation_id=? AND user_id=? ORDER BY created_at DESC LIMIT 1",
+        (conversation_id, user["id"]),
+    )
+    workspace_files = (
+        AgentSharedWorkspace().list_files()
+        if latest_job and latest_job.get("chat_mode") == "agent"
+        else ConversationWorkspace(user["id"], conversation_id).list_files()
+    )
+    if workspace_files or (latest_job and latest_job.get("chat_mode") == "agent"):
         for row in reversed(rows):
             if row["role"] == "assistant":
                 row["meta"]["conversation_id"] = conversation_id
@@ -1254,6 +1270,39 @@ def conversation_workspace(conversation_id: str, user: dict[str, Any] = Depends(
     workspace = owned_workspace(conversation_id, user)
     files = workspace.list_files()
     return {"files": files, "total_size": sum(int(item["size"]) for item in files)}
+
+
+@app.get("/api/agent-workspace")
+def agent_workspace_files(_: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    """List the shared host workspace used only by Agent mode."""
+    files = AgentSharedWorkspace().list_files()
+    return {"root": str(AgentSharedWorkspace().root), "files": files, "total_size": sum(int(item["size"]) for item in files)}
+
+
+@app.get("/api/agent-workspace/files/{file_path:path}")
+def download_agent_workspace_file(file_path: str, _: dict[str, Any] = Depends(current_user)) -> FileResponse:
+    workspace = AgentSharedWorkspace()
+    try:
+        target, relative = workspace.resolve_file(file_path)
+    except WorkspaceError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return FileResponse(target, filename=Path(relative).name, media_type="application/octet-stream")
+
+
+@app.get("/api/agent-workspace.zip")
+def download_agent_workspace_zip(_: dict[str, Any] = Depends(current_user)) -> StreamingResponse:
+    workspace = AgentSharedWorkspace()
+    files = workspace.list_files()
+    if not files:
+        raise HTTPException(404, "Agent 工作区还没有文件")
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        for item in files:
+            target, relative = workspace.resolve_file(item["path"])
+            output.write(target, relative)
+    archive.seek(0)
+    headers = {"Content-Disposition": 'attachment; filename="agent-workspace.zip"'}
+    return StreamingResponse(archive, media_type="application/zip", headers=headers)
 
 
 @app.get("/api/conversations/{conversation_id}/workspace/files/{file_path:path}")

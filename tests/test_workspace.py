@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from app import workspace
-from app.workspace import ConversationWorkspace, WorkspaceError
+from app.workspace import AgentSharedWorkspace, ConversationWorkspace, WorkspaceError
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -136,6 +136,26 @@ class WorkspaceTests(unittest.TestCase):
                 [{"start_line": 2, "end_line": 2, "new_text": "TWO"}],
             )
         self.assertEqual(self.workspace.read_file("app.js"), before)
+
+    def test_agent_shared_workspace_lists_and_resolves_only_shared_files(self) -> None:
+        shared_root = Path(self.temp.name) / "share"
+        shared_root.mkdir()
+        (shared_root / "nested").mkdir()
+        (shared_root / "nested" / "index.html").write_text("<h1>Agent</h1>", encoding="utf-8")
+        outside = Path(self.temp.name) / "outside.txt"
+        outside.write_text("secret", encoding="utf-8")
+        (shared_root / "outside-link").symlink_to(outside)
+
+        agent_workspace = AgentSharedWorkspace(shared_root)
+        files = agent_workspace.list_files()
+        self.assertEqual(files, [{"path": "nested/index.html", "size": 14, "backend": "agent"}])
+        target, relative = agent_workspace.resolve_file("nested/index.html")
+        self.assertEqual(relative, "nested/index.html")
+        self.assertEqual(target.read_text(encoding="utf-8"), "<h1>Agent</h1>")
+        with self.assertRaises(WorkspaceError):
+            agent_workspace.resolve_file("../outside.txt")
+        with self.assertRaises(WorkspaceError):
+            agent_workspace.resolve_file("outside-link")
 
     def test_line_edits_reject_overlapping_ranges_atomically(self) -> None:
         original = "one\ntwo\nthree\n"

@@ -34,7 +34,7 @@ function setChatMode(value,persist=true){
   if(state.job&&['queued','running'].includes(state.job.status)){toast('请先停止当前回答再切换模式');return false}
   state.chatMode=mode;if(persist)storeValue('chat-mode',mode);
   $$('[data-chat-mode]').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.chatMode===mode)));
-  updateProviderUi();return true;
+  updateProviderUi();renderWorkspaceState();loadWorkspaceFiles();return true;
 }
 function browserTimezone(){try{return Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC'}catch{return 'UTC'}}
 function newAttachmentDraftId(){return globalThis.crypto&&globalThis.crypto.randomUUID?globalThis.crypto.randomUUID().replace(/-/g,''):`${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`.padEnd(32,'0').slice(0,32)}
@@ -47,7 +47,11 @@ function currentAttachmentDraftId(){
   return state.attachmentDraftId;
 }
 function formatBytes(value){const bytes=Number(value)||0;if(bytes<1024)return `${bytes}B`;if(bytes<1024*1024)return `${(bytes/1024).toFixed(1)}KB`;return `${(bytes/1024/1024).toFixed(1)}MB`}
-function workspaceFileUrl(conversationId,path){return `/api/conversations/${encodeURIComponent(conversationId)}/workspace/files/${String(path).split('/').map(encodeURIComponent).join('/')}`}
+function workspaceFileUrl(conversationId,item){
+  const path=typeof item==='string'?item:item&&item.path||'',backend=typeof item==='object'&&item&&item.backend||'conversation';
+  const encoded=String(path).split('/').map(encodeURIComponent).join('/');
+  return backend==='agent'?`/api/agent-workspace/files/${encoded}`:`/api/conversations/${encodeURIComponent(conversationId)}/workspace/files/${encoded}`;
+}
 function openWorkspaceDownload(event){
   const link=event.currentTarget,url=link&&link.href;
   if(!url)return;
@@ -57,13 +61,19 @@ function openWorkspaceDownload(event){
 }
 function wireWorkspaceDownloads(root=document){$$('[data-workspace-download]',root).forEach(link=>link.onclick=openWorkspaceDownload)}
 function renderWorkspaceState(){
-  const hasConversation=!!(state.conversation&&state.conversation.id),files=state.workspaceFiles||[];
-  $('#workspaceButton').classList.toggle('hidden',!hasConversation);$('#workspaceCount').textContent=files.length;
-  $('#workspaceSummary').textContent=files.length?`${files.length} 个文件 · ${formatBytes(files.reduce((sum,item)=>sum+(Number(item.size)||0),0))}`:'当前还没有文件。让模型编写项目时，它会把代码保存到这里。';
-  $('#workspaceFiles').innerHTML=files.length?files.map(item=>`<a class="workspace-file" data-workspace-download href="${workspaceFileUrl(state.conversation.id,item.path)}" target="_blank" rel="noopener"><span aria-hidden="true">▤</span><span class="workspace-file-name" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</span><span class="workspace-file-size">${escapeHtml(formatBytes(item.size))}</span></a>`).join(''):'<div class="workspace-empty">暂无工作区文件</div>';
-  $('#workspaceZip').classList.toggle('hidden',!files.length);$('#workspaceZip').href=hasConversation?`/api/conversations/${encodeURIComponent(state.conversation.id)}/workspace.zip`:'#';wireWorkspaceDownloads($('#workspaceModal'));
+  const agent=state.chatMode==='agent',hasConversation=!!(state.conversation&&state.conversation.id),canShow=agent||hasConversation,files=state.workspaceFiles||[];
+  $('#workspaceButton').classList.toggle('hidden',!canShow);$('#workspaceCount').textContent=files.length;
+  $('#workspaceModalTitle').textContent=agent?'Agent 文件':'对话文件';
+  $('#workspaceModalDescription').textContent=agent?'Agent 模式统一使用 /home/share；普通模式工作区与它严格分开。':'模型创建和后续修改的文件会持续保存在当前对话中。';
+  $('#workspaceSummary').textContent=files.length?`${files.length} 个文件 · ${formatBytes(files.reduce((sum,item)=>sum+(Number(item.size)||0),0))}${agent?' · /home/share':''}`:agent?'/home/share 当前还没有文件。':'当前还没有文件。让模型编写项目时，它会把代码保存到这里。';
+  $('#workspaceFiles').innerHTML=files.length?files.map(item=>`<a class="workspace-file" data-workspace-download href="${workspaceFileUrl(hasConversation?state.conversation.id:'',item)}" target="_blank" rel="noopener"><span aria-hidden="true">▤</span><span class="workspace-file-name" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</span><span class="workspace-file-size">${escapeHtml(formatBytes(item.size))}</span></a>`).join(''):'<div class="workspace-empty">暂无工作区文件</div>';
+  $('#workspaceZip').classList.toggle('hidden',!files.length);$('#workspaceZip').href=agent?'/api/agent-workspace.zip':hasConversation?`/api/conversations/${encodeURIComponent(state.conversation.id)}/workspace.zip`:'#';wireWorkspaceDownloads($('#workspaceModal'));
 }
 async function loadWorkspaceFiles(showError=false){
+  if(state.chatMode==='agent'){
+    try{const data=await api('/api/agent-workspace');state.workspaceFiles=data.files||[];renderWorkspaceState()}catch(err){if(showError)toast(err.message)}
+    return;
+  }
   if(!state.conversation||!state.conversation.id){state.workspaceFiles=[];renderWorkspaceState();return}
   try{const data=await api(`/api/conversations/${encodeURIComponent(state.conversation.id)}/workspace`);state.workspaceFiles=data.files||[];renderWorkspaceState()}catch(err){if(showError)toast(err.message)}
 }
@@ -476,8 +486,10 @@ function sourcesHtml(meta={}, detailKey='trace') {
 function workspaceArtifactsHtml(meta={}) {
   const files=Array.isArray(meta.workspace_files)?meta.workspace_files:[],conversationId=meta.conversation_id||'';
   if(!files.length||!conversationId)return '';
-  const links=files.map(item=>`<a class="message-workspace-file" data-workspace-download href="${workspaceFileUrl(conversationId,item.path)}" target="_blank" rel="noopener"><span>▤ ${escapeHtml(item.path)}</span><small>${escapeHtml(formatBytes(item.size))}</small></a>`).join('');
-  return `<div class="message-workspace"><div class="message-workspace-head"><span>工作区文件 · ${files.length}</span><a data-workspace-download href="/api/conversations/${encodeURIComponent(conversationId)}/workspace.zip" target="_blank" rel="noopener">下载全部 ZIP</a></div><div class="message-workspace-files">${links}</div></div>`;
+  const links=files.map(item=>`<a class="message-workspace-file" data-workspace-download href="${workspaceFileUrl(conversationId,item)}" target="_blank" rel="noopener"><span>▤ ${escapeHtml(item.path)}</span><small>${escapeHtml(formatBytes(item.size))}</small></a>`).join('');
+  const agent=files.some(item=>item&&item.backend==='agent');
+  const zip=agent?'/api/agent-workspace.zip':`/api/conversations/${encodeURIComponent(conversationId)}/workspace.zip`;
+  return `<div class="message-workspace"><div class="message-workspace-head"><span>${agent?'Agent 文件':'工作区文件'} · ${files.length}</span><a data-workspace-download href="${zip}" target="_blank" rel="noopener">下载全部 ZIP</a></div><div class="message-workspace-files">${links}</div></div>`;
 }
 
 function messageHtml(message, index, live=false, retryable=false) {
@@ -651,7 +663,7 @@ async function clearAllHistory() {
     const result=await api('/api/conversations',{method:'DELETE'});
     stopPolling();state.conversation=null;state.messages=[];state.job=null;state.latestConversationId=null;state.page=1;state.pages=1;state.workspaceFiles=[];
     state.pendingAttachments=[];state.attachmentDraftId=newAttachmentDraftId();detailState.clear();nestedScrollState.clear();storeValue('active-conversation',null);storeValue('attachment-draft',state.attachmentDraftId);renderPendingAttachments();setAttachmentStatus('');
-    $('#conversationTitle').textContent='新对话';renderWorkspaceState();renderMessages();await loadHistory(1);closeSidebar();
+    $('#conversationTitle').textContent='新对话';renderWorkspaceState();renderMessages();await Promise.all([loadHistory(1),loadWorkspaceFiles()]);closeSidebar();
     toast(`已删除 ${result.deleted} 个对话并释放本地空间`);
   }catch(err){toast(err.message);await loadHistory(state.page)}
 }
@@ -665,7 +677,7 @@ async function openConversation(id) {
     state.attachmentDraftId=null;state.pendingAttachments=[];renderPendingAttachments();setAttachmentStatus('');
     restoreProviderForConversation(data);
     storeValue('active-conversation', state.conversation.id);
-    $('#conversationTitle').textContent=state.conversation.title;renderWorkspaceState(); renderMessages(); await Promise.all([loadHistory(state.page),loadPendingAttachments()]);
+    $('#conversationTitle').textContent=state.conversation.title;renderWorkspaceState(); renderMessages(); await Promise.all([loadHistory(state.page),loadPendingAttachments(),loadWorkspaceFiles()]);
     if(state.job)startPolling(state.job.id);else setRunning(false);
     return true;
   } catch(err){
@@ -679,7 +691,7 @@ async function newConversation(){
   if(state.retryingAnswer){toast('正在重新回答');return}
   if(!state.conversation&&state.pendingAttachments.length)await discardPendingAttachments();
   stopPolling();state.conversation=null;state.messages=[];state.job=null;state.pendingAttachments=[];state.attachmentDraftId=newAttachmentDraftId();state.workspaceFiles=[];
-  setRunning(false);storeValue('active-conversation','__new__');storeValue('attachment-draft',state.attachmentDraftId);$('#conversationTitle').textContent='新对话';renderPendingAttachments();renderWorkspaceState();setAttachmentStatus('');renderMessages();loadHistory(1);
+  setRunning(false);storeValue('active-conversation','__new__');storeValue('attachment-draft',state.attachmentDraftId);$('#conversationTitle').textContent='新对话';renderPendingAttachments();renderWorkspaceState();setAttachmentStatus('');renderMessages();loadWorkspaceFiles();loadHistory(1);
 }
 
 async function submitPrompt(value) {
@@ -793,7 +805,8 @@ function updateProviderUi(){
   $('#welcomeTitle').textContent=agent?'让 Agent 直接管理代码与服务器':custom?'使用 Custom 本地联网':'问点需要查证的问题';
   $('#welcomeDescription').textContent=agent?(custom?'Agent 直接使用主机文件、Shell、对话、Skill 和前端管理工具。':'Agent 模式仅支持 Custom 模型，请先切换下方 API。'):custom?`模型通过标准 ${responses?'Responses':messages?'Anthropic Messages':'Chat Completions'} 协议调用 ${webInfo.label} 搜索与读取真实来源。`:'模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。';
   if($('#statusText'))$('#statusText').textContent=agent?(custom?'Agent 模式 · 主机工具已就绪':'Agent 模式 · 等待 Custom 模型'):'标准模式 · 外部搜索工具已就绪';
-  if($('#footnote'))$('#footnote').textContent=agent?'Agent 模式拥有主机级文件和命令权限，并内置编程、对话、Skill、前端管理能力；每轮最多执行一次联网工具，其他工具按顺序执行。':'标准模式：Custom API 使用你选择的搜索与网页抓取方案；DeepSeek 使用服务端原生联网。';
+  if($('#footnote'))$('#footnote').textContent=agent?'Agent 模式拥有主机级文件和命令权限，并内置编程、对话、Skill、前端管理能力；工作区固定为 /home/share，与普通模式严格分开；每轮最多执行一次联网工具，其他工具按顺序执行。':'标准模式：Custom API 使用你选择的搜索与网页抓取方案；DeepSeek 使用服务端原生联网。';
+  renderWorkspaceState();
 }
 
 async function loadProviders(){

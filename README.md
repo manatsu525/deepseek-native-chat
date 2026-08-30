@@ -29,7 +29,7 @@
 - 所有发往 `opencode.ai` 及其子域名的 Custom 请求固定发送 `User-Agent: opencode/1.18.16`，覆盖模型列表、连接测试和正式聊天流；其他供应商不发送该自定义 UA
 - NVIDIA Nemotron 3 Ultra 使用 `enable_thinking`、工具兼容标志和 16K reasoning budget；GLM-5.2 使用 `thinking.enabled` 与所选 `reasoning_effort` 档位
 - 每个对话拥有隔离且持久的编码工作区。Custom 模型可列出、读取、搜索、创建、原子批量修改和删除 UTF-8 文本文件；网页端支持单文件和 ZIP 下载。Python 文件可在 systemd 动态用户、断网、限时限内存的一次性副本中运行验证；HTML 会解析并用 Node.js 检查内联脚本、事件处理器和本地 JS，独立 JavaScript 文件也可做语法检查。运行产生的文件不会写回持久工作区。删除对话时同步清理
-- Custom 的 Agent 模式直接在真实主机上工作，拥有 root 级文件、Shell、服务、对话、Skill 和前端页面管理工具；内置编程、调试、验证、React、网页设计、对话管理和 Skill 管理 Skills，并可从 Git 或本地目录安装新 Skill。普通聊天仍使用隔离工作区，不受 Agent 权限影响。Agent 每轮最多执行一次联网工具，其余工具调用按模型发出的顺序串行执行
+- Custom 的 Agent 模式直接在真实主机上工作，拥有 root 级文件、Shell、服务、对话、Skill 和前端页面管理工具；相对路径统一使用 `/home/share`，顶部文件面板也展示和下载该目录。`/home/share` 是共享持久目录，不随单个对话删除；它与普通聊天按会话隔离的工作区严格分开。内置编程、调试、验证、React、网页设计、对话管理和 Skill 管理 Skills，并可从 Git 或本地目录安装新 Skill。Agent 每轮最多执行一次联网工具，其余工具调用按模型发出的顺序串行执行
 - 主页面提供独立的 Skills 弹框，可查看 Skill 内容、启用/禁用内置与已安装 Skill，并从 Git 仓库或本地目录安装、删除用户 Skill；不会占用聊天区布局
 - 模型名包含 `minimax` 时启用私有工具标记 fallback：标准 `tool_calls` 始终优先，泄露到正文的 `]<]minimax[>[` 调用会被隐藏并恢复；可用 `MINIMAX_TOOL_FALLBACK=0` 整体关闭
 - 模型名包含 `inkling` 时启用独立工具兼容层：解析官方 `<|content_invoke_tool_json|>` typed block；工作区不超过 12 个文件时，把补丁工具显式预绑定到具体文件，避免模型遗漏 `path`。标准 `tool_calls` 始终优先，可用 `INKLING_TOOL_COMPAT=0` 整体关闭
@@ -81,7 +81,7 @@ sudo ./uninstall.sh --yes
 
 ## 设计说明
 
-DeepSeek 使用官方 `/responses` 路由及原生联网。Custom Chat 使用标准 `/chat/completions`，Custom Responses 使用标准 `/responses`，Custom Messages 使用 Anthropic `/messages`；普通 Custom 聊天由本机后端提供 `web_search`、`fetch_webpage` 和隔离工作区工具。单独的 Custom Agent 模式改为提供真实主机工具、对话管理、Skill 管理和前端页面管理，不再使用四智能体协作；普通模式的路由、提示词和工具额度保持独立。Messages 会转换 system、图片、tool use/tool result、thinking 及签名块，并发送 `x-api-key` 和 `anthropic-version` 请求头。默认方案匿名连接 Parallel 官方 Streamable HTTP MCP；也可以手动选择 Keenable、Tavily Keyless、Firecrawl Keyless、You.com Free 或 DDG + Jina。选择后，搜索与抓取固定使用对应的一组实现，不自动切换、不 fallback、不同 provider 之间不并发。You.com Free 只提供搜索，因此它是唯一复用现有 Jina Reader 抓取的新增方案。查询词和待读取 URL 会发送给当前选择的服务。
+DeepSeek 使用官方 `/responses` 路由及原生联网。Custom Chat 使用标准 `/chat/completions`，Custom Responses 使用标准 `/responses`，Custom Messages 使用 Anthropic `/messages`；普通 Custom 聊天由本机后端提供 `web_search`、`fetch_webpage` 和按会话隔离的工作区工具。单独的 Custom Agent 模式提供真实主机工具、对话管理、Skill 管理和前端页面管理，Agent 相对路径和文件展示统一指向 `/home/share`，不再使用四智能体协作；普通模式的路由、提示词、工作区和工具额度保持独立。Messages 会转换 system、图片、tool use/tool result、thinking 及签名块，并发送 `x-api-key` 和 `anthropic-version` 请求头。默认方案匿名连接 Parallel 官方 Streamable HTTP MCP；也可以手动选择 Keenable、Tavily Keyless、Firecrawl Keyless、You.com Free 或 DDG + Jina。选择后，搜索与抓取固定使用对应的一组实现，不自动切换、不 fallback、不同 provider 之间不并发。You.com Free 只提供搜索，因此它是唯一复用现有 Jina Reader 抓取的新增方案。查询词和待读取 URL 会发送给当前选择的服务。
 
 新增匿名 MCP 由独立的轻量客户端适配：Keenable 调用 `https://api.keenable.ai/mcp` 的 `search_web_pages` / `fetch_page_content`，抓取固定发送 `live=true`；Tavily 调用 `https://mcp.tavily.com/mcp/` 的 `tavily_search` / `tavily_extract`，每次请求固定发送 `X-Tavily-Access-Mode: keyless`；Firecrawl 调用 `https://mcp.firecrawl.dev/v2/mcp`，只使用 `firecrawl_search` / `firecrawl_scrape`；You.com 调用 `https://api.you.com/mcp?profile=free` 的 `you-search`，抓取则直接复用原来的 Jina Reader。四种服务的原始响应都会归一化为相同的标题、URL、摘要和正文格式，再作为 `tool` 消息回传给 LLM。
 

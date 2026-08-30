@@ -23,7 +23,9 @@ from .skills import SkillRegistry
 from .workspace import delete_conversation_workspace
 
 
-AGENT_PROJECT_ROOT = Path(os.getenv("AGENT_PROJECT_ROOT", "/opt/deepseek-native-chat"))
+# Agent mode deliberately uses one shared host workspace.  The ordinary chat
+# path keeps its own per-conversation workspace under data/workspaces.
+AGENT_PROJECT_ROOT = Path(os.getenv("AGENT_WORKSPACE_ROOT", os.getenv("AGENT_PROJECT_ROOT", "/home/share")))
 HOST_READ_MAX_BYTES = 8 * 1024 * 1024
 HOST_WRITE_MAX_BYTES = 32 * 1024 * 1024
 HOST_OUTPUT_MAX_CHARS = 100_000
@@ -32,9 +34,9 @@ HOST_SEARCH_MAX_RESULTS = 500
 HOST_COMMAND_TIMEOUT = 900
 
 
-AGENT_SYSTEM_PROMPT = """You are the host-level Agent for this server. You have unrestricted root-level file and shell access and may install packages, edit projects, manage this application, and manage Skills when the user asks. The default host project directory is /opt/deepseek-native-chat; relative host paths are resolved from there. A persistent conversation workspace is also available for this conversation. Files placed there are the user-visible deliverables shown by the chat's workspace panel. Never claim that an operation happened without calling the corresponding tool and checking its result.
+AGENT_SYSTEM_PROMPT = """You are the host-level Agent for this server. You have unrestricted root-level file and shell access and may install packages, edit projects, manage this application, and manage Skills when the user asks. The shared Agent workspace is /home/share; relative host paths are resolved from there. It is strictly separate from the ordinary chat per-conversation workspace. The ordinary workspace tools (list_files, read_file, write_file, apply_line_edits, search_files, delete_file, run_python, and check_web_syntax) are not available in Agent mode. Never claim that an operation happened without calling the corresponding tool and checking its result.
 
-Use the installed Skills as working instructions, not as a replacement for the user's request. For code or frontend deliverables that belong to this conversation, use the conversation workspace tools (list_files, read_file, write_file, apply_line_edits, search_files, delete_file, run_python, and check_web_syntax) so the result remains attached to the conversation. For changes to the real application, repositories, server configuration, or other host resources, use the host_* and frontend_* tools; absolute host paths always remain available. For a new project, create the files directly; for an existing project, preserve unrelated work. You may create, rename, inspect, and delete conversations with the conversation tools. You may install or disable Skills at any time with the Skill tools. Frontend work should use the frontend tools for an explicitly host-installed page, and should include a real syntax/build check when practical.
+Use the installed Skills as working instructions, not as a replacement for the user's request. For code or frontend deliverables in Agent mode, use the host_* and frontend_* tools under /home/share; use absolute host paths when changing the real application, repositories, server configuration, or other host resources. For a new project, create the files directly; for an existing project, preserve unrelated work. You may create, rename, inspect, and delete conversations with the conversation tools. You may install or disable Skills at any time with the Skill tools. Frontend work should use the frontend tools and should include a real syntax/build check when practical.
 
 There are exactly two Agent scheduling rules: (1) at most one web_search or fetch_webpage call is executed in each model turn; (2) all non-web tool calls emitted in a turn execute serially in the order emitted. Host access itself is not restricted by a workspace sandbox. Do not wait for permission between ordinary tool calls; act on the user's explicit request immediately."""
 
@@ -88,9 +90,9 @@ class _FrontendParser(HTMLParser):
 HOST_TOOLS = [
     _function(
         "host_list_files",
-        "List files and directories on the real host. Relative paths use /opt/deepseek-native-chat as the base.",
+        "List files and directories on the real host. Relative paths use the shared Agent workspace /home/share as the base.",
         {
-            "path": {"type": "string", "description": "Absolute path or path relative to the project root; defaults to the project root"},
+            "path": {"type": "string", "description": "Absolute path or path relative to /home/share; defaults to /home/share"},
             "max_depth": {"type": "integer", "minimum": 0, "maximum": 20, "description": "Directory depth to include; defaults to 3"},
         },
         [],
@@ -99,7 +101,7 @@ HOST_TOOLS = [
         "host_read_file",
         "Read a UTF-8 text file from anywhere on the host with line numbers.",
         {
-            "path": {"type": "string", "description": "Absolute path or path relative to the project root"},
+            "path": {"type": "string", "description": "Absolute path or path relative to /home/share"},
             "start_line": {"type": "integer", "minimum": 1, "description": "Optional first line"},
             "end_line": {"type": "integer", "minimum": 1, "description": "Optional last inclusive line"},
         },
@@ -109,7 +111,7 @@ HOST_TOOLS = [
         "host_write_file",
         "Create or replace a UTF-8 text file anywhere on the host. Parent directories are created automatically.",
         {
-            "path": {"type": "string", "description": "Absolute path or path relative to the project root"},
+            "path": {"type": "string", "description": "Absolute path or path relative to /home/share"},
             "content": {"type": "string", "description": "Complete file contents"},
         },
         ["path", "content"],
@@ -118,7 +120,7 @@ HOST_TOOLS = [
         "host_apply_patch",
         "Replace exact text in a host file. Use replace_all only when every match should change.",
         {
-            "path": {"type": "string", "description": "Absolute path or path relative to the project root"},
+            "path": {"type": "string", "description": "Absolute path or path relative to /home/share"},
             "old_text": {"type": "string", "description": "Exact existing text"},
             "new_text": {"type": "string", "description": "Replacement text"},
             "replace_all": {"type": "boolean", "description": "Replace every match instead of requiring one match"},
@@ -130,7 +132,7 @@ HOST_TOOLS = [
         "Search literal text recursively on the host. Prefer a focused project or directory path.",
         {
             "query": {"type": "string", "description": "Literal case-insensitive text"},
-            "path": {"type": "string", "description": "Directory or file; defaults to the project root"},
+            "path": {"type": "string", "description": "Directory or file; defaults to /home/share"},
             "max_results": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum matches"},
         },
         ["query"],
@@ -140,7 +142,7 @@ HOST_TOOLS = [
         "Run an arbitrary bash command as the application user (root on this installation) on the real host. Use the returned stdout, stderr, and exit code as evidence.",
         {
             "command": {"type": "string", "description": "Bash command to execute"},
-            "cwd": {"type": "string", "description": "Working directory; defaults to the project root"},
+            "cwd": {"type": "string", "description": "Working directory; defaults to /home/share"},
             "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600, "description": "Command timeout; defaults to 900"},
             "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Optional environment overrides"},
         },
@@ -150,7 +152,7 @@ HOST_TOOLS = [
         "host_delete_path",
         "Delete a file or directory on the real host. A directory requires recursive=true.",
         {
-            "path": {"type": "string", "description": "Absolute path or path relative to the project root"},
+            "path": {"type": "string", "description": "Absolute path or path relative to /home/share"},
             "recursive": {"type": "boolean", "description": "Allow recursive directory deletion"},
         },
         ["path"],
