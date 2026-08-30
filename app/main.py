@@ -41,6 +41,7 @@ from .mimo_local import stream_response as custom_stream_response
 from .reasoning_effort import DEFAULT as DEFAULT_REASONING_EFFORT
 from .reasoning_effort import LEVELS as REASONING_EFFORT_LEVELS
 from .security import load_secret, make_token, password_hash, password_ok, read_token
+from .skills import SkillRegistry
 from .workspace import ConversationWorkspace, WorkspaceError, delete_conversation_workspace, delete_user_workspaces
 
 
@@ -151,6 +152,15 @@ class RetryBody(BaseModel):
 
 class PinBody(BaseModel):
     pinned: bool
+
+
+class SkillInstallBody(BaseModel):
+    source: str = Field(min_length=1, max_length=4_000)
+    name: str = Field(default="", max_length=100)
+
+
+class SkillEnabledBody(BaseModel):
+    enabled: bool
 
 
 def normalize_custom_settings(value: Any = None) -> dict[str, Any]:
@@ -711,6 +721,75 @@ def logout(response: Response) -> dict[str, bool]:
 @app.get("/api/me")
 def me(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     return user
+
+
+def public_skill(skill: Any, enabled: bool | None = None) -> dict[str, Any]:
+    """Return the small, UI-safe representation used by the Skill panel."""
+    return {
+        "id": skill.skill_id,
+        "name": skill.name,
+        "description": skill.description,
+        "builtin": bool(skill.builtin),
+        "enabled": bool(enabled) if enabled is not None else False,
+    }
+
+
+@app.get("/api/skills")
+def list_skills(_: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    registry = SkillRegistry()
+    enabled = set(registry.enabled_ids())
+    return {
+        "skills": [public_skill(skill, skill.skill_id in enabled) for skill in registry.all()],
+        "enabled": sorted(enabled),
+    }
+
+
+@app.post("/api/skills/install")
+def install_skill(body: SkillInstallBody, _: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    try:
+        registry = SkillRegistry()
+        skill = registry.install(body.source, body.name)
+        registry.set_enabled(skill.skill_id, True)
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise HTTPException(400, str(exc)[:4_000]) from exc
+    return {"skill": public_skill(skill, True)}
+
+
+@app.get("/api/skills/{skill_id:path}")
+def read_skill(skill_id: str, _: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    registry = SkillRegistry()
+    skill = registry.find(skill_id)
+    if skill is None:
+        raise HTTPException(404, "Skill 不存在")
+    try:
+        content = registry.read(skill.skill_id)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)[:4_000]) from exc
+    return {"skill": public_skill(skill, skill.skill_id in set(registry.enabled_ids())), "content": content}
+
+
+@app.put("/api/skills/{skill_id:path}/enabled")
+def set_skill_enabled(skill_id: str, body: SkillEnabledBody, _: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    try:
+        registry = SkillRegistry()
+        enabled = registry.set_enabled(skill_id, body.enabled)
+        skill = registry.find(skill_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)[:4_000]) from exc
+    if skill is None:
+        raise HTTPException(404, "Skill 不存在")
+    return {"skill": public_skill(skill, skill.skill_id in set(enabled)), "enabled": enabled}
+
+
+@app.delete("/api/skills/{skill_id:path}")
+def remove_skill(skill_id: str, _: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    try:
+        SkillRegistry().remove(skill_id)
+    except ValueError as exc:
+        message = str(exc)
+        status = 404 if "不存在" in message else 400
+        raise HTTPException(status, message[:4_000]) from exc
+    return {"ok": True, "skill_id": skill_id}
 
 
 @app.get("/api/users")

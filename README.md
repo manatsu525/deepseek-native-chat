@@ -30,6 +30,7 @@
 - NVIDIA Nemotron 3 Ultra 使用 `enable_thinking`、工具兼容标志和 16K reasoning budget；GLM-5.2 使用 `thinking.enabled` 与所选 `reasoning_effort` 档位
 - 每个对话拥有隔离且持久的编码工作区。Custom 模型可列出、读取、搜索、创建、原子批量修改和删除 UTF-8 文本文件；网页端支持单文件和 ZIP 下载。Python 文件可在 systemd 动态用户、断网、限时限内存的一次性副本中运行验证；HTML 会解析并用 Node.js 检查内联脚本、事件处理器和本地 JS，独立 JavaScript 文件也可做语法检查。运行产生的文件不会写回持久工作区。删除对话时同步清理
 - Custom 的 Agent 模式直接在真实主机上工作，拥有 root 级文件、Shell、服务、对话、Skill 和前端页面管理工具；内置编程、调试、验证、React、网页设计、对话管理和 Skill 管理 Skills，并可从 Git 或本地目录安装新 Skill。普通聊天仍使用隔离工作区，不受 Agent 权限影响。Agent 每轮最多执行一次联网工具，其余工具调用按模型发出的顺序串行执行
+- 主页面提供独立的 Skills 弹框，可查看 Skill 内容、启用/禁用内置与已安装 Skill，并从 Git 仓库或本地目录安装、删除用户 Skill；不会占用聊天区布局
 - 模型名包含 `minimax` 时启用私有工具标记 fallback：标准 `tool_calls` 始终优先，泄露到正文的 `]<]minimax[>[` 调用会被隐藏并恢复；可用 `MINIMAX_TOOL_FALLBACK=0` 整体关闭
 - 模型名包含 `inkling` 时启用独立工具兼容层：解析官方 `<|content_invoke_tool_json|>` typed block；工作区不超过 12 个文件时，把补丁工具显式预绑定到具体文件，避免模型遗漏 `path`。标准 `tool_calls` 始终优先，可用 `INKLING_TOOL_COMPAT=0` 整体关闭
 

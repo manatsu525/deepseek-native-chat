@@ -179,10 +179,14 @@ class SkillRegistry:
         if destination.exists():
             raise ValueError(f"Skill 目录已存在：{target_name}")
         if source_value.startswith(("http://", "https://", "git@")) or source_value.endswith(".git"):
-            completed = subprocess.run(
-                ["git", "clone", "--depth", "1", source_value, str(destination)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300, check=False,
-            )
+            try:
+                completed = subprocess.run(
+                    ["git", "clone", "--depth", "1", source_value, str(destination)],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300, check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                shutil.rmtree(destination, ignore_errors=True)
+                raise RuntimeError("git clone 超时（超过 300 秒）") from exc
             if completed.returncode != 0:
                 shutil.rmtree(destination, ignore_errors=True)
                 raise RuntimeError((completed.stderr or completed.stdout or "git clone 失败")[-4_000:])

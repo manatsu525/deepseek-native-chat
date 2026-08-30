@@ -1,6 +1,6 @@
 const $ = (s, root=document) => root.querySelector(s);
 const $$ = (s, root=document) => [...root.querySelectorAll(s)];
-const state = {me:null, providers:[], conversation:null, messages:[], job:null, page:1, pages:1, poll:null, latestConversationId:null, editingProviderId:null, pendingAttachments:[], attachmentDraftId:null, uploadingAttachments:false,retryingAnswer:false,workspaceFiles:[],chatMode:'standard'};
+const state = {me:null, providers:[], skills:[], skillDetailId:null, conversation:null, messages:[], job:null, page:1, pages:1, poll:null, latestConversationId:null, editingProviderId:null, pendingAttachments:[], attachmentDraftId:null, uploadingAttachments:false,retryingAnswer:false,workspaceFiles:[],chatMode:'standard'};
 const detailState = new Map();
 const nestedScrollState = new Map();
 const MAX_ATTACHMENT_FILES = 10;
@@ -78,6 +78,72 @@ async function api(path, options={}) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.detail || `请求失败 (${response.status})`);
   return data;
+}
+
+function skillEndpoint(id,suffix=''){
+  const path=String(id||'').split('/').filter(Boolean).map(encodeURIComponent).join('/');
+  return `/api/skills/${path}${suffix}`;
+}
+function clearSkillDetail(){
+  state.skillDetailId=null;
+  $('#skillDetail').classList.add('hidden');
+  $('#skillDetailTitle').textContent='Skill 内容';
+  $('#skillContent').textContent='';
+}
+function renderSkills(){
+  const skills=Array.isArray(state.skills)?state.skills:[],enabled=skills.filter(item=>item.enabled).length;
+  $('#skillsSummary').textContent=skills.length?`${skills.length} 个 Skill · ${enabled} 个已启用`:'没有可用 Skill';
+  $('#skillList').innerHTML=skills.length?skills.map(skill=>{
+    const id=escapeHtml(skill.id||''),name=escapeHtml(skill.name||skill.id||'未命名 Skill'),description=escapeHtml(skill.description||'暂无描述');
+    const badge=skill.builtin?'<span class="skill-item-badge">内置</span>':'<span class="skill-item-badge user">已安装</span>';
+    const toggle=skill.enabled?'禁用':'启用',toggleClass=skill.enabled?'soft-btn':'primary';
+    return `<article class="skill-item"><div class="skill-item-main"><strong>${name}${badge}</strong><small>${description}</small></div><div class="skill-item-actions"><button class="${toggleClass}" type="button" data-skill-read="${id}">查看</button><button class="soft-btn" type="button" data-skill-toggle="${id}" data-skill-enabled="${skill.enabled?'true':'false'}">${toggle}</button>${skill.builtin?'':`<button class="danger-btn" type="button" data-skill-delete="${id}">删除</button>`}</div></article>`;
+  }).join(''):'<div class="skill-list-empty">暂无 Skill</div>';
+  $$('[data-skill-read]',$('#skillList')).forEach(button=>button.onclick=()=>readSkill(button.dataset.skillRead));
+  $$('[data-skill-toggle]',$('#skillList')).forEach(button=>button.onclick=()=>toggleSkill(button));
+  $$('[data-skill-delete]',$('#skillList')).forEach(button=>button.onclick=()=>deleteSkill(button.dataset.skillDelete));
+}
+async function loadSkills(showError=false){
+  try{
+    const data=await api('/api/skills');state.skills=data.skills||[];renderSkills();
+  }catch(err){
+    $('#skillsSummary').textContent='Skill 读取失败';
+    if(showError)$('#skillStatus').textContent=err.message;
+  }
+}
+async function readSkill(id){
+  $('#skillStatus').textContent='正在读取 Skill…';
+  try{
+    const data=await api(skillEndpoint(id));
+    state.skillDetailId=id;
+    $('#skillDetailTitle').textContent=`${data.skill.name||id} · ${data.skill.builtin?'内置':'已安装'}`;
+    $('#skillContent').textContent=data.content||'';
+    $('#skillDetail').classList.remove('hidden');
+    $('#skillStatus').textContent='';
+  }catch(err){$('#skillStatus').textContent=err.message}
+}
+async function toggleSkill(button){
+  const id=button.dataset.skillToggle,enabled=button.dataset.skillEnabled!=='true';
+  button.disabled=true;$('#skillStatus').textContent=`正在${enabled?'启用':'禁用'} Skill…`;
+  try{await api(skillEndpoint(id,'/enabled'),{method:'PUT',body:{enabled}});await loadSkills();$('#skillStatus').textContent=`Skill 已${enabled?'启用':'禁用'}`}catch(err){$('#skillStatus').textContent=err.message}finally{button.disabled=false}
+}
+async function deleteSkill(id){
+  if(!confirm(`删除用户安装的 Skill “${id}”？`))return;
+  $('#skillStatus').textContent='正在删除 Skill…';
+  try{await api(skillEndpoint(id),{method:'DELETE'});if(state.skillDetailId===id)clearSkillDetail();await loadSkills();$('#skillStatus').textContent='Skill 已删除'}catch(err){$('#skillStatus').textContent=err.message}
+}
+async function openSkills(){
+  $('#skillStatus').textContent='';clearSkillDetail();$('#skillsModal').showModal();await loadSkills(true);
+}
+async function installSkill(event){
+  event.preventDefault();
+  const source=$('#skillSource').value.trim(),name=$('#skillName').value.trim(),button=$('#skillInstallButton');
+  if(!source)return;
+  button.disabled=true;$('#skillStatus').textContent='正在安装 Skill…';
+  try{
+    const data=await api('/api/skills/install',{method:'POST',body:{source,name}});
+    event.target.reset();await loadSkills();await readSkill(data.skill.id);$('#skillStatus').textContent=`已安装并启用：${data.skill.name}`;
+  }catch(err){$('#skillStatus').textContent=err.message}finally{button.disabled=false}
 }
 
 function toast(message) {
@@ -864,11 +930,12 @@ $('#prompt').oninput=resizePrompt;
 $('#attachButton').onclick=()=>{if(!state.uploadingAttachments&&!state.retryingAnswer&&!(state.job&&['queued','running'].includes(state.job.status)))$('#fileInput').click()};
 $('#fileInput').onchange=async event=>{const files=[...(event.target.files||[])];event.target.value='';await selectAttachments(files)};
 $('#stopButton').onclick=async()=>{if(state.job&&state.job.id){await api(`/api/jobs/${state.job.id}/stop`,{method:'POST'});toast('正在停止')}};
-$('#providerButton').onclick=()=>{resetProviderEditor();$('#providerModal').showModal();renderProviderList()};$('#usersButton').onclick=()=>{loadUsers();$('#usersModal').showModal()};
+$('#providerButton').onclick=()=>{resetProviderEditor();$('#providerModal').showModal();renderProviderList()};$('#skillsButton').onclick=openSkills;$('#skillsRefresh').onclick=()=>loadSkills(true);$('#skillDetailClose').onclick=clearSkillDetail;$('#usersButton').onclick=()=>{loadUsers();$('#usersModal').showModal()};
 $('#customSettingsButton').onclick=openCustomSettings;$('#providerSelect').onchange=()=>{const provider=selectedProvider();if(provider){storeValue('active-provider',provider.id);storeValue('active-model',selectedModel())}updateProviderUi()};$('#providerType').onchange=syncProviderForm;$('#customThinking').onchange=syncCustomThinkingFields;$('#customReasoningEffortEnabled').onchange=syncCustomThinkingFields;$('#customWebToolBackend').onchange=syncCustomToolFields;$('#customModelFilter').oninput=e=>{const value=e.target.value.trim().toLowerCase();$$('.custom-model-option',$('#customModelList')).forEach(item=>item.dataset.hidden=value&&!item.dataset.model.includes(value)?'1':'0')};
 $$('.close-modal').forEach(b=>b.onclick=()=>b.closest('dialog').close());$$('dialog').forEach(d=>d.onclick=e=>{if(e.target===d)d.close()});
 $('#testProvider').onclick=testProvider;$('#cancelProviderEdit').onclick=resetProviderEditor;$('#providerForm').onsubmit=async e=>{e.preventDefault();try{const body=providerFormData();if(state.editingProviderId){await api(`/api/providers/${state.editingProviderId}`,{method:'PUT',body});resetProviderEditor();await loadProviders();toast('API 已更新')}else{await api('/api/providers',{method:'POST',body});resetProviderEditor();await loadProviders();toast('API 已保存')}}catch(err){$('#providerStatus').textContent=err.message}};
 $('#customForm').onsubmit=saveCustomSettings;
+$('#skillInstallForm').onsubmit=installSkill;
 $('#userForm').onsubmit=async e=>{e.preventDefault();try{await api('/api/users',{method:'POST',body:{username:$('#newUsername').value,password:$('#newPassword').value,is_admin:$('#newAdmin').checked}});e.target.reset();await loadUsers();toast('账号已新增')}catch(err){toast(err.message)}};
 $('#passwordForm').onsubmit=async e=>{e.preventDefault();const password=$('#changePassword').value;if(password!==$('#changePasswordAgain').value){$('#passwordError').textContent='两次输入的密码不一致';return}try{await api(`/api/users/${$('#passwordUserId').value}/password`,{method:'PUT',body:{password}});$('#passwordModal').close();toast('密码已修改')}catch(err){$('#passwordError').textContent=err.message}};
 $('#openSidebar').onclick=openSidebar;$('#closeSidebar').onclick=closeSidebar;$('#scrim').onclick=closeSidebar;
