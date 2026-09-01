@@ -188,6 +188,8 @@
         <label class="check"><input id="customLowestPriceVercel" type="checkbox"> Vercel AI Gateway（<code>sort=cost</code>）</label>
         <p class="muted custom-cost-note">只勾选当前模型所在的聚合商；未勾选时不会改写模型名或请求路由。</p>
       </div>
+      <label class="wide">高级请求 JSON（当前模型）<textarea id="customRequestOverrides" rows="7" spellcheck="false" autocapitalize="off" placeholder='例如：{"session_id":"{{conversation_id}}"}'></textarea></label>
+      <p class="wide muted custom-cost-note">这里填写 JSON 对象，会在服务端生成的请求体上最后合并。支持变量：<code>{{conversation_id}}</code>、<code>{{model}}</code>、<code>{{base_url}}</code>、<code>{{api_protocol}}</code>、<code>{{effort}}</code>。不能覆盖模型、上下文、流式和工具字段。</p>
       <label class="check wide"><input id="customDsmlFallbackEnabled" type="checkbox"> OpenCode DeepSeek V4 Flash：启用 DSML 工具调用兜底</label>
       <label>最大生成 Token<input id="customMaxCompletion" type="number" min="256" max="131072" step="256" value="65536"></label>
       <label>temperature<input id="customTemperature" type="number" min="0" max="1.5" step="0.05" value="1"></label>

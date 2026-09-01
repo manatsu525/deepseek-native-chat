@@ -93,7 +93,16 @@ class CustomModelSettingsTests(unittest.TestCase):
             ),
         )
 
-    def settings_body(self, model: str, *, temperature: float, backend: str, effort: str = "high", aggregators: tuple[str, ...] = ()) -> dict:
+    def settings_body(
+        self,
+        model: str,
+        *,
+        temperature: float,
+        backend: str,
+        effort: str = "high",
+        aggregators: tuple[str, ...] = (),
+        request_overrides: dict | None = None,
+    ) -> dict:
         return {
             "model": model,
             "thinking": "enabled",
@@ -105,6 +114,7 @@ class CustomModelSettingsTests(unittest.TestCase):
             "temperature": temperature,
             "top_p": 0.9,
             "web_tool_backend": backend,
+            "request_overrides": request_overrides or {},
         }
 
     def wait_for_job(self, job_id: str) -> dict:
@@ -277,6 +287,35 @@ class CustomModelSettingsTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["models"], ["tencent/hy3"])
+
+    def test_request_overrides_are_independent_and_reject_reserved_envelopes(self) -> None:
+        provider_id = self.add_legacy_provider()
+        first = self.settings_body(
+            "model-a",
+            temperature=0.8,
+            backend="parallel",
+            request_overrides={
+                "session_id": "{{conversation_id}}",
+                "provider": {"only": ["meta"]},
+            },
+        )
+        response = self.client.put(f"/api/providers/{provider_id}/settings", json=first)
+        self.assertEqual(response.status_code, 200, response.text)
+        provider = response.json()
+        self.assertEqual(
+            provider["model_settings"]["model-a"]["request_overrides"],
+            first["request_overrides"],
+        )
+        self.assertEqual(provider["model_settings"]["model-b"]["request_overrides"], {})
+
+        invalid = self.settings_body(
+            "model-a",
+            temperature=0.8,
+            backend="parallel",
+            request_overrides={"input": "replace the conversation"},
+        )
+        response = self.client.put(f"/api/providers/{provider_id}/settings", json=invalid)
+        self.assertEqual(response.status_code, 422, response.text)
 
 
 if __name__ == "__main__":

@@ -95,6 +95,7 @@ DEFAULT_SETTINGS = {
     "temperature": 1.0,
     "top_p": 0.95,
     "web_tool_backend": "parallel",
+    "request_overrides": {},
 }
 
 _jina_call_times: deque[float] = deque()

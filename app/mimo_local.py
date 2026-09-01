@@ -13,6 +13,7 @@ import httpx
 from curl_cffi import requests as curl_requests
 
 from .custom_tool_normalization import normalize_tool_calls
+from .custom_request import apply_request_overrides
 from .agent import AGENT_SYSTEM_PROMPT
 from .keyless_web import (
     KEYLESS_CUSTOM_SYSTEM_PROMPT,
@@ -928,6 +929,17 @@ async def stream_response(
                     payload["top_p"] = float(config["top_p"])
 
             _apply_lowest_price_routing(payload, model, config)
+            apply_request_overrides(
+                payload,
+                config.get("request_overrides"),
+                context={
+                    "conversation_id": conversation_id,
+                    "model": model,
+                    "base_url": base_url,
+                    "api_protocol": api_protocol,
+                    "effort": normalize_reasoning_effort(effort),
+                },
+            )
             round_answer = ""
             round_preview = ""
             round_reasoning = ""

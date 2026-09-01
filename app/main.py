@@ -18,11 +18,12 @@ import uvicorn
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from . import attachments
 from .agent import AgentRuntime, build_agent_skills_prompt
 from .config import settings
+from .custom_request import validate_request_overrides
 from .db import Database
 from .deepseek import list_models as deepseek_list_models
 from .deepseek import stream_response as deepseek_stream_response
@@ -124,6 +125,12 @@ class CustomSettingsBody(BaseModel):
     temperature: float = Field(default=1.0, ge=0, le=1.5)
     top_p: float = Field(default=0.95, ge=0.01, le=1)
     web_tool_backend: Literal["parallel", "keenable", "tavily", "firecrawl", "you", "legacy"] = "parallel"
+    request_overrides: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("request_overrides")
+    @classmethod
+    def validate_request_overrides_field(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return validate_request_overrides(value)
 
 
 class CustomModelSettingsBody(CustomSettingsBody):
