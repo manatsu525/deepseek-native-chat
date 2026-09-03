@@ -1159,16 +1159,10 @@ async def stream_response(
                     continue
                 raise RuntimeError("模型在工具额度用完后仍反复输出工具调用，未生成最终答案")
 
+            answer += round_answer
             reasoning += round_reasoning
             if not calls or final_answer_only:
-                answer += round_answer
                 break
-
-            # Text emitted alongside tool calls is transient narration, not the
-            # final answer. Keep it in the assistant tool-call message below so
-            # the next model round retains full context, but do not accumulate it
-            # into the user-facing answer (especially for models without a
-            # separate reasoning channel).
 
             # Execute all workspace calls from this response in emitted order.
             # Web calls remain capped at one per model round for cost and abuse control.
