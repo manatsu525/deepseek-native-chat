@@ -496,7 +496,12 @@ def _responses_content(content: Any, role: str) -> Any:
 
 
 def _responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert the agent's internal Chat history into Responses API input."""
+    """Convert internal history while preserving native Responses output items.
+
+    Reasoning models can return opaque reasoning items alongside function calls.
+    When context is managed manually, those items must be replayed unchanged on
+    the next request so the model can continue the same tool-use plan.
+    """
     result: list[dict[str, Any]] = []
     for message in messages:
         role = str(message.get("role") or "user")
@@ -511,14 +516,30 @@ def _responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         tool_calls = message.get("tool_calls") or []
         content = message.get("content")
-        if content not in (None, "", []):
+        raw_output_items = [
+            dict(item)
+            for item in message.get("responses_output_items") or []
+            if isinstance(item, dict) and item.get("type")
+        ]
+        if raw_output_items:
+            result.extend(raw_output_items)
+        raw_has_message = any(item.get("type") == "message" for item in raw_output_items)
+        raw_call_ids = {
+            str(item.get("call_id") or item.get("id") or "")
+            for item in raw_output_items
+            if item.get("type") == "function_call"
+        }
+        if content not in (None, "", []) and not raw_has_message:
             result.append({"role": role, "content": _responses_content(content, role)})
         for call in tool_calls:
             function = call.get("function") or {}
+            call_id = str(call.get("id") or "")
+            if call_id in raw_call_ids:
+                continue
             result.append(
                 {
                     "type": "function_call",
-                    "call_id": str(call.get("id") or ""),
+                    "call_id": call_id,
                     "name": str(function.get("name") or ""),
                     "arguments": str(function.get("arguments") or "{}"),
                 }
@@ -876,6 +897,10 @@ async def stream_response(
                 }
                 if bool(config.get("reasoning_effort_enabled", True)):
                     payload["reasoning"] = {"effort": normalize_reasoning_effort(effort)}
+                    # The loop manages context itself rather than using
+                    # previous_response_id, so request the opaque reasoning
+                    # state needed for the next function-call turn.
+                    payload["include"] = ["reasoning.encrypted_content"]
                 payload["temperature"] = float(config["temperature"])
                 payload["top_p"] = float(config["top_p"])
                 if round_tools:
@@ -947,6 +972,7 @@ async def stream_response(
             anthropic_usage: dict[str, Any] = {}
             anthropic_thinking_blocks: dict[int, dict[str, Any]] = {}
             round_tools_by_index: dict[int, dict[str, Any]] = {}
+            responses_output_items_by_index: dict[int, dict[str, Any]] = {}
             markup_stream = (
                 InklingStreamBuffer()
                 if inkling_compat_active
@@ -982,7 +1008,12 @@ async def stream_response(
                     event_type = str(data.get("type") or "")
                     raw_usage = data.get("usage")
                     if event_type in {"response.completed", "response.incomplete"}:
-                        raw_usage = (data.get("response") or {}).get("usage") or raw_usage
+                        completed_response = data.get("response") or {}
+                        raw_usage = completed_response.get("usage") or raw_usage
+                        if responses_protocol:
+                            for output_index, output_item in enumerate(completed_response.get("output") or []):
+                                if isinstance(output_item, dict) and output_item.get("type"):
+                                    responses_output_items_by_index[output_index] = dict(output_item)
                     if messages_protocol and event_type == "message_start":
                         raw_usage = (data.get("message") or {}).get("usage") or raw_usage
                     if isinstance(raw_usage, dict):
@@ -1001,8 +1032,10 @@ async def stream_response(
                             round_reasoning += str(data.get("delta") or "")
                         elif event_type in {"response.output_item.added", "response.output_item.done"}:
                             item = data.get("item") or {}
+                            index = int(data.get("output_index") or 0)
+                            if event_type == "response.output_item.done" and isinstance(item, dict) and item.get("type"):
+                                responses_output_items_by_index[index] = dict(item)
                             if item.get("type") == "function_call":
-                                index = int(data.get("output_index") or 0)
                                 current = round_tools_by_index.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
                                 current["id"] = str(item.get("call_id") or item.get("id") or current.get("id") or "")
                                 current["function"]["name"] = str(item.get("name") or current["function"].get("name") or "")
@@ -1158,6 +1191,11 @@ async def stream_response(
             if messages_protocol and anthropic_thinking_blocks:
                 assistant_message["anthropic_thinking_blocks"] = [
                     anthropic_thinking_blocks[index] for index in sorted(anthropic_thinking_blocks)
+                ]
+            if responses_protocol and responses_output_items_by_index:
+                assistant_message["responses_output_items"] = [
+                    responses_output_items_by_index[index]
+                    for index in sorted(responses_output_items_by_index)
                 ]
             conversation.append(assistant_message)
             tool_rounds_used += 1
