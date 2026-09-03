@@ -172,6 +172,106 @@ class ContextEfficiencyTests(unittest.TestCase):
             finally:
                 workspace_module.WORKSPACES_DIR = original
 
+    def test_checkpoint_keeps_read_evidence_and_dedupe_in_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "checkpoint-evidence")
+            workspace.root = Path(directory)
+            workspace.write_file(
+                "app.py",
+                "".join(f"line {number}: {'x' * 36}\n" for number in range(1, 801)),
+            )
+            snapshot = json.loads(workspace.execute("read_file", {"path": "app.py"}))
+            read_key = ("app.py", 1, None)
+            evidence = {read_key: snapshot}
+            reads = {read_key}
+            base = [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "fix it"},
+            ]
+            read_pair = [
+                {
+                    "role": "assistant",
+                    "content": "inspect",
+                    "tool_calls": [{"id": "read", "function": {"name": "read_file", "arguments": "{}"}}],
+                },
+                {"role": "tool", "tool_call_id": "read", "content": json.dumps(snapshot)},
+            ]
+            latest_pair = [
+                {
+                    "role": "assistant",
+                    "content": "research",
+                    "tool_calls": [{"id": "search", "function": {"name": "web_search", "arguments": "{}"}}],
+                },
+                {"role": "tool", "tool_call_id": "search", "content": "result" * 10_000},
+            ]
+            conversation = [*base, *read_pair, *latest_pair]
+
+            changed = _maybe_compact_agent_context(
+                conversation,
+                base_message_count=len(base),
+                workspace=workspace,
+                sources={},
+                tool_trace=[
+                    {"name": "read_file", "path": "app.py", "status": "completed"},
+                    {"name": "web_search", "status": "completed"},
+                ],
+                workspace_read_evidence=evidence,
+                workspace_reads=reads,
+            )
+
+            self.assertTrue(changed)
+            checkpoint = json.loads(conversation[0]["content"].split("CONTEXT CHECKPOINT:\n", 1)[1])
+            self.assertEqual(checkpoint["workspace_read_snapshots"], [snapshot])
+            self.assertEqual(reads, {read_key})
+            self.assertEqual(conversation[-2:], latest_pair)
+
+            evidence.clear()
+            reads.clear()
+            refreshed = _maybe_compact_agent_context(
+                conversation,
+                base_message_count=len(base),
+                workspace=workspace,
+                sources={},
+                tool_trace=[{"name": "apply_line_edits", "path": "app.py", "status": "completed"}],
+                workspace_read_evidence=evidence,
+                workspace_reads=reads,
+                refresh_existing=True,
+            )
+            self.assertTrue(refreshed)
+            checkpoint = json.loads(conversation[0]["content"].split("CONTEXT CHECKPOINT:\n", 1)[1])
+            self.assertEqual(checkpoint["workspace_read_snapshots"], [])
+
+    def test_checkpoint_invalidates_dedupe_for_evidence_it_cannot_keep(self) -> None:
+        conversation = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "fix"},
+            {"role": "assistant", "content": "x" * (AGENT_CONTEXT_COMPACT_THRESHOLD + 1)},
+            {"role": "tool", "tool_call_id": "latest", "content": "latest"},
+        ]
+        read_key = ("huge.py", 1, None)
+        evidence = {
+            read_key: {
+                "path": "huge.py",
+                "revision": "r",
+                "numbered_content": "x" * 70_000,
+            }
+        }
+        reads = {read_key}
+
+        self.assertTrue(
+            _maybe_compact_agent_context(
+                conversation,
+                base_message_count=2,
+                workspace=None,
+                sources={},
+                tool_trace=[],
+                workspace_read_evidence=evidence,
+                workspace_reads=reads,
+            )
+        )
+        self.assertEqual(reads, set())
+        self.assertEqual(evidence, {})
+
 
 class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_identical_validation_is_skipped_until_workspace_changes(self) -> None:

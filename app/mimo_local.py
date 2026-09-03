@@ -93,6 +93,7 @@ WORKSPACE_ARGUMENT_COMPACT_THRESHOLD = 4096
 # second safety valve for oversized agent histories.
 FRESH_WRITE_CONTEXT_THRESHOLD = 60_000
 AGENT_CONTEXT_COMPACT_THRESHOLD = 80_000
+CHECKPOINT_READ_EVIDENCE_CHARS = 60_000
 WORKSPACE_MUTATION_TOOLS = {"write_file", "apply_line_edits", "apply_patch", "apply_patch_batch", "delete_file"}
 FINAL_ANSWER_PROMPT = (
     "CRITICAL FINALIZATION INSTRUCTION: The tool-call budget is completely exhausted. "
@@ -309,6 +310,9 @@ def _maybe_compact_agent_context(
     workspace: ConversationWorkspace | None,
     sources: dict[str, dict[str, str]],
     tool_trace: list[dict[str, Any]],
+    workspace_read_evidence: dict[tuple[str, int, int | None], dict[str, Any]] | None = None,
+    workspace_reads: set[tuple[str, int, int | None]] | None = None,
+    refresh_existing: bool = False,
 ) -> bool:
     """Checkpoint oversized internal tool history without another model call.
 
@@ -318,9 +322,12 @@ def _maybe_compact_agent_context(
     while the newest assistant/tool pair is kept verbatim for continuity.
     """
     internal = conversation[base_message_count:]
-    if _serialized_chars(internal) <= AGENT_CONTEXT_COMPACT_THRESHOLD:
+    marker = "\n\nCONTEXT CHECKPOINT:\n"
+    existing_checkpoint = bool(conversation and marker in str(conversation[0].get("content") or ""))
+    over_high_water = _serialized_chars(internal) > AGENT_CONTEXT_COMPACT_THRESHOLD
+    if not over_high_water and not (refresh_existing and existing_checkpoint):
         return False
-    keep = internal[-2:] if len(internal) >= 2 else internal
+    keep = internal[-2:] if over_high_water and len(internal) >= 2 else internal
     files = workspace.list_files() if workspace is not None else []
     source_state = [
         {
@@ -340,20 +347,43 @@ def _maybe_compact_agent_context(
         }
         for item in tool_trace[-30:]
     ]
+    read_snapshots: list[dict[str, Any]] = []
+    preserved_read_keys: set[tuple[str, int, int | None]] = set()
+    evidence_chars = 0
+    if workspace_read_evidence:
+        for read_key, snapshot in reversed(list(workspace_read_evidence.items())):
+            snapshot_chars = len(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")))
+            if evidence_chars + snapshot_chars > CHECKPOINT_READ_EVIDENCE_CHARS:
+                continue
+            read_snapshots.append(dict(snapshot))
+            preserved_read_keys.add(read_key)
+            evidence_chars += snapshot_chars
+        read_snapshots.reverse()
+    if workspace_reads is not None:
+        # A duplicate may only be skipped while its exact returned content is
+        # still present in the request. Compaction and deduplication must share
+        # the same source of truth.
+        workspace_reads.intersection_update(preserved_read_keys)
+    if workspace_read_evidence is not None:
+        for read_key in list(workspace_read_evidence):
+            if read_key not in preserved_read_keys:
+                del workspace_read_evidence[read_key]
     checkpoint = {
         "context_checkpoint": True,
         "instruction": (
-            "Verbose older tool traffic was compacted. The workspace files below are authoritative; "
-            "read a file again only when its current contents are needed. Do not repeat completed searches or operations."
+            "Verbose older tool traffic was compacted. workspace_read_snapshots below contain exact current file "
+            "content, line numbers, and revisions that remain available in this request; do not read those ranges "
+            "again. workspace_files is metadata only. Do not repeat completed searches or operations."
         ),
         "workspace_files": files,
+        "workspace_read_snapshots": read_snapshots,
         "sources": source_state,
         "recent_operations": operations,
     }
     base = [dict(message) for message in conversation[:base_message_count]]
     checkpoint_text = json.dumps(checkpoint, ensure_ascii=False, separators=(",", ":"))
     if base and base[0].get("role") == "system":
-        original_system = str(base[0].get("content") or "").split("\n\nCONTEXT CHECKPOINT:\n", 1)[0]
+        original_system = str(base[0].get("content") or "").split(marker, 1)[0]
         base[0]["content"] = f"{original_system}\n\nCONTEXT CHECKPOINT:\n{checkpoint_text}"
     else:
         base.insert(0, {"role": "system", "content": f"CONTEXT CHECKPOINT:\n{checkpoint_text}"})
@@ -785,6 +815,7 @@ async def stream_response(
     final_answer_attempts = 0
     force_final_answer = False
     workspace_reads: set[tuple[str, int, int | None]] = set()
+    workspace_read_evidence: dict[tuple[str, int, int | None], dict[str, Any]] = {}
     workspace_searches: set[str] = set()
     workspace_validations: set[tuple[int, str]] = set()
     workspace_list_generations: set[int] = set()
@@ -1193,6 +1224,7 @@ async def stream_response(
                 ]
             conversation.append(assistant_message)
             tool_rounds_used += 1
+            generation_before_calls = workspace_generation
             for call in calls:
                 call_id = call["id"]
                 function = call.get("function") or {}
@@ -1390,6 +1422,11 @@ async def stream_response(
                             elif workspace_name in WORKSPACE_MUTATION_TOOLS:
                                 workspace_generation += 1
                                 workspace_reads = {item for item in workspace_reads if item[0] != normalized_path}
+                                workspace_read_evidence = {
+                                    key: value
+                                    for key, value in workspace_read_evidence.items()
+                                    if key[0] != normalized_path
+                                }
                                 workspace_searches.clear()
                         if workspace_name == "read_file" and not workspace_call_skipped:
                             try:
@@ -1405,6 +1442,36 @@ async def stream_response(
                                 ):
                                     if field in read_result:
                                         step[field] = read_result[field]
+                                snapshot = {
+                                    field: read_result[field]
+                                    for field in (
+                                        "path",
+                                        "revision",
+                                        "line_count",
+                                        "returned_from_line",
+                                        "returned_through_line",
+                                        "truncated",
+                                        "numbered_content",
+                                    )
+                                    if field in read_result
+                                }
+                                snapshot_from = int(read_result.get("returned_from_line") or 0)
+                                snapshot_through = int(read_result.get("returned_through_line") or 0)
+                                covered_by_existing = False
+                                for existing_key, existing in list(workspace_read_evidence.items()):
+                                    if existing_key[0] != normalized_path or existing.get("revision") != snapshot.get("revision"):
+                                        continue
+                                    existing_from = int(existing.get("returned_from_line") or 0)
+                                    existing_through = int(existing.get("returned_through_line") or 0)
+                                    if existing_from <= snapshot_from and existing_through >= snapshot_through:
+                                        workspace_read_evidence.pop(existing_key)
+                                        workspace_read_evidence[existing_key] = existing
+                                        covered_by_existing = True
+                                        break
+                                    if snapshot_from <= existing_from and snapshot_through >= existing_through:
+                                        del workspace_read_evidence[existing_key]
+                                if not covered_by_existing and snapshot.get("numbered_content") is not None:
+                                    workspace_read_evidence[read_key] = snapshot
                         step["status"] = "skipped" if workspace_call_skipped else "completed"
                     elif is_search:
                         if parallel_mode:
@@ -1625,6 +1692,9 @@ async def stream_response(
                 workspace=workspace,
                 sources=sources,
                 tool_trace=tool_trace,
+                workspace_read_evidence=workspace_read_evidence,
+                workspace_reads=workspace_reads,
+                refresh_existing=workspace_generation != generation_before_calls,
             )
     searches = steps
     return {
