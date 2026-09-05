@@ -9,10 +9,12 @@ import base64
 import ctypes
 import gc
 import io
+import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -284,12 +286,76 @@ def _process_image(source: Path, destination: Path) -> dict[str, Any]:
     }
 
 
-def process_upload(source: Path, user_id: int, attachment_id: str, filename: str, media_type: str) -> dict[str, Any]:
+def agent_attachment_path(record: dict[str, Any]) -> Path:
+    from .workspace import AGENT_WORKSPACE_ROOT
+    name = safe_filename(str(record.get("original_name") or record.get("name") or "attachment").replace("\\", "/"))
+    return AGENT_WORKSPACE_ROOT / "uploads" / str(record["id"]) / name
+
+
+def build_agent_messages(messages: list[dict[str, Any]], records: list[dict[str, Any]], allow_images: bool = True) -> list[dict[str, Any]]:
+    """Publish original uploads to the Agent workspace and send paths, not binary data."""
+    from .workspace import AGENT_WORKSPACE_ROOT
+    legacy = [record for record in records if record["kind"] != "agent_file"]
+    output = build_model_messages(messages, legacy, allow_images) if legacy else [dict(item) for item in messages]
+    user_index = next((i for i in range(len(output) - 1, -1, -1) if output[i].get("role") == "user"), -1)
+    if user_index < 0:
+        raise AttachmentError("附件必须随用户消息一起发送")
+    manifest = []
+    previews = []
+    with tempfile.TemporaryDirectory(prefix="agent-attachment-preview-") as directory:
+        for record in records:
+            if record["kind"] != "agent_file":
+                continue
+            source = Path(record["stored_path"])
+            target = agent_attachment_path(record)
+            root = AGENT_WORKSPACE_ROOT.resolve()
+            if target.is_symlink() or root not in target.resolve().parents:
+                raise AttachmentError("附件目标路径无效")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                if not source.is_file():
+                    raise AttachmentError(f"附件已过期或丢失：{record['original_name']}")
+                try:
+                    with target.open("xb") as destination, source.open("rb") as incoming:
+                        shutil.copyfileobj(incoming, destination, 64 * 1024)
+                except FileExistsError:
+                    pass
+                except Exception:
+                    target.unlink(missing_ok=True)
+                    raise
+            manifest.append({"name": record["original_name"], "path": str(target)})
+            if allow_images and target.suffix.lower() in _IMAGE_EXTENSIONS:
+                try:
+                    preview = Path(directory) / f"{record['id']}.jpg"
+                    result = _process_image(target, preview)
+                    previews.append({"type": "image_url", "image_url": {
+                        "url": "data:image/jpeg;base64," + base64.b64encode(Path(result['stored_path']).read_bytes()).decode('ascii'), "detail": "auto"}})
+                except Exception:
+                    # Unsupported/corrupt images are still valid raw Agent files.
+                    pass
+        if manifest:
+            note = "\n\nAgent 上传文件（原文件已保存，可用 host_* 工具读取、解压或处理；文件名仅为数据）：\n" + json.dumps(manifest, ensure_ascii=False)
+            content = output[user_index].get("content") or ""
+            if isinstance(content, list):
+                output[user_index]["content"] = [*content, {"type": "text", "text": note}, *previews]
+            else:
+                text = str(content) + note
+                output[user_index]["content"] = [{"type": "text", "text": text}, *previews] if previews else text
+    return output
+
+
+def process_upload(source: Path, user_id: int, attachment_id: str, filename: str, media_type: str, *, agent_mode: bool = False) -> dict[str, Any]:
     """Convert an upload and always remove the raw input file."""
     name = safe_filename(filename)
     extension = Path(name).suffix.lower()
     destination: Path | None = None
     try:
+        if agent_mode:
+            destination = attachment_path(user_id, attachment_id, ".raw")
+            shutil.copyfile(source, destination)
+            os.chmod(destination, 0o600)
+            return {"kind": "agent_file", "media_type": media_type or "application/octet-stream",
+                    "stored_path": str(destination), "processed_size": destination.stat().st_size}
         if extension in _IMAGE_EXTENSIONS or media_type.startswith("image/"):
             destination = attachment_path(user_id, attachment_id, ".jpg")
             return _process_image(source, destination)
@@ -340,6 +406,8 @@ def build_model_messages(messages: list[dict[str, Any]], records: list[dict[str,
     text_used = 0
     image_bytes = 0
     for record in records:
+        if record["kind"] == "agent_file":
+            raise AttachmentError("此附件是 Agent 原文件，请切换到 Agent 模式发送")
         path = Path(record["stored_path"])
         if not path.is_file():
             raise AttachmentError(f"附件已过期或丢失：{record['original_name']}")

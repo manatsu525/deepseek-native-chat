@@ -476,6 +476,15 @@ async def _execute_job(job_id: str) -> None:
         if row["role"] == "assistant" and meta.get("failed"):
             continue
         message: dict[str, Any] = {"role": row["role"], "content": row["content"]}
+        if agent_job and row["role"] == "user":
+            current_ids = {item["id"] for item in attachment_records}
+            previous_files = [
+                {"name": item.get("name", "attachment"), "path": str(attachments.agent_attachment_path(item))}
+                for item in meta.get("attachments", [])
+                if item.get("kind") == "agent_file" and item.get("id") not in current_ids
+            ]
+            if previous_files:
+                message["content"] += "\n\n此前上传的 Agent 文件（路径可能已被后续操作修改或删除）：\n" + json.dumps(previous_files, ensure_ascii=False)
         # Custom Chat Completions gateways may accept historical reasoning_content
         # in later turns. Client-side
         # tool messages are intentionally not replayed here: the final assistant
@@ -514,7 +523,7 @@ async def _execute_job(job_id: str) -> None:
             await attachment_job_lock.acquire()
             attachment_lock_acquired = True
             history = await asyncio.to_thread(
-                attachments.build_model_messages,
+                attachments.build_agent_messages if agent_job else attachments.build_model_messages,
                 history,
                 attachment_records,
                 is_custom_provider(kind),
@@ -873,8 +882,11 @@ async def upload_attachment(
     request: Request,
     draft_id: str,
     filename: str = "attachment",
+    chat_mode: str = "standard",
     user: dict[str, Any] = Depends(current_user),
 ) -> dict[str, Any]:
+    if chat_mode not in {"standard", "agent"}:
+        raise HTTPException(400, "无效的聊天模式")
     if not re.fullmatch(r"[a-f0-9]{32}", draft_id):
         raise HTTPException(400, "无效的附件草稿标识")
     name = attachments.safe_filename(filename)
@@ -907,7 +919,7 @@ async def upload_attachment(
                     if written > remaining or written > attachments.MAX_UPLOAD_BYTES:
                         raise HTTPException(413, "一次消息的附件总量不能超过 50MB")
                     output.write(chunk)
-            if written <= 0:
+            if written <= 0 and chat_mode != "agent":
                 raise HTTPException(400, "附件内容为空")
             os.chmod(incoming, 0o600)
             async with attachment_processing_lock:
@@ -918,6 +930,7 @@ async def upload_attachment(
                     attachment_id,
                     name,
                     request.headers.get("content-type", "application/octet-stream"),
+                    agent_mode=chat_mode == "agent",
                 )
             processed_record = {"stored_path": str(result["stored_path"])}
             record = db.create_attachment(
@@ -1431,6 +1444,8 @@ async def retry_answer(
             ).fetchall()
             if len(attachment_rows) != len(set(attachment_ids)):
                 raise HTTPException(409, "原问题的附件文件已经不可用，无法重新回答")
+            if body.chat_mode != "agent" and any(row["kind"] == "agent_file" for row in attachment_rows):
+                raise HTTPException(400, "原问题包含 Agent 原文件，请使用 Agent 模式重新回答")
             if not is_custom_provider(kind) and any(row["kind"] == "image" for row in attachment_rows):
                 raise HTTPException(400, "当前 DeepSeek Responses 路由不接受图片，请改用支持视觉输入的 Custom 模型")
 
@@ -1510,6 +1525,8 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
     attachment_records = db.get_attachments(user["id"], attachment_ids)
     if len(attachment_records) != len(attachment_ids) or any(item.get("job_id") for item in attachment_records):
         raise HTTPException(400, "部分附件不存在、已过期或已经发送")
+    if body.chat_mode != "agent" and any(item["kind"] == "agent_file" for item in attachment_records):
+        raise HTTPException(400, "附件包含 Agent 原文件，请切换到 Agent 模式或移除这些附件")
     if not is_custom_provider(kind) and any(item["kind"] == "image" for item in attachment_records):
         raise HTTPException(400, "当前 DeepSeek Responses 路由不接受图片，请改用支持视觉输入的 Custom 模型")
     timezone_name = clean_timezone(body.timezone)

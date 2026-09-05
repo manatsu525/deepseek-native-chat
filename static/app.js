@@ -33,6 +33,7 @@ function storeValue(name, value) {
   } catch {}
 }
 function setChatMode(value,persist=true){
+  if(state.uploadingAttachments){toast('请等待附件上传完成');return false}
   const mode=value==='agent'?'agent':'standard';
   if(state.job&&['queued','running'].includes(state.job.status)){toast('请先停止当前回答再切换模式');return false}
   state.chatMode=mode;if(persist)storeValue('chat-mode',mode);
@@ -213,7 +214,7 @@ async function discardPendingAttachments(){
   await Promise.allSettled(items.map(item=>api(`/api/attachments/${item.id}`,{method:'DELETE'})));
 }
 async function uploadOneAttachment(file){
-  const query=new URLSearchParams({draft_id:currentAttachmentDraftId(),filename:file.name||'attachment'});
+  const query=new URLSearchParams({draft_id:currentAttachmentDraftId(),filename:file.name||'attachment',chat_mode:state.chatMode});
   const response=await fetch(`/api/attachments?${query}`,{method:'POST',headers:{'Content-Type':file.type||'application/octet-stream'},body:file});
   const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data.detail||`附件上传失败 (${response.status})`);return data;
 }
@@ -230,7 +231,7 @@ async function selectAttachments(files){
       setAttachmentStatus(`正在处理 ${index+1}/${list.length}：${list[index].name}`);
       const uploaded=await uploadOneAttachment(list[index]);state.pendingAttachments.push(uploaded);renderPendingAttachments();
     }
-    setAttachmentStatus('附件已就绪：图片会压缩发送，文档只提取有限文字。');
+    setAttachmentStatus(state.chatMode==='agent'?'附件原文件已就绪，发送后保存在 /home/share/uploads/，由 Agent 直接处理。':'附件已就绪：图片会压缩发送，文档只提取有限文字。');
   }catch(err){setAttachmentStatus(err.message,true)}finally{state.uploadingAttachments=false;setRunning(Boolean(state.job&&['queued','running'].includes(state.job.status)))}
 }
 
@@ -755,7 +756,7 @@ async function submitPrompt(value) {
   }catch(err){state.messages.pop();state.job=null;if(fromComposer){const newerDraft=prompt.value;prompt.value=newerDraft?`${originalPrompt}\n\n${newerDraft}`:originalPrompt;resizePrompt()}setRunning(false);renderMessages();toast(err.message)}
 }
 
-function setRunning(on){const locked=on||state.uploadingAttachments||state.retryingAnswer;$('#stopButton').classList.toggle('hidden',!on);$('#sendButton').disabled=locked;$('#attachButton').disabled=locked;$('#providerSelect').disabled=on||state.retryingAnswer;$$('[data-chat-mode]').forEach(button=>button.disabled=on||state.retryingAnswer)}
+function setRunning(on){const locked=on||state.uploadingAttachments||state.retryingAnswer;$('#stopButton').classList.toggle('hidden',!on);$('#sendButton').disabled=locked;$('#attachButton').disabled=locked;$('#providerSelect').disabled=on||state.retryingAnswer;$$('[data-chat-mode]').forEach(button=>button.disabled=locked)}
 function stopPolling(){if(state.poll)clearTimeout(state.poll);state.poll=null}
 function startPolling(id){
   stopPolling();setRunning(true);
@@ -829,6 +830,10 @@ function updateProviderUi(){
   const provider=selectedProvider(), custom=provider&&isCustomProviderType(provider.provider_type), protocol=provider&&normalizeProviderType(provider.provider_type), responses=protocol==='custom_response', messages=protocol==='custom_messages';
   const webInfo=custom?selectedWebToolInfo(provider):null;
   const agent=state.chatMode==='agent';
+  const fileInput=$('#fileInput');
+  if(fileInput.dataset.standardAccept===undefined)fileInput.dataset.standardAccept=fileInput.getAttribute('accept')||'';
+  if(agent)fileInput.removeAttribute('accept');else fileInput.setAttribute('accept',fileInput.dataset.standardAccept);
+  $('#attachButton').title=agent?'上传任意格式原文件（最多 10 个，共 50MB）':'上传图片、文档或代码文件';
   $('#customSettingsButton').classList.toggle('hidden',!custom);
   $('#effortControl').classList.toggle('hidden',!!custom);
   $('#effort').disabled=!!custom;
