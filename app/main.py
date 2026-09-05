@@ -1296,6 +1296,17 @@ def download_agent_workspace_file(file_path: str, _: dict[str, Any] = Depends(cu
     return FileResponse(target, filename=Path(relative).name, media_type="application/octet-stream")
 
 
+@app.delete("/api/agent-workspace/files/{file_path:path}")
+def delete_agent_workspace_file(file_path: str, _: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    workspace = AgentSharedWorkspace()
+    try:
+        result = workspace.delete_file(file_path)
+    except WorkspaceError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    files = workspace.list_files()
+    return {**result, "files": files, "total_size": sum(int(item["size"]) for item in files)}
+
+
 @app.get("/api/agent-workspace.zip")
 def download_agent_workspace_zip(_: dict[str, Any] = Depends(current_user)) -> StreamingResponse:
     workspace = AgentSharedWorkspace()

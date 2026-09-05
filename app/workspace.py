@@ -500,12 +500,12 @@ class ConversationWorkspace:
 
 
 class AgentSharedWorkspace:
-    """Read-only display view of the host-level Agent workspace.
+    """Authenticated UI view of the host-level Agent workspace.
 
     Agent mode deliberately does not use ``ConversationWorkspace``.  Its host
     tools operate directly on the shared ``/home/share`` directory, while this
-    view only provides the authenticated UI with a safe listing and download
-    resolver for that same directory.
+    view provides the authenticated UI with safe listing, download, and
+    explicit single-file deletion for that same directory.
     """
 
     def __init__(self, root: Path | None = None) -> None:
@@ -563,6 +563,16 @@ class AgentSharedWorkspace:
         if not target.is_file() or target.is_symlink():
             raise WorkspaceError("Agent 工作区文件不存在")
         return target, relative
+
+    def delete_file(self, path: Any) -> dict[str, Any]:
+        target, relative = self.resolve_file(path)
+        try:
+            target.unlink()
+        except FileNotFoundError as exc:
+            raise WorkspaceError("Agent 工作区文件不存在") from exc
+        except OSError as exc:
+            raise WorkspaceError(f"删除 Agent 工作区文件失败：{exc}") from exc
+        return {"ok": True, "path": relative}
 
 
 def delete_conversation_workspace(user_id: int, conversation_id: str) -> None:

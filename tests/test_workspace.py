@@ -152,10 +152,19 @@ class WorkspaceTests(unittest.TestCase):
         target, relative = agent_workspace.resolve_file("nested/index.html")
         self.assertEqual(relative, "nested/index.html")
         self.assertEqual(target.read_text(encoding="utf-8"), "<h1>Agent</h1>")
+        deleted = agent_workspace.delete_file("nested/index.html")
+        self.assertEqual(deleted, {"ok": True, "path": "nested/index.html"})
+        self.assertFalse(target.exists())
+        self.assertEqual(agent_workspace.list_files(), [])
         with self.assertRaises(WorkspaceError):
             agent_workspace.resolve_file("../outside.txt")
         with self.assertRaises(WorkspaceError):
             agent_workspace.resolve_file("outside-link")
+        with self.assertRaises(WorkspaceError):
+            agent_workspace.delete_file("../outside.txt")
+        with self.assertRaises(WorkspaceError):
+            agent_workspace.delete_file("outside-link")
+        self.assertEqual(outside.read_text(encoding="utf-8"), "secret")
 
     def test_line_edits_reject_overlapping_ranges_atomically(self) -> None:
         original = "one\ntwo\nthree\n"
