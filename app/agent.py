@@ -8,19 +8,26 @@ that mode host-level file, shell, Skill, conversation, and frontend tools.
 from __future__ import annotations
 
 import json
+import asyncio
 import os
+import shlex
+import signal
 import shutil
 import subprocess
+import tempfile
+import threading
 import time
 import uuid
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from . import attachments
 from .db import Database
 from .skills import SkillRegistry
 from .workspace import delete_conversation_workspace
+from .code_runner import _HtmlScripts
 
 
 # Agent mode deliberately uses one shared host workspace.  The ordinary chat
@@ -192,6 +199,23 @@ class AgentRuntime:
         self.user_id = int(user_id)
         self.conversation_id = str(conversation_id)
         self.skills = SkillRegistry()
+        self._cancelled = threading.Event()
+
+    async def execute_async(self, name: str, arguments: dict[str, Any]) -> str:
+        worker = asyncio.create_task(asyncio.to_thread(self.execute, name, arguments))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            self._cancelled.set()
+            # Cancelling to_thread does not stop its worker. Keep the job slot
+            # occupied until the command has exited and the tool has returned.
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    self._cancelled.set()
+            worker.result()
+            raise
 
     @property
     def tool_definitions(self) -> list[dict[str, Any]]:
@@ -319,21 +343,51 @@ class AgentRuntime:
         supplied_env = arguments.get("env")
         if isinstance(supplied_env, dict):
             environment.update({str(key): str(value) for key, value in supplied_env.items()})
-        try:
-            completed = subprocess.run(
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            if self._cancelled.is_set():
+                return {"ok": False, "cancelled": True, "error": "任务已停止"}
+            process = subprocess.Popen(
                 ["/bin/bash", "-lc", command], cwd=str(cwd), env=environment,
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=timeout, check=False,
+                stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                start_new_session=True,
             )
+            deadline = time.monotonic() + timeout
+            timed_out = False
+            cancelled = False
+            try:
+                while True:
+                    cancelled = self._cancelled.is_set()
+                    timed_out = time.monotonic() >= deadline
+                    if cancelled or timed_out:
+                        # Kill the process group, including shell children.
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        process.wait()
+                        break
+                    if process.poll() is not None:
+                        break
+                    self._cancelled.wait(0.1)
+            finally:
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+            def tail(stream: Any) -> str:
+                stream.seek(0, os.SEEK_END)
+                stream.seek(max(0, stream.tell() - HOST_OUTPUT_MAX_CHARS * 4))
+                return stream.read().decode("utf-8", errors="replace")[-HOST_OUTPUT_MAX_CHARS:]
             return {
-                "ok": completed.returncode == 0,
-                "exit_code": int(completed.returncode),
+                "ok": process.returncode == 0 and not cancelled and not timed_out,
+                "exit_code": int(process.returncode),
                 "cwd": str(cwd),
-                "stdout": completed.stdout.decode("utf-8", errors="replace")[-HOST_OUTPUT_MAX_CHARS:],
-                "stderr": completed.stderr.decode("utf-8", errors="replace")[-HOST_OUTPUT_MAX_CHARS:],
+                "stdout": tail(stdout), "stderr": tail(stderr),
+                "timeout": timed_out, "cancelled": cancelled,
+                "error": "任务已停止" if cancelled else "命令执行超时" if timed_out else "",
             }
-        except subprocess.TimeoutExpired as exc:
-            return {"ok": False, "timeout": True, "cwd": str(cwd), "stdout": str(exc.stdout or "")[-HOST_OUTPUT_MAX_CHARS:], "stderr": str(exc.stderr or "")[-HOST_OUTPUT_MAX_CHARS:]}
 
     def _host_delete_path(self, arguments: dict[str, Any]) -> dict[str, Any]:
         path = self._path(arguments.get("path"))
@@ -447,17 +501,60 @@ class AgentRuntime:
         if not path.is_file():
             raise ValueError(f"文件不存在：{path}")
         suffix = path.suffix.casefold()
-        if suffix in {".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"}:
-            completed = subprocess.run(["node", "--check", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-            return {"ok": completed.returncode == 0, "path": str(path), "stdout": completed.stdout[-HOST_OUTPUT_MAX_CHARS:], "stderr": completed.stderr[-HOST_OUTPUT_MAX_CHARS:]}
+        if suffix in {".jsx", ".ts", ".tsx"}:
+            return {"ok": False, "path": str(path), "error": "此文件需要项目的 TypeScript/JSX 编译或构建检查；node --check 不能完整验证。"}
+        def check_js(script: Path) -> dict[str, Any]:
+            return self._host_run_command({"command": "node --check " + shlex.quote(str(script.resolve())),
+                                           "cwd": str(path.resolve().parent), "timeout_seconds": 30})
+        if suffix in {".js", ".mjs", ".cjs"}:
+            return {**check_js(path), "path": str(path)}
         if suffix in {".html", ".htm"}:
+            content = path.read_text(encoding="utf-8", errors="replace")
             parser = _FrontendParser()
-            parser.feed(path.read_text(encoding="utf-8", errors="replace"))
+            parser.feed(content)
             parser.close()
-            return {"ok": not parser.errors, "path": str(path), "errors": parser.errors}
+            scripts = _HtmlScripts()
+            scripts.feed(content)
+            scripts.close()
+            errors = list(parser.errors)
+            if scripts.unclosed_script:
+                errors.append("未闭合 script 标签")
+            checked: list[str] = []
+            skipped: list[str] = []
+            with tempfile.TemporaryDirectory(prefix="agent-js-check-") as directory:
+                checks: list[tuple[str, Path]] = []
+                for index, (source, module) in enumerate(scripts.inline):
+                    target = Path(directory) / f"inline-{index}{'.mjs' if module else '.cjs'}"
+                    target.write_text(source, encoding="utf-8")
+                    checks.append((f"inline-script-{index + 1}", target))
+                for index, handler in enumerate(scripts.handlers):
+                    target = Path(directory) / f"handler-{index}.cjs"
+                    target.write_text("function handler(event) {\n" + handler + "\n}\n", encoding="utf-8")
+                    checks.append((f"event-handler-{index + 1}", target))
+                for source in scripts.sources:
+                    parsed = urlsplit(source)
+                    if parsed.scheme or parsed.netloc or parsed.path.startswith("/"):
+                        skipped.append(source)
+                        continue
+                    target = path.parent / unquote(parsed.path)
+                    if not target.is_file():
+                        errors.append(f"引用的本地脚本不存在：{source}")
+                    else:
+                        checks.append((source, target))
+                for label, target in checks:
+                    result = check_js(target)
+                    checked.append(label)
+                    if not result["ok"]:
+                        errors.append(f"{label}: {result.get('error') or result.get('stderr') or '语法检查失败'}")
+                    if result.get("cancelled"):
+                        break
+            return {"ok": not errors, "path": str(path), "errors": errors, "checked_scripts": checked,
+                    "skipped_scripts": skipped, "validation_scope": "HTML 标签与已列出的本地 JavaScript 语法；未验证浏览器行为或跳过的 URL"}
         raise ValueError("前端语法检查支持 HTML、JavaScript、TypeScript 页面")
 
     def execute(self, name: str, arguments: dict[str, Any]) -> str:
+        if self._cancelled.is_set():
+            return _json({"ok": False, "cancelled": True, "error": "任务已停止"})
         dispatch = {
             "host_list_files": self._host_list_files,
             "host_read_file": self._host_read_file,

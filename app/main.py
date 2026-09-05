@@ -541,7 +541,7 @@ async def _execute_job(job_id: str) -> None:
                 workspace_access="none",
                 agent_mode=True,
                 extra_tools=runtime.tool_definitions,
-                extra_tool_handler=runtime.execute,
+                extra_tool_handler=runtime.execute_async,
                 max_tool_rounds=96,
                 web_search_limit=96,
                 web_fetch_limit=96,
@@ -1558,13 +1558,18 @@ def get_job(job_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[s
 
 @app.post("/api/jobs/{job_id}/stop")
 async def stop_job(job_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, bool]:
-    job = db.one("SELECT id,status FROM jobs WHERE id=? AND user_id=?", (job_id, user["id"]))
+    job = db.one("SELECT id,status,stop_requested FROM jobs WHERE id=? AND user_id=?", (job_id, user["id"]))
     if not job:
         raise HTTPException(404, "任务不存在")
     if job["status"] in {"queued", "running"}:
-        db.update_job(job_id, status="stopped", stop_requested=1)
         task = tasks.get(job_id)
-        if task:
+        # A running tool must finish cancellation before the UI and the next
+        # request see this job as stopped. Queued tasks have no worker to drain.
+        if job["status"] == "running" and task and not task.done():
+            db.update_job(job_id, stop_requested=1)
+        else:
+            db.update_job(job_id, status="stopped", stop_requested=1)
+        if task and not job.get("stop_requested"):
             task.cancel()
     return {"ok": True}
 

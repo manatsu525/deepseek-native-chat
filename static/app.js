@@ -5,6 +5,9 @@ const detailState = new Map();
 const nestedScrollState = new Map();
 const MAX_ATTACHMENT_FILES = 10;
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+let workspaceRequestId=0,conversationRequestId=0;
+const workspaceDeletes=new Set();
+function workspaceContext(){return `${state.chatMode}:${state.conversation?state.conversation.id:''}`}
 
 function rememberNestedScroll(root=document) {
   $$('[data-scroll-key]', root).forEach(node => nestedScrollState.set(node.dataset.scrollKey, {top:node.scrollTop, left:node.scrollLeft}));
@@ -65,31 +68,43 @@ async function deleteAgentWorkspaceFile(event){
   let path='';
   try{path=decodeURIComponent(button.dataset.agentWorkspaceDelete||'')}catch{return}
   if(state.chatMode!=='agent'||!path||!window.confirm(`确定从 /home/share 删除“${path}”吗？此操作无法撤销。`))return;
+  if(workspaceDeletes.has(path))return;
+  const context=workspaceContext();
+  workspaceDeletes.add(path);
+  ++workspaceRequestId;
   button.disabled=true;
   try{
-    const data=await api(workspaceFileUrl('',{path,backend:'agent'}),{method:'DELETE'});
-    state.workspaceFiles=data.files||[];
-    renderWorkspaceState();
+    await api(workspaceFileUrl('',{path,backend:'agent'}),{method:'DELETE'});
+    if(workspaceContext()===context){
+      state.workspaceFiles=state.workspaceFiles.filter(item=>item.path!==path);
+      renderWorkspaceState();
+      await loadWorkspaceFiles(true);
+    }
     toast(`已删除 ${path}`);
-  }catch(err){button.disabled=false;toast(err.message)}
+  }catch(err){toast(err.message)}
+  finally{workspaceDeletes.delete(path);renderWorkspaceState()}
 }
 function wireAgentWorkspaceDeletes(root=document){$$('[data-agent-workspace-delete]',root).forEach(button=>button.onclick=deleteAgentWorkspaceFile)}
 function renderWorkspaceState(){
-  const agent=state.chatMode==='agent',hasConversation=!!(state.conversation&&state.conversation.id),canShow=agent||hasConversation,files=state.workspaceFiles||[];
+  const agent=state.chatMode==='agent',hasConversation=!!(state.conversation&&state.conversation.id),canShow=agent||hasConversation,files=state.workspaceContext===workspaceContext()?(state.workspaceFiles||[]):[];
   $('#workspaceButton').classList.toggle('hidden',!canShow);$('#workspaceCount').textContent=files.length;
   $('#workspaceModalTitle').textContent=agent?'Agent 文件':'对话文件';
   $('#workspaceModalDescription').textContent=agent?'Agent 模式统一使用 /home/share；普通模式工作区与它严格分开。':'模型创建和后续修改的文件会持续保存在当前对话中。';
   $('#workspaceSummary').textContent=files.length?`${files.length} 个文件 · ${formatBytes(files.reduce((sum,item)=>sum+(Number(item.size)||0),0))}${agent?' · /home/share':''}`:agent?'/home/share 当前还没有文件。':'当前还没有文件。让模型编写项目时，它会把代码保存到这里。';
   $('#workspaceFiles').innerHTML=files.length?files.map(item=>agent?`<div class="workspace-file"><a class="workspace-file-link" data-workspace-download href="${workspaceFileUrl('',item)}" target="_blank" rel="noopener"><span aria-hidden="true">▤</span><span class="workspace-file-name" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</span><span class="workspace-file-size">${escapeHtml(formatBytes(item.size))}</span></a><button class="workspace-file-delete" type="button" data-agent-workspace-delete="${encodeURIComponent(item.path)}" aria-label="删除 ${escapeHtml(item.path)}">删除</button></div>`:`<a class="workspace-file" data-workspace-download href="${workspaceFileUrl(state.conversation.id,item)}" target="_blank" rel="noopener"><span aria-hidden="true">▤</span><span class="workspace-file-name" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</span><span class="workspace-file-size">${escapeHtml(formatBytes(item.size))}</span></a>`).join(''):'<div class="workspace-empty">暂无工作区文件</div>';
   $('#workspaceZip').classList.toggle('hidden',!files.length);$('#workspaceZip').href=agent?'/api/agent-workspace.zip':hasConversation?`/api/conversations/${encodeURIComponent(state.conversation.id)}/workspace.zip`:'#';wireWorkspaceDownloads($('#workspaceModal'));wireAgentWorkspaceDeletes($('#workspaceModal'));
+  $$('[data-agent-workspace-delete]',$('#workspaceModal')).forEach(button=>{button.disabled=workspaceDeletes.has(decodeURIComponent(button.dataset.agentWorkspaceDelete))});
 }
 async function loadWorkspaceFiles(showError=false){
-  if(state.chatMode==='agent'){
-    try{const data=await api('/api/agent-workspace');state.workspaceFiles=data.files||[];renderWorkspaceState()}catch(err){if(showError)toast(err.message)}
-    return;
-  }
-  if(!state.conversation||!state.conversation.id){state.workspaceFiles=[];renderWorkspaceState();return}
-  try{const data=await api(`/api/conversations/${encodeURIComponent(state.conversation.id)}/workspace`);state.workspaceFiles=data.files||[];renderWorkspaceState()}catch(err){if(showError)toast(err.message)}
+  const context=workspaceContext(),requestId=++workspaceRequestId;
+  const current=()=>requestId===workspaceRequestId&&context===workspaceContext();
+  const url=state.chatMode==='agent'?'/api/agent-workspace':state.conversation?`/api/conversations/${encodeURIComponent(state.conversation.id)}/workspace`:null;
+  if(!url){state.workspaceFiles=[];state.workspaceContext=context;renderWorkspaceState();return}
+  try{
+    const data=await api(url);
+    if(!current())return;
+    state.workspaceFiles=data.files||[];state.workspaceContext=context;renderWorkspaceState();
+  }catch(err){if(current()&&showError)toast(err.message)}
 }
 
 async function api(path, options={}) {
@@ -684,14 +699,18 @@ async function clearAllHistory() {
 
 async function openConversation(id) {
   if(state.retryingAnswer){toast('正在重新回答');return false}
+  const requestId=++conversationRequestId;
   stopPolling();
   try {
     if(!state.conversation&&state.pendingAttachments.length)await discardPendingAttachments();
-    const data=await api(`/api/conversations/${id}`); state.conversation=data.conversation; state.messages=data.messages; state.job=data.active_job;state.workspaceFiles=data.workspace_files||[];
+    const data=await api(`/api/conversations/${id}`);
+    if(requestId!==conversationRequestId)return false;
+    state.conversation=data.conversation; state.messages=data.messages; state.job=data.active_job;state.workspaceFiles=[];state.workspaceContext=null;
     state.attachmentDraftId=null;state.pendingAttachments=[];renderPendingAttachments();setAttachmentStatus('');
     restoreProviderForConversation(data);
     storeValue('active-conversation', state.conversation.id);
     $('#conversationTitle').textContent=state.conversation.title;renderWorkspaceState(); renderMessages(); await Promise.all([loadHistory(state.page),loadPendingAttachments(),loadWorkspaceFiles()]);
+    if(requestId!==conversationRequestId)return false;
     if(state.job)startPolling(state.job.id);else setRunning(false);
     return true;
   } catch(err){
@@ -703,6 +722,7 @@ async function openConversation(id) {
 
 async function newConversation(){
   if(state.retryingAnswer){toast('正在重新回答');return}
+  ++conversationRequestId;
   if(!state.conversation&&state.pendingAttachments.length)await discardPendingAttachments();
   stopPolling();state.conversation=null;state.messages=[];state.job=null;state.pendingAttachments=[];state.attachmentDraftId=newAttachmentDraftId();state.workspaceFiles=[];
   setRunning(false);storeValue('active-conversation','__new__');storeValue('attachment-draft',state.attachmentDraftId);$('#conversationTitle').textContent='新对话';renderPendingAttachments();renderWorkspaceState();setAttachmentStatus('');renderMessages();loadWorkspaceFiles();loadHistory(1);

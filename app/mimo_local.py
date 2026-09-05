@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import uuid
 from collections.abc import Awaitable, Callable
@@ -303,6 +304,27 @@ def _compact_workspace_call_arguments(
     return True
 
 
+def _remember_host_evidence(evidence: list[dict[str, Any]], name: str, arguments: dict[str, Any], result: str, status: str) -> None:
+    """Keep bounded, chronological evidence, not claims about current disk state."""
+    item = {"name": name, "arguments": dict(arguments), "result": result, "status": status}
+    if len(json.dumps(item, ensure_ascii=False)) > CHECKPOINT_READ_EVIDENCE_CHARS:
+        item = {"name": name, "path": str(arguments.get("path") or arguments.get("cwd") or ""),
+                "status": status, "evidence_omitted": "Operation exceeded checkpoint capacity; inspect the file if its contents are needed."}
+    evidence.append(item)
+    while len(evidence) > 30 or len(json.dumps(evidence, ensure_ascii=False)) > CHECKPOINT_READ_EVIDENCE_CHARS:
+        evidence.pop(0)
+
+
+def _tool_result_failure(result: str) -> str:
+    try:
+        data = json.loads(result)
+    except (TypeError, ValueError):
+        return ""
+    if isinstance(data, dict) and (data.get("ok") is False or data.get("timeout") or data.get("cancelled")):
+        return str(data.get("error") or data.get("stderr") or data.get("errors") or "工具执行失败")[:1000]
+    return ""
+
+
 def _maybe_compact_agent_context(
     conversation: list[dict[str, Any]],
     *,
@@ -313,13 +335,14 @@ def _maybe_compact_agent_context(
     workspace_read_evidence: dict[tuple[str, int, int | None], dict[str, Any]] | None = None,
     workspace_reads: set[tuple[str, int, int | None]] | None = None,
     refresh_existing: bool = False,
+    host_evidence: list[dict[str, Any]] | None = None,
 ) -> bool:
     """Checkpoint oversized internal tool history without another model call.
 
     This deliberately triggers only at a high-water mark.  Between checkpoints
     history is append-only for prompt-cache hits.  At a checkpoint the durable
     workspace and compact source metadata replace verbose stale tool traffic,
-    while the newest assistant/tool pair is kept verbatim for continuity.
+    while the newest complete assistant/tool exchange is kept verbatim.
     """
     internal = conversation[base_message_count:]
     marker = "\n\nCONTEXT CHECKPOINT:\n"
@@ -327,7 +350,14 @@ def _maybe_compact_agent_context(
     over_high_water = _serialized_chars(internal) > AGENT_CONTEXT_COMPACT_THRESHOLD
     if not over_high_water and not (refresh_existing and existing_checkpoint):
         return False
-    keep = internal[-2:] if over_high_water and len(internal) >= 2 else internal
+    keep = internal
+    if over_high_water:
+        # One assistant message can own many tool results. Keep that entire
+        # exchange, including provider-specific Responses reasoning items.
+        for index in range(len(internal) - 1, -1, -1):
+            if internal[index].get("role") == "assistant":
+                keep = internal[index:]
+                break
     files = workspace.list_files() if workspace is not None else []
     source_state = [
         {
@@ -380,6 +410,13 @@ def _maybe_compact_agent_context(
         "sources": source_state,
         "recent_operations": operations,
     }
+    if host_evidence is not None:
+        checkpoint["host_operation_evidence"] = host_evidence
+        checkpoint["instruction"] += (
+            " host_operation_evidence preserves historical arguments and results in execution order, including edits. "
+            "Later writes or commands may supersede earlier reads; these are not guaranteed current file snapshots. "
+            "Use the recorded changes to continue completed work. Evidence explicitly marked omitted may require inspection."
+        )
     base = [dict(message) for message in conversation[:base_message_count]]
     checkpoint_text = json.dumps(checkpoint, ensure_ascii=False, separators=(",", ":"))
     if base and base[0].get("role") == "system":
@@ -732,7 +769,7 @@ async def stream_response(
     api_protocol: str = "chat_completions",
     agent_mode: bool = False,
     extra_tools: list[dict[str, Any]] | None = None,
-    extra_tool_handler: Callable[[str, dict[str, Any]], str] | None = None,
+    extra_tool_handler: Callable[[str, dict[str, Any]], str | Awaitable[str]] | None = None,
 ) -> dict[str, Any]:
     """Run a custom OpenAI-compatible model with local web tools.
 
@@ -816,6 +853,7 @@ async def stream_response(
     force_final_answer = False
     workspace_reads: set[tuple[str, int, int | None]] = set()
     workspace_read_evidence: dict[tuple[str, int, int | None], dict[str, Any]] = {}
+    host_evidence: list[dict[str, Any]] = []
     workspace_searches: set[str] = set()
     workspace_validations: set[tuple[int, str]] = set()
     workspace_list_generations: set[int] = set()
@@ -1619,8 +1657,14 @@ async def stream_response(
                     elif is_extra:
                         if extra_tool_handler is None:
                             raise ValueError("当前 Agent 没有可用的主机工具处理器")
-                        result_text = await asyncio.to_thread(extra_tool_handler, name, arguments)
-                        step["status"] = "completed"
+                        if inspect.iscoroutinefunction(extra_tool_handler):
+                            result_text = await extra_tool_handler(name, arguments)
+                        else:
+                            result_text = await asyncio.to_thread(extra_tool_handler, name, arguments)
+                        failure = _tool_result_failure(result_text)
+                        step["status"] = "failed" if failure else "completed"
+                        step["error"] = failure
+                        _remember_host_evidence(host_evidence, name, arguments, result_text, step["status"])
                     else:
                         raise ValueError(f"不支持的工具：{name or '未命名工具'}")
                 except asyncio.CancelledError:
@@ -1695,6 +1739,7 @@ async def stream_response(
                 workspace_read_evidence=workspace_read_evidence,
                 workspace_reads=workspace_reads,
                 refresh_existing=workspace_generation != generation_before_calls,
+                host_evidence=host_evidence if agent_mode else None,
             )
     searches = steps
     return {
