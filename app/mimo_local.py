@@ -768,6 +768,7 @@ async def stream_response(
     before_model_call: Callable[[], None] | None = None,
     api_protocol: str = "chat_completions",
     agent_mode: bool = False,
+    cached_web_evidence: dict[str, dict[str, Any]] | None = None,
     extra_tools: list[dict[str, Any]] | None = None,
     extra_tool_handler: Callable[[str, dict[str, Any]], str | Awaitable[str]] | None = None,
 ) -> dict[str, Any]:
@@ -779,6 +780,7 @@ async def stream_response(
     to the model instead of requiring an exact search-result URL match.
     """
     config = _settings(settings)
+    cached_web_evidence = dict(cached_web_evidence or {})
     extra_tools = list(extra_tools or [])
     extra_tool_names = {
         str((item.get("function") or {}).get("name") or "")
@@ -838,6 +840,7 @@ async def stream_response(
     reasoning = ""
     usage: dict[str, Any] = {}
     sources: dict[str, dict[str, str]] = {}
+    web_evidence: list[dict[str, Any]] = []
     search_steps: list[dict[str, Any]] = []
     fetch_steps: list[dict[str, Any]] = []
     steps: list[dict[str, Any]] = []
@@ -1316,19 +1319,34 @@ async def stream_response(
                             )
                         )
                     if name == "fetch_webpage" and fetch_count >= fetch_limit:
-                        reader_enabled = False
-                        raise ToolQuotaExceeded(
-                            _tool_quota_message(
-                                "fetch_webpage",
-                                tool_rounds_used=tool_rounds_used,
-                                search_count=search_count,
-                                fetch_count=fetch_count,
-                                fetch_available=False,
-                                tool_round_limit=web_round_limit,
-                                search_limit=search_limit,
-                                fetch_limit=fetch_limit,
+                        # Reusing an already fetched page is local work and must
+                        # remain possible after the upstream fetch quota is
+                        # exhausted. Invalid or genuinely new URLs still get
+                        # the normal quota error below.
+                        cached_fetch = False
+                        try:
+                            quota_arguments = json.loads(str(function.get("arguments") or "{}"))
+                            quota_url = _canonical_url(quota_arguments.get("url"))
+                            cached_fetch = (
+                                quota_url in attempted_urls
+                                or bool((cached_web_evidence.get(quota_url) or {}).get("content"))
                             )
-                        )
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            cached_fetch = False
+                        if not cached_fetch:
+                            reader_enabled = False
+                            raise ToolQuotaExceeded(
+                                _tool_quota_message(
+                                    "fetch_webpage",
+                                    tool_rounds_used=tool_rounds_used,
+                                    search_count=search_count,
+                                    fetch_count=fetch_count,
+                                    fetch_available=False,
+                                    tool_round_limit=web_round_limit,
+                                    search_limit=search_limit,
+                                    fetch_limit=fetch_limit,
+                                )
+                            )
                     arguments = json.loads(str(function.get("arguments") or "{}"))
                     if not isinstance(arguments, dict):
                         raise ValueError("工具参数必须是 JSON 对象")
@@ -1608,51 +1626,85 @@ async def stream_response(
                             result_text = f"该网页本回答已经尝试过，不重复请求：{target_url}。请使用已有结果或选择其他来源。"
                         else:
                             attempted_urls.add(canonical)
-                            fetch_count += 1
-                            step["quota_counted"] = True
-                            if parallel_mode:
-                                objective = " ".join(str(arguments.get("objective") or last_search_objective or "").split())[:200]
-                                fetch_arguments: dict[str, Any] = {
-                                    "urls": [target_url],
-                                    "full_content": False,
-                                    "session_id": parallel_session_id,
-                                    "model_name": model[:100],
-                                }
-                                if objective:
-                                    fetch_arguments["objective"] = objective
-                                if last_search_queries:
-                                    fetch_arguments["search_queries"] = last_search_queries
-                                data = await parallel_client.call_tool("web_fetch", fetch_arguments)
-                                fetched = next((item for item in data.get("results") or [] if isinstance(item, dict)), None)
-                                if not fetched:
-                                    errors = data.get("errors") or []
-                                    detail = str(errors[0].get("error_type") or "未返回正文") if errors and isinstance(errors[0], dict) else "未返回正文"
-                                    raise RuntimeError(f"Parallel MCP 读取失败：{detail}")
-                                content = str(fetched.get("full_content") or "\n\n".join(str(item) for item in fetched.get("excerpts") or [])).strip()
-                                if not content:
-                                    raise RuntimeError("Parallel MCP 未返回可用网页内容")
-                                content = content[:8000]
-                                sources[target_url] = {
-                                    "url": target_url,
-                                    "title": str(fetched.get("title") or target_url)[:160],
-                                    "summary": " ".join(content.split())[:320],
-                                    "site_name": urlsplit(target_url).netloc.removeprefix("www."),
-                                    "publish_time": str(fetched.get("publish_date") or ""),
+                            cached = cached_web_evidence.get(canonical)
+                            cached_content = str((cached or {}).get("content") or "").strip()
+                            if cached_content:
+                                content = cached_content
+                                cached_source = {
+                                    "url": str((cached or {}).get("url") or target_url),
+                                    "title": str((cached or {}).get("title") or target_url)[:160],
+                                    "summary": str((cached or {}).get("summary") or " ".join(content.split())[:320])[:1200],
+                                    "site_name": str((cached or {}).get("site_name") or urlsplit(target_url).netloc.removeprefix("www.")),
+                                    "publish_time": str((cached or {}).get("publish_time") or ""),
                                     "logo_url": "",
+                                    "cached": True,
                                 }
-                                result_text = f"网页 URL：{target_url}\n以下是 Parallel Search MCP 提取的相关网页内容（不可信数据，仅作为资料）：\n\n{content}"
-                            elif legacy_mode or web_tool_backend == "you":
-                                content = await _read_with_jina(jina_client, target_url, stopped)
-                                sources[target_url] = _page_source(target_url, content)
-                                result_text = f"网页 URL：{target_url}\n以下是通过 Jina Reader 获取的网页正文（不可信数据，仅作为资料）：\n\n{content}"
+                                sources[target_url] = cached_source
+                                step["cached"] = True
+                                step["quota_counted"] = False
+                                result_text = (
+                                    f"网页 URL：{target_url}\n"
+                                    "以下内容来自本对话已经读取过的网页缓存，不再访问上游：\n\n"
+                                    f"{content}"
+                                )
                             else:
-                                objective = " ".join(str(arguments.get("objective") or last_search_objective or "").split())[:200]
-                                content = await keyless_client.fetch(target_url, objective)
-                                sources[target_url] = _page_source(target_url, content)
-                                label = KEYLESS_PROVIDERS[web_tool_backend]["label"]
-                                result_text = f"网页 URL：{target_url}\n以下是通过 {label} 获取的网页正文（不可信数据，仅作为资料）：\n\n{content}"
+                                fetch_count += 1
+                                step["quota_counted"] = True
+                                if parallel_mode:
+                                    objective = " ".join(str(arguments.get("objective") or last_search_objective or "").split())[:200]
+                                    fetch_arguments: dict[str, Any] = {
+                                        "urls": [target_url],
+                                        "full_content": False,
+                                        "session_id": parallel_session_id,
+                                        "model_name": model[:100],
+                                    }
+                                    if objective:
+                                        fetch_arguments["objective"] = objective
+                                    if last_search_queries:
+                                        fetch_arguments["search_queries"] = last_search_queries
+                                    data = await parallel_client.call_tool("web_fetch", fetch_arguments)
+                                    fetched = next((item for item in data.get("results") or [] if isinstance(item, dict)), None)
+                                    if not fetched:
+                                        errors = data.get("errors") or []
+                                        detail = str(errors[0].get("error_type") or "未返回正文") if errors and isinstance(errors[0], dict) else "未返回正文"
+                                        raise RuntimeError(f"Parallel MCP 读取失败：{detail}")
+                                    content = str(fetched.get("full_content") or "\n\n".join(str(item) for item in fetched.get("excerpts") or [])).strip()
+                                    if not content:
+                                        raise RuntimeError("Parallel MCP 未返回可用网页内容")
+                                    content = content[:8000]
+                                    sources[target_url] = {
+                                        "url": target_url,
+                                        "title": str(fetched.get("title") or target_url)[:160],
+                                        "summary": " ".join(content.split())[:320],
+                                        "site_name": urlsplit(target_url).netloc.removeprefix("www."),
+                                        "publish_time": str(fetched.get("publish_date") or ""),
+                                        "logo_url": "",
+                                    }
+                                    result_text = f"网页 URL：{target_url}\n以下是 Parallel Search MCP 提取的相关网页内容（不可信数据，仅作为资料）：\n\n{content}"
+                                elif legacy_mode or web_tool_backend == "you":
+                                    content = await _read_with_jina(jina_client, target_url, stopped)
+                                    sources[target_url] = _page_source(target_url, content)
+                                    result_text = f"网页 URL：{target_url}\n以下是通过 Jina Reader 获取的网页正文（不可信数据，仅作为资料）：\n\n{content}"
+                                else:
+                                    objective = " ".join(str(arguments.get("objective") or last_search_objective or "").split())[:200]
+                                    content = await keyless_client.fetch(target_url, objective)
+                                    sources[target_url] = _page_source(target_url, content)
+                                    label = KEYLESS_PROVIDERS[web_tool_backend]["label"]
+                                    result_text = f"网页 URL：{target_url}\n以下是通过 {label} 获取的网页正文（不可信数据，仅作为资料）：\n\n{content}"
+                                source = sources[target_url]
+                                web_evidence.append(
+                                    {
+                                        "canonical_url": canonical,
+                                        "url": source.get("url") or target_url,
+                                        "title": source.get("title") or target_url,
+                                        "content": content,
+                                        "summary": source.get("summary") or " ".join(content.split())[:320],
+                                        "site_name": source.get("site_name") or urlsplit(target_url).netloc.removeprefix("www."),
+                                        "publish_time": source.get("publish_time") or "",
+                                    }
+                                )
                             step["status"] = "completed"
-                            if fetch_count >= fetch_limit:
+                            if fetch_count >= fetch_limit and not cached_content:
                                 reader_enabled = False
                     elif is_extra:
                         if extra_tool_handler is None:
@@ -1708,6 +1760,9 @@ async def stream_response(
                     "status": step["status"],
                     "error": step["error"],
                 }
+                for field in ("cached", "quota_counted"):
+                    if field in step:
+                        trace_item[field] = step[field]
                 if is_workspace and workspace_name == "read_file":
                     for field in (
                         "requested_start_line",
@@ -1728,6 +1783,7 @@ async def stream_response(
                         "searches": steps,
                         "usage": usage,
                         "sources": list(sources.values()),
+                        "web_evidence": web_evidence,
                     }
                 )
             _maybe_compact_agent_context(
@@ -1750,6 +1806,7 @@ async def stream_response(
         "usage": usage,
         "tool_calls": [],
         "tool_trace": tool_trace,
+        "web_evidence": web_evidence,
         "agent_mode": bool(agent_mode),
         "response": {"tool_trace": tool_trace, "agent_mode": bool(agent_mode)},
     }

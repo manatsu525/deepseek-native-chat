@@ -92,6 +92,24 @@ class Database:
                     updated_at INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS conversation_web_evidence (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                    canonical_url TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    content TEXT NOT NULL DEFAULT '',
+                    summary TEXT NOT NULL DEFAULT '',
+                    site_name TEXT NOT NULL DEFAULT '',
+                    publish_time TEXT NOT NULL DEFAULT '',
+                    fetched_at INTEGER NOT NULL,
+                    last_used_at INTEGER NOT NULL,
+                    source_job_id TEXT NOT NULL DEFAULT '',
+                    UNIQUE(conversation_id, canonical_url)
+                );
+                CREATE INDEX IF NOT EXISTS idx_web_evidence_conversation
+                    ON conversation_web_evidence(user_id, conversation_id, fetched_at DESC);
                 CREATE TABLE IF NOT EXISTS attachments (
                     id TEXT PRIMARY KEY,
                     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -146,6 +164,86 @@ class Database:
     def all(self, sql: str, args: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         with self.lock, self.connect() as db:
             return [dict(row) for row in db.execute(sql, args).fetchall()]
+
+    def web_evidence_for_conversation(
+        self,
+        user_id: int,
+        conversation_id: str,
+        *,
+        max_age_seconds: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return recent, conversation-scoped webpage evidence.
+
+        Web evidence is deliberately kept separate from message history. The
+        latter is the provider-facing transcript; this table is the durable
+        source cache used to rebuild a compact evidence context on each turn.
+        """
+        args: tuple[Any, ...] = (user_id, conversation_id)
+        age_clause = ""
+        if max_age_seconds is not None and max_age_seconds > 0:
+            age_clause = " AND fetched_at>=?"
+            args += (int(time.time()) - int(max_age_seconds),)
+        return self.all(
+            "SELECT * FROM conversation_web_evidence "
+            "WHERE user_id=? AND conversation_id=?" + age_clause +
+            " ORDER BY fetched_at ASC, id ASC",
+            args,
+        )
+
+    def upsert_web_evidence(
+        self,
+        user_id: int,
+        conversation_id: str,
+        source_job_id: str,
+        evidence: list[dict[str, Any]],
+    ) -> None:
+        """Persist successful webpage bodies for reuse in later turns."""
+        if not evidence:
+            return
+        timestamp = int(time.time())
+        rows: list[tuple[Any, ...]] = []
+        for item in evidence:
+            canonical_url = str(item.get("canonical_url") or "").strip()
+            content = str(item.get("content") or "").strip()
+            if not canonical_url or not content:
+                continue
+            rows.append(
+                (
+                    user_id,
+                    conversation_id,
+                    canonical_url,
+                    str(item.get("url") or canonical_url)[:2048],
+                    str(item.get("title") or "")[:160],
+                    content[:12000],
+                    str(item.get("summary") or " ".join(content.split())[:320])[:1200],
+                    str(item.get("site_name") or "")[:160],
+                    str(item.get("publish_time") or "")[:120],
+                    timestamp,
+                    timestamp,
+                    source_job_id,
+                )
+            )
+        if not rows:
+            return
+        with self.lock, self.connect() as db:
+            db.executemany(
+                """INSERT INTO conversation_web_evidence(
+                       user_id,conversation_id,canonical_url,url,title,content,
+                       summary,site_name,publish_time,fetched_at,last_used_at,source_job_id
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(conversation_id,canonical_url) DO UPDATE SET
+                       user_id=excluded.user_id,
+                       url=excluded.url,
+                       title=excluded.title,
+                       content=excluded.content,
+                       summary=excluded.summary,
+                       site_name=excluded.site_name,
+                       publish_time=excluded.publish_time,
+                       fetched_at=excluded.fetched_at,
+                       last_used_at=excluded.last_used_at,
+                       source_job_id=excluded.source_job_id""",
+                rows,
+            )
 
     def run(self, sql: str, args: tuple[Any, ...] = ()) -> int:
         with self.lock, self.connect() as db:

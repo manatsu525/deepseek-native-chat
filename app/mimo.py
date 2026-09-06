@@ -415,7 +415,18 @@ def _canonical_url(value: Any) -> str:
         host = f"[{host}]"
     default_port = (parts.scheme.lower() == "http" and port == 80) or (parts.scheme.lower() == "https" and port == 443)
     netloc = host if not port or default_port else f"{host}:{port}"
-    path = parts.path.rstrip("/") or "/"
+    # Decode only characters that are safe to normalize in a path. In
+    # particular this makes ``%(28|29)``-encoded wiki titles match their
+    # literal-parentheses form without turning an encoded slash into a
+    # different path hierarchy.
+    def decode_safe_path_character(match: re.Match[str]) -> str:
+        character = chr(int(match.group(1), 16))
+        if character.isalnum() or character in "-._~()":
+            return character
+        return match.group(0).upper()
+
+    path = re.sub(r"%([0-9A-Fa-f]{2})", decode_safe_path_character, parts.path)
+    path = path.rstrip("/") or "/"
     query_items = [
         (key, item)
         for key, item in parse_qsl(parts.query, keep_blank_values=True)
