@@ -194,6 +194,129 @@ class WebEvidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["tool_trace"][0].get("cached"))
         self.assertFalse(result["tool_trace"][0].get("quota_counted"))
 
+    async def test_stale_exhausted_web_call_is_dropped_before_workspace_round(self) -> None:
+        """A gateway must not turn a removed web tool into a visible failed step."""
+        def event(lines: list[str]) -> list[str]:
+            return lines + ["data: [DONE]"]
+
+        responses = [
+            event(
+                [
+                    "data: "
+                    + json.dumps(
+                        {
+                            "choices": [
+                                {
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": 0,
+                                                "id": "stale-fetch",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": "fetch_webpage",
+                                                    "arguments": json.dumps({"url": "https://example.com/page"}),
+                                                },
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    )
+                ]
+            ),
+            event(["data: " + json.dumps({"choices": [{"delta": {"content": "完成"}}]})]),
+        ]
+
+        class FakeResponse:
+            status_code = 200
+
+            async def aiter_lines(self):
+                for line in responses.pop(0):
+                    yield line
+
+            async def aread(self) -> bytes:
+                return b""
+
+        class FakeStreamContext:
+            def __init__(self) -> None:
+                self.response = FakeResponse()
+
+            async def __aenter__(self):
+                return self.response
+
+            async def __aexit__(self, *_):
+                return False
+
+        class FakeHTTPClient:
+            def __init__(self, **_):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            def stream(self, *_args, **_kwargs):
+                return FakeStreamContext()
+
+        class FakeParallelClient:
+            calls = 0
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            async def call_tool(self, *_args, **_kwargs):
+                type(self).calls += 1
+                raise AssertionError("an exhausted fetch must be dropped before upstream execution")
+
+        class FakeWorkspace:
+            def tool_definitions(self, _access):
+                return [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "description": "read",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ]
+
+            def list_files(self):
+                return []
+
+        async def update(_state):
+            return None
+
+        with patch("app.mimo_local.httpx.AsyncClient", FakeHTTPClient), patch(
+            "app.mimo_local.ParallelMCPClient", FakeParallelClient
+        ):
+            result = await stream_response(
+                base_url="https://example.test/v1",
+                api_key="test-key",
+                model="test-model",
+                messages=[{"role": "user", "content": "检查页面"}],
+                timeout=30,
+                stopped=lambda: False,
+                update=update,
+                settings={"thinking": "disabled", "web_tool_backend": "parallel"},
+                workspace=FakeWorkspace(),
+                workspace_access="edit",
+                web_search_limit=0,
+                web_fetch_limit=0,
+            )
+
+        self.assertEqual(result["answer"], "完成")
+        self.assertEqual(result["searches"], [])
+        self.assertEqual(result["tool_trace"], [])
+        self.assertEqual(FakeParallelClient.calls, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

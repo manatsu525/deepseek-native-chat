@@ -161,6 +161,31 @@ def _select_round_tool_calls(
         selected.append(call)
     return selected
 
+
+def _round_tool_names(tools: list[dict[str, Any]]) -> set[str]:
+    """Return the function names actually advertised for this model round.
+
+    Some OpenAI-compatible gateways can reuse a previous tool schema and emit
+    a call for a tool that was removed from the current request. Keeping this
+    extraction in one place lets the stream loop reject only those stale calls
+    before they become visible tool steps or reach an upstream service.
+    """
+    names: set[str] = set()
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+        else:
+            # Responses-style tools use a top-level name. round_tools are
+            # normally Chat Completions-shaped, but accepting both keeps this
+            # guard correct if a provider-specific definition is added later.
+            name = tool.get("name")
+        if name:
+            names.add(str(name))
+    return names
+
 NEMOTRON_LANGUAGE_PROMPT = (
     "LANGUAGE REQUIREMENT: Answer in the same language as the user's most recent message. "
     "If that message is in Chinese, the final answer MUST be in Chinese; if it is in another language, "
@@ -1214,7 +1239,44 @@ async def stream_response(
                     id_prefix=f"inkling-{round_number + 1}",
                     tools_available=bool(round_tools),
                 )
-            invalid_answer = not round_answer.strip() or _looks_like_text_tool_call(round_answer)
+            # A few gateways/models keep emitting a tool from the preceding
+            # round even after its definition has been removed. This is most
+            # visible when ordinary mode still advertises workspace tools:
+            # final_answer_only is false, so the stale web call used to be
+            # recorded and then rejected by the quota check. Drop only stale
+            # network calls here; valid workspace/extra calls in the same
+            # response still execute normally.
+            advertised_tool_names = _round_tool_names(round_tools)
+            stale_web_calls = []
+            filtered_calls = []
+            for call in calls:
+                function = call.get("function") or {}
+                name = str(function.get("name") or "")
+                if name in {"web_search", "fetch_webpage"} and name not in advertised_tool_names:
+                    stale_web_calls.append(call)
+                    continue
+                filtered_calls.append(call)
+            calls = filtered_calls
+            if stale_web_calls and responses_output_items_by_index:
+                stale_call_ids = {
+                    str(call.get("id") or "")
+                    for call in stale_web_calls
+                    if call.get("id")
+                }
+                if stale_call_ids:
+                    responses_output_items_by_index = {
+                        index: item
+                        for index, item in responses_output_items_by_index.items()
+                        if not (
+                            item.get("type") == "function_call"
+                            and str(item.get("call_id") or item.get("id") or "") in stale_call_ids
+                        )
+                    }
+            invalid_answer = (
+                not round_answer.strip()
+                or _looks_like_text_tool_call(round_answer)
+                or bool(stale_web_calls and not calls)
+            )
             if (final_answer_only and (calls or invalid_answer)) or (not calls and invalid_answer):
                 final_answer_attempts += 1
                 force_final_answer = True
