@@ -24,6 +24,7 @@ from . import attachments
 from .agent import AgentRuntime, build_agent_skills_prompt
 from .config import settings
 from .custom_request import validate_request_overrides
+from .responses_state import state_scope, resume_state
 from .db import Database
 from .deepseek import list_models as deepseek_list_models
 from .deepseek import stream_response as deepseek_stream_response
@@ -525,6 +526,11 @@ async def _execute_job(job_id: str) -> None:
         "SELECT role, content, meta_json FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 20",
         (job["conversation_id"],),
     )
+    response_scope = ""
+    response_options: dict[str, Any] = {}
+    if kind == "custom_response":
+        response_scope = state_scope(provider, job, custom_settings_for_model(provider, job["model"]))
+        response_options["responses_state"] = resume_state(history_rows, response_scope)
     history: list[dict[str, Any]] = []
     for row in reversed(history_rows):
         meta = db.decode(row.get("meta_json", "{}"), {})
@@ -636,6 +642,7 @@ async def _execute_job(job_id: str) -> None:
                 web_fetch_limit=96,
                 web_tool_round_limit=96,
                 cached_web_evidence=cached_web_evidence,
+                **response_options,
                 system_addendum=(
                     build_agent_skills_prompt()
                     + (f"\n\n{web_evidence_context}" if web_evidence_context else "")
@@ -659,6 +666,7 @@ async def _execute_job(job_id: str) -> None:
                 workspace=job_workspace,
                 cached_web_evidence=cached_web_evidence,
                 system_addendum=web_evidence_context,
+                **response_options,
             )
         else:
             result = await deepseek_stream_response(
@@ -682,6 +690,8 @@ async def _execute_job(job_id: str) -> None:
         meta = {"job_id": job_id, "conversation_id": job["conversation_id"], "provider_id": job["provider_id"], "provider_type": kind, "model": job["model"], "chat_mode": job.get("chat_mode") or "standard", "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"], "agents": result.get("agents", []), "workspace_files": display_files}
         if result.get("tool_trace"):
             meta["tool_trace"] = result["tool_trace"]
+        if kind == "custom_response" and result.get("responses_state"):
+            meta["responses_state"] = {**result["responses_state"], "scope": response_scope}
         db.run(
             "INSERT INTO messages(conversation_id, role, content, meta_json, created_at) VALUES(?,?,?,?,?)",
             (job["conversation_id"], "assistant", result["answer"], json.dumps(meta, ensure_ascii=False), now()),

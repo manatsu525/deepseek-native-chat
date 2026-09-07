@@ -106,6 +106,10 @@ DeepSeek 当前会忽略 Responses API 的 `max_tool_calls`。项目在系统提
 
 ## 数据与安全
 
+Custom Responses 默认发送 `store:true`，成功响应的 ID 随助手消息保存在本地数据库。工具轮次通过 `previous_response_id` 只回填新增工具结果；下一条用户消息通过同一 ID 链续接。每次请求重新发送 `instructions`，工具可用性仍按原额度变化。会话、用户、API 配置、密钥、模型或聊天模式变化时不复用旧链；重新回答使用被重试问题之前的父状态。Chat Completions、Anthropic Messages 和原生 DeepSeek 路由保持原逻辑。
+
+只有完整成功响应的 ID 才会保存。上游不返回可存储 ID，或明确拒绝 `store` / `previous_response_id` 时，该聊天转为本地历史回填；状态错误仅在消费输出之前补发一次，不重复执行工具，503/429 等错误不自动重试。高级 JSON 的 `store:false` 可禁用状态续接，`previous_response_id` / `conversation` 由服务端管理。上下文压缩或丢弃未执行的工具调用时，从本地有效历史建立新链。状态模式仍会计费历史输入，缓存命中及价格取决于上游，不能保证降低账单。
+
 - 数据库：`/opt/deepseek-native-chat/data/chat.db`
 - API Key：保存在仅 root 可读的本地 SQLite 数据库中，前端只返回掩码
 - 会话 Cookie：HttpOnly、Secure、SameSite=Lax

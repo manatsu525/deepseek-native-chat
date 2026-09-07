@@ -15,6 +15,7 @@ from curl_cffi import requests as curl_requests
 
 from .custom_tool_normalization import normalize_tool_calls
 from .custom_request import apply_request_overrides
+from .responses_state import ResponsesState
 from .agent import AGENT_SYSTEM_PROMPT
 from .keyless_web import (
     KEYLESS_CUSTOM_SYSTEM_PROMPT,
@@ -794,6 +795,7 @@ async def stream_response(
     api_protocol: str = "chat_completions",
     agent_mode: bool = False,
     cached_web_evidence: dict[str, dict[str, Any]] | None = None,
+    responses_state: dict[str, Any] | None = None,
     extra_tools: list[dict[str, Any]] | None = None,
     extra_tool_handler: Callable[[str, dict[str, Any]], str | Awaitable[str]] | None = None,
 ) -> dict[str, Any]:
@@ -805,6 +807,7 @@ async def stream_response(
     to the model instead of requiring an exact search-result URL match.
     """
     config = _settings(settings)
+    response_chain = ResponsesState(responses_state)
     cached_web_evidence = dict(cached_web_evidence or {})
     extra_tools = list(extra_tools or [])
     extra_tool_names = {
@@ -860,6 +863,10 @@ async def stream_response(
     if system_addendum.strip():
         system_prompt = f"{system_prompt}\n\n{system_addendum.strip()}"
     conversation: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}, *[dict(message) for message in messages]]
+    if api_protocol == "responses" and response_chain.previous_id:
+        # The persisted state belongs to the immediately preceding assistant.
+        # Attachment expansion has already happened in main.py.
+        response_chain.pending = _responses_input(messages[-1:])
     base_message_count = len(conversation)
     answer = ""
     reasoning = ""
@@ -986,17 +993,22 @@ async def stream_response(
             messages_protocol = api_protocol == "messages"
             output_token_field = custom_output_token_field(api_protocol)
             if responses_protocol:
+                full_response_input = _responses_input([
+                    item for item in request_messages if item.get("role") not in {"system", "developer"}
+                ])
                 payload = {
                     "model": model,
-                    "input": _responses_input(request_messages),
+                    "input": full_response_input,
+                    "instructions": "\n\n".join(
+                        str(item.get("content") or "") for item in request_messages
+                        if item.get("role") in {"system", "developer"}
+                    ),
                     output_token_field: int(config["max_completion_tokens"]),
                     "stream": True,
                 }
                 if bool(config.get("reasoning_effort_enabled", True)):
                     payload["reasoning"] = {"effort": normalize_reasoning_effort(effort)}
-                    # The loop manages context itself rather than using
-                    # previous_response_id, so request the opaque reasoning
-                    # state needed for the next function-call turn.
+                    # Retain a local replay for gateways without stored state.
                     payload["include"] = ["reasoning.encrypted_content"]
                 payload["temperature"] = float(config["temperature"])
                 payload["top_p"] = float(config["top_p"])
@@ -1062,6 +1074,8 @@ async def stream_response(
                     "effort": normalize_reasoning_effort(effort),
                 },
             )
+            if responses_protocol:
+                response_chain.prepare(payload, full_response_input)
             round_answer = ""
             round_preview = ""
             round_reasoning = ""
@@ -1082,7 +1096,13 @@ async def stream_response(
             if before_model_call is not None:
                 before_model_call()
             endpoint = "/responses" if responses_protocol else "/messages" if messages_protocol else "/chat/completions"
-            async with api_client.stream("POST", _url(base_url, endpoint), headers=headers, json=payload) as response:
+            stream_context = (
+                response_chain.stream(api_client, "POST", _url(base_url, endpoint),
+                                      headers=headers, json=payload, full_input=full_response_input)
+                if responses_protocol else
+                api_client.stream("POST", _url(base_url, endpoint), headers=headers, json=payload)
+            )
+            async with stream_context as response:
                 if response.status_code >= 400:
                     body = (await response.aread()).decode(errors="replace")[:2000]
                     raise RuntimeError(f"Custom API {response.status_code}: {body}")
@@ -1103,6 +1123,8 @@ async def stream_response(
                     if data.get("error"):
                         raise RuntimeError(f"Custom 响应失败: {data['error']}")
                     event_type = str(data.get("type") or "")
+                    if responses_protocol:
+                        response_chain.observe(data)
                     raw_usage = data.get("usage")
                     if event_type in {"response.completed", "response.incomplete"}:
                         completed_response = data.get("response") or {}
@@ -1278,6 +1300,7 @@ async def stream_response(
                 or bool(stale_web_calls and not calls)
             )
             if (final_answer_only and (calls or invalid_answer)) or (not calls and invalid_answer):
+                response_chain.reset()
                 final_answer_attempts += 1
                 force_final_answer = True
                 await update(
@@ -1295,12 +1318,26 @@ async def stream_response(
 
             answer += round_answer
             reasoning += round_reasoning
+            if responses_protocol:
+                response_chain.accept()
             if not calls or final_answer_only:
                 break
 
             # Execute all workspace calls from this response in emitted order.
             # Web calls remain capped at one per model round for cost and abuse control.
+            emitted_call_ids = {call["id"] for call in calls}
             calls = _select_round_tool_calls(calls, inkling_patch_bindings)
+            if responses_protocol and (stale_web_calls or {call["id"] for call in calls} != emitted_call_ids):
+                # The stored response still contains unexecuted calls. Rebase
+                # from local accepted history instead of leaving orphan calls.
+                response_chain.reset()
+            if responses_protocol:
+                selected_ids = {call["id"] for call in calls}
+                responses_output_items_by_index = {
+                    index: item for index, item in responses_output_items_by_index.items()
+                    if item.get("type") != "function_call"
+                    or str(item.get("call_id") or item.get("id") or "") in selected_ids
+                }
             if not calls:
                 break
             assistant_message: dict[str, Any] = {
@@ -1326,6 +1363,7 @@ async def stream_response(
                     for index in sorted(responses_output_items_by_index)
                 ]
             conversation.append(assistant_message)
+            tool_results_start = len(conversation)
             tool_rounds_used += 1
             generation_before_calls = workspace_generation
             for call in calls:
@@ -1848,7 +1886,9 @@ async def stream_response(
                         "web_evidence": web_evidence,
                     }
                 )
-            _maybe_compact_agent_context(
+            if responses_protocol:
+                response_chain.pending = _responses_input(conversation[tool_results_start:])
+            compacted = _maybe_compact_agent_context(
                 conversation,
                 base_message_count=base_message_count,
                 workspace=workspace,
@@ -1859,6 +1899,8 @@ async def stream_response(
                 refresh_existing=workspace_generation != generation_before_calls,
                 host_evidence=host_evidence if agent_mode else None,
             )
+            if responses_protocol and compacted:
+                response_chain.reset()
     searches = steps
     return {
         "answer": answer,
@@ -1871,4 +1913,5 @@ async def stream_response(
         "web_evidence": web_evidence,
         "agent_mode": bool(agent_mode),
         "response": {"tool_trace": tool_trace, "agent_mode": bool(agent_mode)},
+        **({"responses_state": response_chain.export()} if api_protocol == "responses" else {}),
     }
