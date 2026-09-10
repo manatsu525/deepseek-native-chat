@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -588,6 +589,16 @@ def _responses_content(content: Any, role: str) -> Any:
     return translated
 
 
+def _record_response_call(found: dict, index: int, item: dict) -> None:
+    """Merge complete call snapshots without erasing streamed arguments."""
+    current = found.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+    current["id"] = str(item.get("call_id") or current["id"] or item.get("id") or "")
+    current["function"]["name"] = str(item.get("name") or current["function"]["name"])
+    arguments = item.get("arguments")
+    if arguments not in (None, ""):
+        current["function"]["arguments"] = arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
+
+
 def _responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Convert internal history while preserving native Responses output items.
 
@@ -939,6 +950,8 @@ async def stream_response(
         for round_number in range(role_tool_round_limit + FINAL_ANSWER_ATTEMPTS):
             if stopped():
                 raise asyncio.CancelledError
+            if round_number >= role_tool_round_limit:
+                force_final_answer = True
             round_tools: list[dict[str, Any]] = []
             inkling_patch_bindings: dict[str, tuple[str, str]] = {}
             if not force_final_answer:
@@ -971,6 +984,11 @@ async def stream_response(
             final_answer_only = force_final_answer or (tools_expected and not round_tools)
             mimo_model = is_mimo_model(model)
             request_messages = conversation
+            if web_enabled and (search_count >= search_limit or fetch_count >= fetch_limit) and not final_answer_only:
+                request_messages = [*conversation, {"role": "system", "content":
+                    f"Remaining web budget: web_search={max(0, search_limit - search_count)}, "
+                    f"fetch_webpage={max(0, fetch_limit - fetch_count)}. "
+                    "Use only tools listed in this request. Answer when the available evidence is sufficient."}]
             if final_answer_only:
                 retry_note = (
                     " Your preceding finalization attempt still tried to call a tool and was discarded."
@@ -1015,6 +1033,9 @@ async def stream_response(
                 if round_tools:
                     payload["tools"] = _responses_tools(round_tools)
                     payload["tool_choice"] = "auto"
+                elif final_answer_only:
+                    payload["tools"] = []
+                    payload["tool_choice"] = "none"
             elif messages_protocol:
                 system_value, anthropic_history = _anthropic_messages(request_messages)
                 max_tokens = int(config["max_completion_tokens"])
@@ -1133,6 +1154,14 @@ async def stream_response(
                             for output_index, output_item in enumerate(completed_response.get("output") or []):
                                 if isinstance(output_item, dict) and output_item.get("type"):
                                     responses_output_items_by_index[output_index] = dict(output_item)
+                                    if output_item.get("type") == "function_call":
+                                        _record_response_call(round_tools_by_index, output_index, output_item)
+                            if not round_answer:
+                                round_answer = "".join(
+                                    str(part.get("text") or "")
+                                    for item in completed_response.get("output") or [] if item.get("type") == "message"
+                                    for part in item.get("content") or [] if part.get("type") == "output_text"
+                                )
                     if messages_protocol and event_type == "message_start":
                         raw_usage = (data.get("message") or {}).get("usage") or raw_usage
                     if isinstance(raw_usage, dict):
@@ -1155,11 +1184,9 @@ async def stream_response(
                             if event_type == "response.output_item.done" and isinstance(item, dict) and item.get("type"):
                                 responses_output_items_by_index[index] = dict(item)
                             if item.get("type") == "function_call":
-                                current = round_tools_by_index.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-                                current["id"] = str(item.get("call_id") or item.get("id") or current.get("id") or "")
-                                current["function"]["name"] = str(item.get("name") or current["function"].get("name") or "")
-                                if item.get("arguments") is not None:
-                                    current["function"]["arguments"] = str(item.get("arguments") or "")
+                                _record_response_call(round_tools_by_index, index, item)
+                        elif event_type == "response.function_call_arguments.done":
+                            _record_response_call(round_tools_by_index, int(data.get("output_index") or 0), data)
                         elif event_type == "response.function_call_arguments.delta":
                             index = int(data.get("output_index") or 0)
                             current = round_tools_by_index.setdefault(index, {"id": str(data.get("item_id") or ""), "type": "function", "function": {"name": "", "arguments": ""}})
@@ -1238,6 +1265,46 @@ async def stream_response(
 
             usage = _merge_usage(usage, round_usage)
             calls = normalize_tool_calls(_tool_calls(round_tools_by_index, round_number))
+            if responses_protocol:
+                # Execution and replay must use the same assembled arguments.
+                # A corrected local transcript cannot continue an uncorrected
+                # stored response; rebase that chain before sending results.
+                by_id = {call["id"]: call["function"] for call in calls}
+                invalid_calls = []
+                for call in calls:
+                    try:
+                        arguments = json.loads(call["function"]["arguments"])
+                        if not isinstance(arguments, dict):
+                            raise ValueError("arguments must be a JSON object")
+                    except (ValueError, TypeError):
+                        invalid_calls.append(call)
+                if invalid_calls and not final_answer_only:
+                    logging.getLogger(__name__).warning(
+                        "responses_invalid_arguments conversation=%s round=%s calls=%s",
+                        conversation_id, round_number + 1,
+                        [(call["function"]["name"], len(call["function"]["arguments"])) for call in invalid_calls],
+                    )
+                    # Invalid protocol items cannot be replayed as function_call
+                    # history. Return the error as text and request corrected
+                    # arguments, without executing any partially decoded call.
+                    response_chain.reset()
+                    conversation.append({"role": "system", "content":
+                        "The preceding tool calls were not executed because their arguments were not valid JSON objects. "
+                        "Submit complete JSON arguments for the intended tool. Invalid calls: " +
+                        json.dumps(invalid_calls, ensure_ascii=False)[:4000]})
+                    continue
+                for item in responses_output_items_by_index.values():
+                    if item.get("type") != "function_call":
+                        continue
+                    function = by_id.get(str(item.get("call_id") or item.get("id") or ""))
+                    if function and item.get("arguments") != function["arguments"]:
+                        logging.getLogger(__name__).warning(
+                            "responses_arguments_reassembled conversation=%s round=%s call=%s snapshot_chars=%s assembled_chars=%s",
+                            conversation_id, round_number + 1, item.get("call_id"),
+                            len(str(item.get("arguments") or "")), len(function["arguments"]),
+                        )
+                        item["arguments"] = function["arguments"]
+                        response_chain.disable("upstream_tool_arguments_required_reassembly")
             if markup_stream is not None:
                 round_preview += markup_stream.flush()
             if dsml_fallback_active:
@@ -1279,6 +1346,22 @@ async def stream_response(
                     continue
                 filtered_calls.append(call)
             calls = filtered_calls
+            if stale_web_calls and not calls and round_tools:
+                logging.getLogger(__name__).warning(
+                    "unavailable_tool_selected conversation=%s round=%s requested=%s available=%s search_used=%s fetch_used=%s",
+                    conversation_id, round_number + 1,
+                    [call["function"]["name"] for call in stale_web_calls],
+                    sorted(advertised_tool_names), search_count, fetch_count,
+                )
+                # An unavailable search is not exhaustion of fetch/workspace
+                # tools. Preserve the accepted history and announce the actual
+                # remaining capabilities instead of forcing finalization.
+                response_chain.reset()
+                conversation.append({"role": "system", "content":
+                    "The preceding request used an unavailable tool and was not executed. "
+                    "Available tools for the next turn: " + ", ".join(sorted(advertised_tool_names)) +
+                    ". Use an available tool if needed, or answer using the evidence already obtained."})
+                continue
             if stale_web_calls and responses_output_items_by_index:
                 stale_call_ids = {
                     str(call.get("id") or "")
@@ -1300,6 +1383,11 @@ async def stream_response(
                 or bool(stale_web_calls and not calls)
             )
             if (final_answer_only and (calls or invalid_answer)) or (not calls and invalid_answer):
+                failure_kind = "unexpected_tool_call" if calls or stale_web_calls or _looks_like_text_tool_call(round_answer) else "empty_answer"
+                logging.getLogger(__name__).warning(
+                    "custom_finalization_rejected conversation=%s round=%s kind=%s answer_only=%s search_used=%s fetch_used=%s",
+                    conversation_id, round_number + 1, failure_kind, final_answer_only, search_count, fetch_count,
+                )
                 response_chain.reset()
                 final_answer_attempts += 1
                 force_final_answer = True
@@ -1314,7 +1402,9 @@ async def stream_response(
                 )
                 if final_answer_attempts < FINAL_ANSWER_ATTEMPTS:
                     continue
-                raise RuntimeError("模型在工具额度用完后仍反复输出工具调用，未生成最终答案")
+                if failure_kind == "empty_answer":
+                    raise RuntimeError("上游连续返回空正文，未生成最终答案")
+                raise RuntimeError("上游在最终回答阶段仍返回工具调用，未生成最终答案")
 
             answer += round_answer
             reasoning += round_reasoning

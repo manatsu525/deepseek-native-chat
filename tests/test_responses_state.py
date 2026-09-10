@@ -62,6 +62,85 @@ class Transport:
 
 
 class ResponsesStateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_three_searches_still_allow_fetch_after_stale_search(self):
+        def web_call(rid, name, args):
+            events = call(rid, (name,))
+            events[0]["item"]["arguments"] = json.dumps(args)
+            return events
+        queries = [web_call(f"s{i}", "web_search", {"objective": "verify age", "search_queries": [f"query{i}"]}) for i in range(3)]
+        transport = Transport([*queries,
+            web_call("stale", "web_search", {"objective": "verify age", "search_queries": ["query4"]}),
+            web_call("fetch", "fetch_webpage", {"url": "https://example.com/age"}), final()])
+        requests = []
+        class Web:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *_):
+                return False
+            async def call_tool(self, name, args):
+                requests.append(name)
+                return {"results": [{"url": "https://example.com/age", "title": "age", "excerpts": ["Born in 2000."]}]}
+        with patch("app.mimo_local.ParallelMCPClient", Web):
+            result = await self.run_stream(transport, web_enabled=True, extra_tools=[], extra_tool_handler=None,
+                                          settings={"web_tool_backend": "parallel"})
+        self.assertEqual(requests, ["web_search"] * 3 + ["web_fetch"])
+        self.assertEqual(result["answer"], "完成")
+        for payload in transport.payloads[3:5]:
+            self.assertEqual([item["name"] for item in payload["tools"]], ["fetch_webpage"])
+            self.assertIn("web_search=0, fetch_webpage=3", payload["instructions"])
+        self.assertTrue(all(item["status"] == "completed" for item in result["tool_trace"]))
+
+    async def test_completed_snapshot_supplies_calls_and_final_text(self):
+        events = call("resp_tool")[-1:]
+        end = [{"type": "response.completed", "response": {"id": "resp_final", "output": [
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "完成"}]}]}}]
+        transport = Transport([events, end])
+        result = await self.run_stream(transport)
+        self.assertEqual(len(result["tool_trace"]), 1)
+        self.assertEqual(result["answer"], "完成")
+        self.assertEqual(transport.payloads[1]["previous_response_id"], "resp_tool")
+
+    async def test_arguments_done_survives_empty_item_snapshot_and_replay(self):
+        item = {"type": "function_call", "id": "fc_0", "call_id": "call_0", "name": "host_check", "arguments": ""}
+        events = [
+            {"type": "response.output_item.added", "output_index": 0, "item": item},
+            {"type": "response.function_call_arguments.done", "output_index": 0, "arguments": '{"value":42}'},
+            {"type": "response.output_item.done", "output_index": 0, "item": item},
+            {"type": "response.completed", "response": {"id": "resp_tool", "output": [item]}},
+        ]
+        executed = []
+        async def execute(name, args):
+            executed.append(args)
+            return "checked"
+        transport = Transport([events, final()])
+        await self.run_stream(transport, extra_tool_handler=execute)
+        self.assertEqual(executed, [{"value": 42}])
+        second = transport.payloads[1]
+        self.assertNotIn("previous_response_id", second)
+        replay = next(item for item in second["input"] if item.get("type") == "function_call")
+        self.assertEqual(json.loads(replay["arguments"]), {"value": 42})
+
+    async def test_invalid_arguments_are_not_executed_or_replayed(self):
+        events = call("resp_bad")
+        for event in events:
+            if "item" in event:
+                event["item"]["arguments"] = '{"broken":'
+        transport = Transport([events, call("resp_good"), final()])
+        result = await self.run_stream(transport)
+        self.assertEqual(len(result["tool_trace"]), 1)
+        retry = transport.payloads[1]
+        self.assertNotIn("previous_response_id", retry)
+        self.assertFalse(any(item.get("type") == "function_call" for item in retry["input"]))
+        self.assertIn("not valid JSON", retry["instructions"])
+
+    async def test_unavailable_web_call_does_not_force_remaining_tools_off(self):
+        transport = Transport([call("resp_stale", ("web_search",)), call("resp_valid"), final()])
+        result = await self.run_stream(transport)
+        self.assertEqual(len(result["tool_trace"]), 1)
+        self.assertEqual(transport.payloads[1]["tool_choice"], "auto")
+        self.assertIn("host_check", [item["name"] for item in transport.payloads[1]["tools"]])
+        self.assertIn("Available tools", transport.payloads[1]["instructions"])
+
     async def run_stream(self, transport, **kwargs):
         async def update(state):
             pass
