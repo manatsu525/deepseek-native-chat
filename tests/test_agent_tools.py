@@ -17,15 +17,15 @@ class AgentToolTests(unittest.TestCase):
         self.db = Database(self.root / "chat.db")
         self.db.init()
         self.user_id = self.db.run(
-            "INSERT INTO users(username,password_hash,created_at) VALUES(?,?,?)",
-            ("agent-user", "hash", 1),
+            "INSERT INTO users(username,password_hash,is_admin,created_at) VALUES(?,?,?,?)",
+            ("agent-user", "hash", 1, 1),
         )
         self.conversation_id = "agent-test"
         self.db.run(
             "INSERT INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?)",
             (self.conversation_id, self.user_id, "Agent", 1, 1),
         )
-        self.runtime = AgentRuntime(self.db, self.user_id, self.conversation_id)
+        self.runtime = AgentRuntime(self.db, self.user_id, self.conversation_id, is_admin=True)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -53,6 +53,17 @@ class AgentToolTests(unittest.TestCase):
         self.assertIn("skill_install", names)
         self.assertIn("conversation_create", names)
         self.assertIn("frontend_validate_page", names)
+
+    def test_non_admin_can_read_but_cannot_mutate_shared_skills(self) -> None:
+        runtime = AgentRuntime(self.db, self.user_id, self.conversation_id, is_admin=False)
+        names = {item["function"]["name"] for item in runtime.tool_definitions}
+        self.assertIn("skill_list", names)
+        self.assertIn("skill_read", names)
+        self.assertNotIn("skill_install", names)
+        self.assertNotIn("skill_enable", names)
+        self.assertNotIn("skill_remove", names)
+        denied = runtime.execute("skill_enable", {"skill_id": "writing-plans", "enabled": False})
+        self.assertIn("仅管理员", denied)
 
 
 if __name__ == "__main__":

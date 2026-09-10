@@ -156,6 +156,7 @@
 
   <dialog id="providerModal" class="modal">
     <div class="modal-head"><div><p class="eyebrow">CONNECTIONS</p><h3 id="providerModalTitle">模型 API</h3></div><button class="icon-btn close-modal">×</button></div>
+    <p id="providerAccessNote" class="wide muted"></p>
     <div id="providerList" class="item-list"></div>
     <form id="providerForm" class="form-grid">
       <label>配置名称<input id="providerName" placeholder="例如：我的 DeepSeek" required></label>
@@ -206,6 +207,7 @@
   <dialog id="skillsModal" class="modal">
     <div class="modal-head"><div><p class="eyebrow">AGENT SKILLS</p><h3>Skill 管理</h3><p class="muted">这些 Skill 只会注入 Agent 模式，普通聊天不受影响。</p></div><button class="icon-btn close-modal" type="button" aria-label="关闭">×</button></div>
     <div class="skills-toolbar"><span id="skillsSummary">正在读取 Skill…</span><button id="skillsRefresh" class="soft-btn" type="button">刷新</button></div>
+    <p id="skillAccessNote" class="muted"></p>
     <div id="skillList" class="skill-list"><div class="skill-list-empty">正在读取 Skill…</div></div>
     <section id="skillDetail" class="skill-detail hidden">
       <div class="skill-detail-head"><strong id="skillDetailTitle">Skill 内容</strong><button id="skillDetailClose" class="icon-btn" type="button" aria-label="关闭内容">×</button></div>

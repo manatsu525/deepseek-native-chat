@@ -381,6 +381,9 @@ def public_provider(row: dict[str, Any]) -> dict[str, Any]:
     saved_settings = _decoded_provider_settings(row)
     saved_models = _models_from_settings(row.get("model"), saved_settings)
     key = row.pop("api_key", "")
+    # The database column is retained as a migration/foreign-key anchor, but
+    # shared-resource consumers must not see which account created it.
+    row.pop("user_id", None)
     row["provider_type"] = provider_type(row)
     if is_custom_provider(row["provider_type"]):
         row["model_settings"] = custom_settings_by_model(row, saved_models)
@@ -513,10 +516,14 @@ async def _execute_job(job_id: str) -> None:
     if job.get("chat_mode") == "multi_agent":
         job["chat_mode"] = "agent"
     attachment_records = db.attachments_for_job(job["user_id"], job_id)
-    provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (job["provider_id"], job["user_id"]))
+    # Provider configurations are shared across accounts. The provider table
+    # keeps a creator/owner user_id only as a foreign-key anchor for legacy
+    # databases; it is not an access-control boundary.
+    provider = db.one("SELECT * FROM providers WHERE id=?", (job["provider_id"],))
     if not provider:
         db.update_job(job_id, status="failed", error="API 配置不存在")
         return
+    job_user = db.one("SELECT is_admin FROM users WHERE id=?", (job["user_id"],)) or {}
     kind = provider_type(provider)
     agent_job = is_custom_provider(kind) and job.get("chat_mode") == "agent"
     # Agent jobs never create or mount an ordinary per-conversation workspace.
@@ -616,7 +623,12 @@ async def _execute_job(job_id: str) -> None:
             )
         if is_custom_provider(kind) and job.get("chat_mode") == "agent":
             provider_settings = custom_settings_for_model(provider, job["model"])
-            runtime = AgentRuntime(db, job["user_id"], job["conversation_id"])
+            runtime = AgentRuntime(
+                db,
+                job["user_id"],
+                job["conversation_id"],
+                is_admin=bool(job_user.get("is_admin")),
+            )
             result = await custom_streamer(kind)(
                 base_url=provider["base_url"],
                 api_key=provider["api_key"],
@@ -875,7 +887,7 @@ def list_skills(_: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
 
 
 @app.post("/api/skills/install")
-def install_skill(body: SkillInstallBody, _: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+def install_skill(body: SkillInstallBody, _: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
     try:
         registry = SkillRegistry()
         skill = registry.install(body.source, body.name)
@@ -899,7 +911,7 @@ def read_skill(skill_id: str, _: dict[str, Any] = Depends(current_user)) -> dict
 
 
 @app.put("/api/skills/{skill_id:path}/enabled")
-def set_skill_enabled(skill_id: str, body: SkillEnabledBody, _: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+def set_skill_enabled(skill_id: str, body: SkillEnabledBody, _: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
     try:
         registry = SkillRegistry()
         enabled = registry.set_enabled(skill_id, body.enabled)
@@ -912,7 +924,7 @@ def set_skill_enabled(skill_id: str, body: SkillEnabledBody, _: dict[str, Any] =
 
 
 @app.delete("/api/skills/{skill_id:path}")
-def remove_skill(skill_id: str, _: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+def remove_skill(skill_id: str, _: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
     try:
         SkillRegistry().remove(skill_id)
     except ValueError as exc:
@@ -954,6 +966,9 @@ def delete_user(user_id: int, admin: dict[str, Any] = Depends(admin_user)) -> di
         raise HTTPException(400, "必须保留一个管理员")
     if db.one("SELECT id FROM jobs WHERE user_id=? AND status IN ('queued','running')", (user_id,)):
         raise HTTPException(409, "该账号正在生成回答，请先停止后再删除")
+    # Provider configurations are shared. Re-anchor any legacy rows created
+    # by the account being removed before the users FK cascade runs.
+    db.run("UPDATE providers SET user_id=? WHERE user_id=?", (admin["id"], user_id))
     attachment_records = db.get_attachments(user_id)
     db.run("DELETE FROM users WHERE id=?", (user_id,))
     attachments.delete_files(attachment_records)
@@ -1078,18 +1093,18 @@ def delete_attachment(attachment_id: str, user: dict[str, Any] = Depends(current
 
 
 @app.get("/api/providers")
-def providers(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
-    return [public_provider(row) for row in db.all("SELECT * FROM providers WHERE user_id=? ORDER BY id", (user["id"],))]
+def providers(_: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
+    return [public_provider(row) for row in db.all("SELECT * FROM providers ORDER BY id")]
 
 
 @app.get("/api/providers/{provider_id}/key")
 def provider_api_key(
     provider_id: int,
     response: Response,
-    user: dict[str, Any] = Depends(current_user),
+    _: dict[str, Any] = Depends(admin_user),
 ) -> dict[str, str]:
-    """Reveal the current user's saved Key only when opening its editor."""
-    provider = db.one("SELECT api_key FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"]))
+    """Reveal a shared Key only to an administrator opening its editor."""
+    provider = db.one("SELECT api_key FROM providers WHERE id=?", (provider_id,))
     if not provider:
         raise HTTPException(404, "API 配置不存在")
     response.headers["Cache-Control"] = "no-store"
@@ -1187,7 +1202,7 @@ async def test_provider_credentials(kind: str, base: str, api_key: str, manual_v
 
 
 @app.post("/api/providers/test")
-async def test_provider(body: ProviderBody, _: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+async def test_provider(body: ProviderBody, _: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
     kind = body.provider_type
     base = clean_base_url(body.base_url or DEFAULT_BASE_URLS[kind])
     manual_values = body.manual_models if body.manual_models is not None else body.selected_models
@@ -1195,7 +1210,7 @@ async def test_provider(body: ProviderBody, _: dict[str, Any] = Depends(current_
 
 
 @app.post("/api/providers")
-def add_provider(body: ProviderBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+def add_provider(body: ProviderBody, admin: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
     kind = body.provider_type
     base = clean_base_url(body.base_url or DEFAULT_BASE_URLS[kind])
     selected_models = _clean_model_ids(body.selected_models)
@@ -1220,14 +1235,16 @@ def add_provider(body: ProviderBody, user: dict[str, Any] = Depends(current_user
     settings_json = json.dumps(settings_value, ensure_ascii=False)
     provider_id = db.run(
         "INSERT INTO providers(user_id,name,api_key,base_url,model,provider_type,settings_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
-        (user["id"], body.name.strip(), body.api_key.strip(), base, model, kind, settings_json, now()),
+        # user_id is only the retained creator/foreign-key anchor; this API
+        # configuration is visible to every account after creation.
+        (admin["id"], body.name.strip(), body.api_key.strip(), base, model, kind, settings_json, now()),
     )
     return public_provider(db.one("SELECT * FROM providers WHERE id=?", (provider_id,)))
 
 
 @app.post("/api/providers/{provider_id}/test")
-async def test_saved_provider(provider_id: int, body: ProviderEditBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"]))
+async def test_saved_provider(provider_id: int, body: ProviderEditBody, _: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
+    provider = db.one("SELECT * FROM providers WHERE id=?", (provider_id,))
     if not provider:
         raise HTTPException(404, "API 配置不存在")
     kind = body.provider_type or provider_type(provider)
@@ -1240,8 +1257,8 @@ async def test_saved_provider(provider_id: int, body: ProviderEditBody, user: di
 
 
 @app.put("/api/providers/{provider_id}")
-def update_provider(provider_id: int, body: ProviderEditBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"]))
+def update_provider(provider_id: int, body: ProviderEditBody, _: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
+    provider = db.one("SELECT * FROM providers WHERE id=?", (provider_id,))
     if not provider:
         raise HTTPException(404, "API 配置不存在")
     if db.one("SELECT id FROM jobs WHERE provider_id=? AND status IN ('queued','running')", (provider_id,)):
@@ -1268,7 +1285,7 @@ def update_provider(provider_id: int, body: ProviderEditBody, user: dict[str, An
     db.run(
         """UPDATE providers
            SET name=?,api_key=?,base_url=?,model=?,provider_type=?,settings_json=?
-           WHERE id=? AND user_id=?""",
+           WHERE id=?""",
         (
             name,
             api_key,
@@ -1277,15 +1294,14 @@ def update_provider(provider_id: int, body: ProviderEditBody, user: dict[str, An
             kind,
             json.dumps(settings_value, ensure_ascii=False),
             provider_id,
-            user["id"],
         ),
     )
-    return public_provider(db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"])))
+    return public_provider(db.one("SELECT * FROM providers WHERE id=?", (provider_id,)))
 
 
 @app.put("/api/providers/{provider_id}/models")
-def update_provider_models(provider_id: int, body: ProviderModelsBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"]))
+def update_provider_models(provider_id: int, body: ProviderModelsBody, _: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
+    provider = db.one("SELECT * FROM providers WHERE id=?", (provider_id,))
     if not provider:
         raise HTTPException(404, "API 配置不存在")
     kind = provider_type(provider)
@@ -1306,25 +1322,25 @@ def update_provider_models(provider_id: int, body: ProviderModelsBody, user: dic
         else {"models": selected_models}
     )
     db.run(
-        "UPDATE providers SET model=?,settings_json=? WHERE id=? AND user_id=?",
-        (model, json.dumps(settings_value, ensure_ascii=False), provider_id, user["id"]),
+        "UPDATE providers SET model=?,settings_json=? WHERE id=?",
+        (model, json.dumps(settings_value, ensure_ascii=False), provider_id),
     )
-    return public_provider(db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"])))
+    return public_provider(db.one("SELECT * FROM providers WHERE id=?", (provider_id,)))
 
 
 @app.delete("/api/providers/{provider_id}")
-def delete_provider(provider_id: int, user: dict[str, Any] = Depends(current_user)) -> dict[str, bool]:
-    if not db.one("SELECT id FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"])):
+def delete_provider(provider_id: int, _: dict[str, Any] = Depends(admin_user)) -> dict[str, bool]:
+    if not db.one("SELECT id FROM providers WHERE id=?", (provider_id,)):
         raise HTTPException(404, "API 配置不存在")
     if db.one("SELECT id FROM jobs WHERE provider_id=? AND status IN ('queued','running')", (provider_id,)):
         raise HTTPException(409, "该 API 正在生成回答，暂时不能删除")
-    db.run("DELETE FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"]))
+    db.run("DELETE FROM providers WHERE id=?", (provider_id,))
     return {"ok": True}
 
 
 @app.put("/api/providers/{provider_id}/settings")
-def update_provider_settings(provider_id: int, body: CustomModelSettingsBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"]))
+def update_provider_settings(provider_id: int, body: CustomModelSettingsBody, _: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
+    provider = db.one("SELECT * FROM providers WHERE id=?", (provider_id,))
     if not provider:
         raise HTTPException(404, "API 配置不存在")
     if not is_custom_provider(provider_type(provider)):
@@ -1333,8 +1349,8 @@ def update_provider_settings(provider_id: int, body: CustomModelSettingsBody, us
     validate_provider_selection(provider_type(provider), model, provider)
     settings_value = custom_settings_document(provider)
     settings_value["model_settings"][model] = normalize_custom_settings(body.model_dump(exclude={"model"}))
-    db.run("UPDATE providers SET settings_json=? WHERE id=? AND user_id=?", (json.dumps(settings_value, ensure_ascii=False), provider_id, user["id"]))
-    return public_provider(db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (provider_id, user["id"])))
+    db.run("UPDATE providers SET settings_json=? WHERE id=?", (json.dumps(settings_value, ensure_ascii=False), provider_id))
+    return public_provider(db.one("SELECT * FROM providers WHERE id=?", (provider_id,)))
 
 
 @app.get("/api/conversations")
@@ -1497,7 +1513,7 @@ async def retry_answer(
     user: dict[str, Any] = Depends(current_user),
 ) -> dict[str, str]:
     """Discard messages after one prompt and regenerate its answer in place."""
-    provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (body.provider_id, user["id"]))
+    provider = db.one("SELECT * FROM providers WHERE id=?", (body.provider_id,))
     if not provider:
         raise HTTPException(404, "请选择有效的 API 配置")
     kind = provider_type(provider)
@@ -1608,7 +1624,7 @@ def delete_conversation(conversation_id: str, user: dict[str, Any] = Depends(cur
 
 @app.post("/api/chat")
 async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    provider = db.one("SELECT * FROM providers WHERE id=? AND user_id=?", (body.provider_id, user["id"]))
+    provider = db.one("SELECT * FROM providers WHERE id=?", (body.provider_id,))
     if not provider:
         raise HTTPException(404, "请选择有效的 API 配置")
     kind = provider_type(provider)

@@ -41,9 +41,9 @@ HOST_SEARCH_MAX_RESULTS = 500
 HOST_COMMAND_TIMEOUT = 900
 
 
-AGENT_SYSTEM_PROMPT = """You are the host-level Agent for this server. You have unrestricted root-level file and shell access and may install packages, edit projects, manage this application, and manage Skills when the user asks. The shared Agent workspace is /home/share; relative host paths are resolved from there. It is strictly separate from the ordinary chat per-conversation workspace. The ordinary workspace tools (list_files, read_file, write_file, apply_line_edits, search_files, delete_file, run_python, and check_web_syntax) are not available in Agent mode. Never claim that an operation happened without calling the corresponding tool and checking its result.
+AGENT_SYSTEM_PROMPT = """You are the host-level Agent for this server. You have unrestricted root-level file and shell access and may install packages, edit projects, manage this application, and work with Skills when the user asks. Skill contents and enabled state are shared by all accounts; only an administrator may install, enable, disable, or remove a Skill. The shared Agent workspace is /home/share; relative host paths are resolved from there. It is strictly separate from the ordinary chat per-conversation workspace. The ordinary workspace tools (list_files, read_file, write_file, apply_line_edits, search_files, delete_file, run_python, and check_web_syntax) are not available in Agent mode. Never claim that an operation happened without calling the corresponding tool and checking its result.
 
-Use the installed Skills as working instructions, not as a replacement for the user's request. For code or frontend deliverables in Agent mode, use the host_* and frontend_* tools under /home/share; use absolute host paths when changing the real application, repositories, server configuration, or other host resources. For a new project, create the files directly; for an existing project, preserve unrelated work. You may create, rename, inspect, and delete conversations with the conversation tools. You may install or disable Skills at any time with the Skill tools. Frontend work should use the frontend tools and should include a real syntax/build check when practical.
+Use the installed Skills as working instructions, not as a replacement for the user's request. For code or frontend deliverables in Agent mode, use the host_* and frontend_* tools under /home/share; use absolute host paths when changing the real application, repositories, server configuration, or other host resources. For a new project, create the files directly; for an existing project, preserve unrelated work. You may create, rename, inspect, and delete conversations with the conversation tools. You may list and read Skills; Skill mutations are available only to administrators. Frontend work should use the frontend tools and should include a real syntax/build check when practical.
 
 There are exactly two Agent scheduling rules: (1) at most one web_search or fetch_webpage call is executed in each model turn; (2) all non-web tool calls emitted in a turn execute serially in the order emitted. Host access itself is not restricted by a workspace sandbox. Do not wait for permission between ordinary tool calls; act on the user's explicit request immediately."""
 
@@ -194,10 +194,11 @@ FRONTEND_TOOLS = [
 
 
 class AgentRuntime:
-    def __init__(self, database: Database, user_id: int, conversation_id: str) -> None:
+    def __init__(self, database: Database, user_id: int, conversation_id: str, *, is_admin: bool = False) -> None:
         self.db = database
         self.user_id = int(user_id)
         self.conversation_id = str(conversation_id)
+        self.is_admin = bool(is_admin)
         self.skills = SkillRegistry()
         self._cancelled = threading.Event()
 
@@ -219,7 +220,15 @@ class AgentRuntime:
 
     @property
     def tool_definitions(self) -> list[dict[str, Any]]:
-        return [*HOST_TOOLS, *CONVERSATION_TOOLS, *SKILL_TOOLS, *FRONTEND_TOOLS]
+        tools = [*HOST_TOOLS, *CONVERSATION_TOOLS, *SKILL_TOOLS, *FRONTEND_TOOLS]
+        if not self.is_admin:
+            mutation_tools = {"skill_install", "skill_enable", "skill_remove"}
+            tools = [item for item in tools if item.get("function", {}).get("name") not in mutation_tools]
+        return tools
+
+    def _require_admin(self) -> None:
+        if not self.is_admin:
+            raise PermissionError("仅管理员可修改共享 Skill")
 
     @staticmethod
     def _path(value: Any, *, required: bool = True) -> Path:
@@ -474,16 +483,19 @@ class AgentRuntime:
         return {"id": skill.skill_id, "name": skill.name, "builtin": skill.builtin, "content": self.skills.read(skill.skill_id)}
 
     def _skill_install(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        self._require_admin()
         skill = self.skills.install(str(arguments.get("source") or ""), str(arguments.get("name") or ""))
         self.skills.set_enabled(skill.skill_id, True)
         return {"ok": True, "id": skill.skill_id, "name": skill.name, "path": str(skill.path), "enabled": True}
 
     def _skill_enable(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        self._require_admin()
         skill_id = str(arguments.get("skill_id") or "")
         values = self.skills.set_enabled(skill_id, bool(arguments.get("enabled")))
         return {"ok": True, "enabled": values}
 
     def _skill_remove(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        self._require_admin()
         skill_id = str(arguments.get("skill_id") or "")
         self.skills.remove(skill_id)
         return {"ok": True, "removed": skill_id}
