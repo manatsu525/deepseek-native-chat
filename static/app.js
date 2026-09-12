@@ -966,7 +966,7 @@ function customSettings(provider,model=selectedModel()){
     :(provider&&String(provider.model)===String(model)&&provider.settings||{});
   return {...defaults,...saved};
 }
-const customEditor={draft:null,preview:null,requestId:0,timer:null,providerId:null,model:''};
+const customEditor={draft:null,preview:null,previewSignature:null,requestId:0,timer:null,providerId:null,model:''};
 function customFormValues(){
   return {model:customEditor.model,thinking:$('#customThinking').value,reasoning_effort:$('#customReasoningEffort').value,reasoning_effort_enabled:$('#customReasoningEffortEnabled').checked,lowest_price_aggregators:[$('#customLowestPriceOpenRouter').checked?'openrouter':'',$('#customLowestPriceVercel').checked?'vercel':''].filter(Boolean),dsml_fallback_enabled:$('#customDsmlFallbackEnabled').checked,max_completion_tokens:Number($('#customMaxCompletion').value),temperature:Number($('#customTemperature').value),top_p:Number($('#customTopP').value),web_tool_backend:$('#customWebToolBackend').value,request_overrides:{},advanced_enabled:false,advanced_request:{}};
 }
@@ -978,31 +978,43 @@ function syncAdvancedEditor(){
 async function refreshCustomPreview(){
   clearTimeout(customEditor.timer);
   if($('#customAdvancedEnabled').checked)return;
-  const requestId=++customEditor.requestId,providerId=customEditor.providerId,body=customFormValues();
+  const requestId=++customEditor.requestId,providerId=customEditor.providerId,body=customFormValues(),signature=JSON.stringify(body);
   $('#customAdvancedEnabled').disabled=true;
   $('#customAdvancedNote').textContent='正在更新参数预览…';
   try{
     const data=await api(`/api/providers/${providerId}/settings/preview`,{method:'POST',body});
     if(requestId!==customEditor.requestId||$('#customAdvancedEnabled').checked)return;
     customEditor.preview=data.parameters;
+    customEditor.previewSignature=signature;
     $('#customRequestOverrides').value=JSON.stringify(data.parameters,null,2);
     $('#customStatus').textContent='';syncAdvancedEditor();
-  }catch(err){if(requestId===customEditor.requestId){customEditor.preview=null;$('#customStatus').textContent=err.message;$('#customAdvancedNote').textContent='预览更新失败，请检查上方参数。'}}
+  }catch(err){if(requestId===customEditor.requestId){customEditor.preview=null;customEditor.previewSignature=null;$('#customStatus').textContent=err.message;$('#customAdvancedNote').textContent='预览更新失败，请检查上方参数。'}}
   finally{if(requestId===customEditor.requestId)$('#customAdvancedEnabled').disabled=!customEditor.preview}
 }
 function scheduleCustomPreview(event){
-  if(event.target.id==='customRequestOverrides'||event.target.id==='customAdvancedEnabled'||$('#customAdvancedEnabled').checked)return;
+  if(event.target.id==='customRequestOverrides'){
+    if($('#customAdvancedEnabled').checked)customEditor.draft=event.target.value;
+    return;
+  }
+  if(event.target.id==='customAdvancedEnabled'||$('#customAdvancedEnabled').checked)return;
   ++customEditor.requestId;clearTimeout(customEditor.timer);
+  customEditor.previewSignature=null;
   $('#customAdvancedEnabled').disabled=true;
   customEditor.timer=setTimeout(refreshCustomPreview,150);
 }
 async function toggleAdvancedSettings(){
   clearTimeout(customEditor.timer);++customEditor.requestId;
   if($('#customAdvancedEnabled').checked){
-    $('#customRequestOverrides').value=customEditor.draft===null?JSON.stringify(customEditor.preview||{},null,2):customEditor.draft;
+    // The read-only preview is the source of truth at the moment advanced mode
+    // is enabled. Never resurrect an older editable draft here.
+    customEditor.draft=JSON.stringify(customEditor.preview||{},null,2);
+    $('#customRequestOverrides').value=customEditor.draft;
     syncAdvancedEditor();
   }else{
-    customEditor.draft=$('#customRequestOverrides').value;
+    // Leaving advanced mode hands control back to the form. The next preview
+    // is generated from the options currently selected above, so the old JSON
+    // draft must not survive and be restored on a later toggle.
+    customEditor.draft=null;
     syncAdvancedEditor();await refreshCustomPreview();
   }
 }
@@ -1010,8 +1022,8 @@ async function fillCustomSettings(){
   const model=selectedModel(),config=customSettings(selectedProvider(),model),aggregators=new Set(Array.isArray(config.lowest_price_aggregators)?config.lowest_price_aggregators:[]);
   $('#customModalTitle').textContent=`Custom 参数 · ${model}`;$('#customModalTitle').title=model;$('#customStatus').textContent='';
   clearTimeout(customEditor.timer);++customEditor.requestId;
-  customEditor.providerId=selectedProvider().id;customEditor.model=model;customEditor.preview=null;
-  customEditor.draft=config.advanced_enabled||Object.keys(config.advanced_request||{}).length?JSON.stringify(config.advanced_request||{},null,2):null;
+  customEditor.providerId=selectedProvider().id;customEditor.model=model;customEditor.preview=null;customEditor.previewSignature=null;
+  customEditor.draft=config.advanced_enabled?JSON.stringify(config.advanced_request||{},null,2):null;
   $('#customThinking').value=config.thinking;$('#customReasoningEffort').value=config.reasoning_effort||'high';$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customLowestPriceOpenRouter').checked=aggregators.has('openrouter');$('#customLowestPriceVercel').checked=aggregators.has('vercel');$('#customDsmlFallbackEnabled').checked=config.dsml_fallback_enabled;$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
   $('#customAdvancedEnabled').checked=!!config.advanced_enabled;$('#customAdvancedEnabled').disabled=false;
   syncCustomThinkingFields();syncCustomToolFields();
@@ -1030,8 +1042,6 @@ async function saveCustomSettings(event){
     if(enabled){
       document=JSON.parse($('#customRequestOverrides').value);
       if(!document||Array.isArray(document)||typeof document!=='object')throw new Error('高级配置必须是 JSON 对象');
-    }else if(customEditor.draft!==null){
-      try{document=JSON.parse(customEditor.draft);if(!document||Array.isArray(document)||typeof document!=='object')document={}}catch{document={}}
     }
     const body={...customFormValues(),advanced_enabled:enabled,advanced_request:document};
     const updated=await api(`/api/providers/${customEditor.providerId}/settings`,{method:'PUT',body});const index=state.providers.findIndex(x=>x.id===updated.id);if(index>=0)state.providers[index]=updated;$('#customModal').close();updateProviderUi();toast(`${model} 的 Custom 参数已保存`)

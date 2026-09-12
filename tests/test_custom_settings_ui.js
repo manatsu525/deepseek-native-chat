@@ -29,17 +29,25 @@ const run=code=>vm.runInContext(code,context);
   pending[1].resolve({parameters:{model:'a',temperature:0.4}});await old;
   assert.equal(JSON.parse(node('#customRequestOverrides').value).temperature,0.3);
 
+  // A stale draft must never replace the preview generated from the current
+  // form when advanced mode is enabled.
+  run("customEditor.draft='{\"temperature\":0.99,\"stale\":true}'");
   node('#customAdvancedEnabled').checked=true;await run('toggleAdvancedSettings()');
   assert.equal(node('#customRequestOverrides').readOnly,false);
+  assert.equal(JSON.parse(node('#customRequestOverrides').value).temperature,0.3);
+  assert.equal(JSON.parse(node('#customRequestOverrides').value).stale,undefined);
   node('#customRequestOverrides').value='{"temperature":0.15,"vendor":true}';
   run("scheduleCustomPreview({target:{id:'customTemperature'}})");
   assert.equal(pending.length,3);
+  node('#customTemperature').value='0.2';
   node('#customAdvancedEnabled').checked=false;
   const disabled=run('toggleAdvancedSettings()');
-  pending[3].resolve({parameters:{model:'a',temperature:0.3}});await disabled;
+  assert.equal(pending[3].options.body.temperature,0.2);
+  pending[3].resolve({parameters:{model:'a',temperature:0.2}});await disabled;
   assert.equal(node('#customRequestOverrides').readOnly,true);
   node('#customAdvancedEnabled').checked=true;await run('toggleAdvancedSettings()');
-  assert.equal(JSON.parse(node('#customRequestOverrides').value).vendor,true);
+  assert.equal(JSON.parse(node('#customRequestOverrides').value).temperature,0.2);
+  assert.equal(JSON.parse(node('#customRequestOverrides').value).vendor,undefined);
 
   node('#customRequestOverrides').value='{broken';
   await run('saveCustomSettings({preventDefault(){}})');
@@ -56,5 +64,5 @@ const run=code=>vm.runInContext(code,context);
   pending[5].resolve({parameters:{model:'b',temperature:0.6}});await opening;
   assert.equal(node('#customAdvancedEnabled').checked,false);
   assert.equal(JSON.parse(node('#customRequestOverrides').value).model,'b');
-  console.log('PASS: read-only preview, stale responses, JSON priority, toggle/draft retention, validation and model isolation');
+  console.log('PASS: read-only preview, stale responses, current-form toggle handoff, validation and model isolation');
 })().catch(error=>{console.error(error);process.exitCode=1});
