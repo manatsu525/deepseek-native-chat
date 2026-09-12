@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field, field_validator
 from . import attachments
 from .agent import AgentRuntime, build_agent_skills_prompt
 from .config import settings
-from .custom_request import validate_request_overrides
+from .custom_request import validate_request_overrides, validate_advanced_request
 from .responses_state import state_scope, resume_state
 from .db import Database
 from .deepseek import list_models as deepseek_list_models
@@ -39,7 +39,7 @@ from .mimo import (
     is_mimo_model,
     list_models as custom_list_models,
 )
-from .mimo_local import stream_response as custom_stream_response
+from .mimo_local import stream_response as custom_stream_response, build_custom_request_parameters
 from .reasoning_effort import DEFAULT as DEFAULT_REASONING_EFFORT
 from .reasoning_effort import LEVELS as REASONING_EFFORT_LEVELS
 from .security import load_secret, make_token, password_hash, password_ok, read_token
@@ -130,6 +130,13 @@ class CustomSettingsBody(BaseModel):
     top_p: float = Field(default=0.95, ge=0.01, le=1)
     web_tool_backend: Literal["parallel", "keenable", "tavily", "firecrawl", "you", "legacy"] = "parallel"
     request_overrides: dict[str, Any] = Field(default_factory=dict)
+    advanced_enabled: bool = False
+    advanced_request: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("advanced_request")
+    @classmethod
+    def validate_advanced_request_field(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return validate_advanced_request(value)
 
     @field_validator("request_overrides")
     @classmethod
@@ -215,8 +222,26 @@ def custom_settings_by_model(row: dict[str, Any], models: Optional[list[str]] = 
     result: dict[str, dict[str, Any]] = {}
     for model in selected:
         raw = raw_by_model.get(model) if has_model_map else legacy
-        result[model] = normalize_custom_settings(raw if isinstance(raw, dict) else None)
+        result[model] = normalize_model_settings(row, model, raw if isinstance(raw, dict) else {})
     return result
+
+
+def custom_protocol(row: dict[str, Any]) -> str:
+    return {"custom_response": "responses", "custom_messages": "messages"}.get(provider_type(row), "chat_completions")
+
+
+def normalize_model_settings(row: dict[str, Any], model: str, raw: dict[str, Any]) -> dict[str, Any]:
+    config = normalize_custom_settings(raw)
+    if raw.get("request_overrides") and "advanced_enabled" not in raw:
+        # Preserve existing opt-in JSON extensions as complete documents.
+        legacy_config = dict(config)
+        legacy_config.pop("advanced_enabled", None)
+        config["advanced_request"] = build_custom_request_parameters(
+            row.get("base_url") or "", model, legacy_config, api_protocol=custom_protocol(row),
+            effort=config["reasoning_effort"], expand=False,
+        )
+        config["advanced_enabled"] = True
+    return config
 
 
 def custom_settings_document(row: dict[str, Any], models: Optional[list[str]] = None) -> dict[str, Any]:
@@ -1225,10 +1250,11 @@ def add_provider(body: ProviderBody, admin: dict[str, Any] = Depends(admin_user)
         selected_models = [model]
     validate_provider_selection(kind, model)
     if is_custom_provider(kind):
-        initial_settings = normalize_custom_settings(body.custom_settings)
         settings_value = {
             "models": selected_models,
-            "model_settings": {item: dict(initial_settings) for item in selected_models},
+            "model_settings": {item: normalize_model_settings(
+                {"base_url": base, "provider_type": kind}, item, body.custom_settings or {},
+            ) for item in selected_models},
         }
     else:
         settings_value = {"models": selected_models}
@@ -1348,9 +1374,22 @@ def update_provider_settings(provider_id: int, body: CustomModelSettingsBody, _:
     model = body.model.strip()
     validate_provider_selection(provider_type(provider), model, provider)
     settings_value = custom_settings_document(provider)
-    settings_value["model_settings"][model] = normalize_custom_settings(body.model_dump(exclude={"model"}))
+    settings_value["model_settings"][model] = normalize_model_settings(provider, model, body.model_dump(exclude={"model"}, exclude_unset=True))
     db.run("UPDATE providers SET settings_json=? WHERE id=?", (json.dumps(settings_value, ensure_ascii=False), provider_id))
     return public_provider(db.one("SELECT * FROM providers WHERE id=?", (provider_id,)))
+
+
+@app.post("/api/providers/{provider_id}/settings/preview")
+def preview_provider_settings(provider_id: int, body: CustomModelSettingsBody, _: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
+    provider = db.one("SELECT * FROM providers WHERE id=?", (provider_id,))
+    if not provider or not is_custom_provider(provider_type(provider)):
+        raise HTTPException(404, "Custom API 配置不存在")
+    validate_provider_selection(provider_type(provider), body.model, provider)
+    config = normalize_model_settings(provider, body.model, body.model_dump(exclude={"model"}, exclude_unset=True))
+    return {"parameters": build_custom_request_parameters(
+        provider["base_url"], body.model, config, api_protocol=custom_protocol(provider),
+        effort=config["reasoning_effort"], expand=False,
+    )}
 
 
 @app.get("/api/conversations")

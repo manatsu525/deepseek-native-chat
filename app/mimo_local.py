@@ -15,7 +15,7 @@ import httpx
 from curl_cffi import requests as curl_requests
 
 from .custom_tool_normalization import normalize_tool_calls
-from .custom_request import apply_request_overrides
+from .custom_request import apply_request_overrides, expand_advanced_request
 from .responses_state import ResponsesState
 from .agent import AGENT_SYSTEM_PROMPT
 from .keyless_web import (
@@ -569,6 +569,46 @@ def _apply_thinking_options(
         payload["reasoning_effort"] = selected_effort
 
 
+def build_custom_request_parameters(
+    base_url: str, model: str, config: dict[str, Any], *, api_protocol: str = "chat_completions",
+    effort: str = "high", conversation_id: str = "", expand: bool = True,
+) -> dict[str, Any]:
+    """One source for the editor preview and every outgoing Custom request.
+
+    Advanced mode is a replacement, not an overlay: omitted parameters stay
+    omitted. The conversation and tools are attached separately at runtime.
+    """
+    legacy = "advanced_enabled" not in config
+    config = _settings(config)
+    context = {"conversation_id": conversation_id, "model": model, "base_url": base_url,
+               "api_protocol": api_protocol, "effort": normalize_reasoning_effort(effort)} if expand else {}
+    if config.get("advanced_enabled"):
+        parameters = expand_advanced_request(config.get("advanced_request") or {}, context)
+        parameters.setdefault("model", model)
+        return parameters
+    parameters = {"model": model, custom_output_token_field(api_protocol): int(config["max_completion_tokens"])}
+    thinking = config["thinking"] == "enabled"
+    if api_protocol == "responses":
+        parameters["store"] = True
+        if config.get("reasoning_effort_enabled", True):
+            parameters["reasoning"] = {"effort": normalize_reasoning_effort(effort)}
+            parameters["include"] = ["reasoning.encrypted_content"]
+    elif api_protocol == "messages":
+        parameters["thinking"] = {"type": "adaptive" if thinking else "disabled"}
+        if thinking and config.get("reasoning_effort_enabled", True):
+            parameters["output_config"] = {"effort": normalize_reasoning_effort(effort)}
+    else:
+        _apply_thinking_options(parameters, base_url, model, config["thinking"], effort,
+                                bool(config.get("reasoning_effort_enabled", True)), int(config["max_completion_tokens"]))
+    if api_protocol == "responses" or not thinking or (api_protocol == "chat_completions" and not is_mimo_model(model)):
+        parameters["temperature"] = float(config["temperature"])
+        parameters["top_p"] = float(config["top_p"])
+    _apply_lowest_price_routing(parameters, model, config)
+    if legacy:
+        apply_request_overrides(parameters, config.get("request_overrides"), context=context)
+    return parameters
+
+
 def _responses_content(content: Any, role: str) -> Any:
     """Translate Chat Completions multimodal parts to Responses input parts."""
     if not isinstance(content, list):
@@ -1009,27 +1049,25 @@ async def stream_response(
                 ]
             responses_protocol = api_protocol == "responses"
             messages_protocol = api_protocol == "messages"
-            output_token_field = custom_output_token_field(api_protocol)
+            parameter_config = dict(config)
+            if settings and "advanced_enabled" not in settings:
+                parameter_config.pop("advanced_enabled", None)
+            parameters = build_custom_request_parameters(
+                base_url, model, parameter_config, api_protocol=api_protocol,
+                effort=effort, conversation_id=conversation_id,
+            )
             if responses_protocol:
                 full_response_input = _responses_input([
                     item for item in request_messages if item.get("role") not in {"system", "developer"}
                 ])
                 payload = {
-                    "model": model,
                     "input": full_response_input,
                     "instructions": "\n\n".join(
                         str(item.get("content") or "") for item in request_messages
                         if item.get("role") in {"system", "developer"}
                     ),
-                    output_token_field: int(config["max_completion_tokens"]),
                     "stream": True,
                 }
-                if bool(config.get("reasoning_effort_enabled", True)):
-                    payload["reasoning"] = {"effort": normalize_reasoning_effort(effort)}
-                    # Retain a local replay for gateways without stored state.
-                    payload["include"] = ["reasoning.encrypted_content"]
-                payload["temperature"] = float(config["temperature"])
-                payload["top_p"] = float(config["top_p"])
                 if round_tools:
                     payload["tools"] = _responses_tools(round_tools)
                     payload["tool_choice"] = "auto"
@@ -1038,64 +1076,26 @@ async def stream_response(
                     payload["tool_choice"] = "none"
             elif messages_protocol:
                 system_value, anthropic_history = _anthropic_messages(request_messages)
-                max_tokens = int(config["max_completion_tokens"])
                 payload = {
-                    "model": model,
                     "system": system_value,
                     "messages": anthropic_history,
-                    output_token_field: max_tokens,
                     "stream": True,
                 }
-                if config["thinking"] == "enabled":
-                    # Claude adaptive thinking uses the same reasoning-level
-                    # setting as the other Custom protocols. The deprecated
-                    # manual budget setting is intentionally omitted.
-                    payload["thinking"] = {"type": "adaptive"}
-                    if bool(config.get("reasoning_effort_enabled", True)):
-                        payload["output_config"] = {"effort": normalize_reasoning_effort(effort)}
-                else:
-                    payload["thinking"] = {"type": "disabled"}
-                    payload["temperature"] = float(config["temperature"])
-                    payload["top_p"] = float(config["top_p"])
                 if round_tools:
                     payload["tools"] = _anthropic_tools(round_tools)
                     payload["tool_choice"] = {"type": "auto"}
             else:
                 payload = {
-                    "model": model,
                     "messages": request_messages,
-                    output_token_field: int(config["max_completion_tokens"]),
                     "stream": True,
                 }
-                _apply_thinking_options(
-                    payload,
-                    base_url,
-                    model,
-                    config["thinking"],
-                    effort,
-                    bool(config.get("reasoning_effort_enabled", True)),
-                    int(config["max_completion_tokens"]),
-                )
                 if round_tools:
                     payload["tools"] = round_tools
                     payload["tool_choice"] = "auto"
-                if not mimo_model or config["thinking"] == "disabled":
-                    payload["temperature"] = float(config["temperature"])
-                    payload["top_p"] = float(config["top_p"])
-
-            _apply_lowest_price_routing(payload, model, config)
-            apply_request_overrides(
-                payload,
-                config.get("request_overrides"),
-                context={
-                    "conversation_id": conversation_id,
-                    "model": model,
-                    "base_url": base_url,
-                    "api_protocol": api_protocol,
-                    "effort": normalize_reasoning_effort(effort),
-                },
-            )
+            payload.update(parameters)
             if responses_protocol:
+                if config.get("advanced_enabled") and "store" not in parameters:
+                    response_chain.disable("advanced_store_omitted")
                 response_chain.prepare(payload, full_response_input)
             round_answer = ""
             round_preview = ""

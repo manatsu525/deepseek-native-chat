@@ -55,6 +55,28 @@ def _expand(value: Any, context: Mapping[str, Any]) -> Any:
     )
 
 
+def validate_advanced_request(value: Any) -> dict[str, Any]:
+    """A complete parameter document, excluding the live conversation envelope."""
+    if not isinstance(value, dict):
+        raise ValueError("高级配置必须是 JSON 对象")
+    runtime_fields = {"input", "messages", "stream", "tools", "tool_choice", "system", "instructions",
+                      "previous_response_id", "conversation"}
+    forbidden = sorted(runtime_fields.intersection(value))
+    if forbidden:
+        raise ValueError("这些字段由对话运行时自动管理，请只填写配置参数：" + ", ".join(forbidden))
+    # Reuse size/JSON validation, allowing a model-specific routing model ID.
+    validate_request_overrides({key: item for key, item in value.items() if key != "model"})
+    if "model" in value and (not isinstance(value["model"], str) or not value["model"].strip() or len(value["model"]) > 500):
+        raise ValueError("model 必须是非空字符串，最多 500 字符")
+    if "store" in value and not isinstance(value["store"], bool):
+        raise ValueError("store 必须是 true 或 false")
+    return dict(value)
+
+
+def expand_advanced_request(value: Any, context: Mapping[str, Any]) -> dict[str, Any]:
+    return _expand(validate_advanced_request(value), context)
+
+
 def apply_request_overrides(
     payload: dict[str, Any],
     overrides: Any,

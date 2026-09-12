@@ -117,7 +117,7 @@ async function api(path, options={}) {
   }
   const response = await fetch(path, {...options, headers});
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.detail || `请求失败 (${response.status})`);
+  if (!response.ok) throw new Error(Array.isArray(data.detail)?data.detail.map(item=>item.msg||String(item)).join('；'):(data.detail || `请求失败 (${response.status})`));
   return data;
 }
 
@@ -959,35 +959,82 @@ function checkedCustomModels(){return $$('#customModelList input[type="checkbox"
 function providerFormData(){const custom=isCustomProviderType(providerType());const manual=custom?manualModelList():[];const selected=custom?[...new Set([...checkedCustomModels(),...manual])]:[$('#providerModel').value||'deepseek-v4-flash'];return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:selected[0]||(custom?'':'deepseek-v4-flash'),selected_models:selected,manual_models:manual}}
 
 function customSettings(provider,model=selectedModel()){
-  const defaults={thinking:'enabled',reasoning_effort:'high',reasoning_effort_enabled:true,lowest_price_aggregators:[],dsml_fallback_enabled:false,max_completion_tokens:65536,temperature:1,top_p:.95,web_tool_backend:'parallel',request_overrides:{}};
+  const defaults={thinking:'enabled',reasoning_effort:'high',reasoning_effort_enabled:true,lowest_price_aggregators:[],dsml_fallback_enabled:false,max_completion_tokens:65536,temperature:1,top_p:.95,web_tool_backend:'parallel',request_overrides:{},advanced_enabled:false,advanced_request:{}};
   const byModel=provider&&provider.model_settings;
   const saved=byModel&&typeof byModel==='object'&&byModel[model]&&typeof byModel[model]==='object'
     ?byModel[model]
     :(provider&&String(provider.model)===String(model)&&provider.settings||{});
   return {...defaults,...saved};
 }
-function fillCustomSettings(){
+const customEditor={draft:null,preview:null,requestId:0,timer:null,providerId:null,model:''};
+function customFormValues(){
+  return {model:customEditor.model,thinking:$('#customThinking').value,reasoning_effort:$('#customReasoningEffort').value,reasoning_effort_enabled:$('#customReasoningEffortEnabled').checked,lowest_price_aggregators:[$('#customLowestPriceOpenRouter').checked?'openrouter':'',$('#customLowestPriceVercel').checked?'vercel':''].filter(Boolean),dsml_fallback_enabled:$('#customDsmlFallbackEnabled').checked,max_completion_tokens:Number($('#customMaxCompletion').value),temperature:Number($('#customTemperature').value),top_p:Number($('#customTopP').value),web_tool_backend:$('#customWebToolBackend').value,request_overrides:{},advanced_enabled:false,advanced_request:{}};
+}
+function syncAdvancedEditor(){
+  const enabled=$('#customAdvancedEnabled').checked;
+  $('#customRequestOverrides').readOnly=!enabled;
+  $('#customAdvancedNote').textContent=enabled?'JSON 已接管上游参数；上方思考、推理强度、采样和最大 Token 等选项仅保留为关闭高级配置后的设置。':'只读预览：这里展示按表单生成的上游参数，修改上方选项会自动更新。';
+}
+async function refreshCustomPreview(){
+  clearTimeout(customEditor.timer);
+  if($('#customAdvancedEnabled').checked)return;
+  const requestId=++customEditor.requestId,providerId=customEditor.providerId,body=customFormValues();
+  $('#customAdvancedEnabled').disabled=true;
+  $('#customAdvancedNote').textContent='正在更新参数预览…';
+  try{
+    const data=await api(`/api/providers/${providerId}/settings/preview`,{method:'POST',body});
+    if(requestId!==customEditor.requestId||$('#customAdvancedEnabled').checked)return;
+    customEditor.preview=data.parameters;
+    $('#customRequestOverrides').value=JSON.stringify(data.parameters,null,2);
+    $('#customStatus').textContent='';syncAdvancedEditor();
+  }catch(err){if(requestId===customEditor.requestId){customEditor.preview=null;$('#customStatus').textContent=err.message;$('#customAdvancedNote').textContent='预览更新失败，请检查上方参数。'}}
+  finally{if(requestId===customEditor.requestId)$('#customAdvancedEnabled').disabled=!customEditor.preview}
+}
+function scheduleCustomPreview(event){
+  if(event.target.id==='customRequestOverrides'||event.target.id==='customAdvancedEnabled'||$('#customAdvancedEnabled').checked)return;
+  ++customEditor.requestId;clearTimeout(customEditor.timer);
+  $('#customAdvancedEnabled').disabled=true;
+  customEditor.timer=setTimeout(refreshCustomPreview,150);
+}
+async function toggleAdvancedSettings(){
+  clearTimeout(customEditor.timer);++customEditor.requestId;
+  if($('#customAdvancedEnabled').checked){
+    $('#customRequestOverrides').value=customEditor.draft===null?JSON.stringify(customEditor.preview||{},null,2):customEditor.draft;
+    syncAdvancedEditor();
+  }else{
+    customEditor.draft=$('#customRequestOverrides').value;
+    syncAdvancedEditor();await refreshCustomPreview();
+  }
+}
+async function fillCustomSettings(){
   const model=selectedModel(),config=customSettings(selectedProvider(),model),aggregators=new Set(Array.isArray(config.lowest_price_aggregators)?config.lowest_price_aggregators:[]);
   $('#customModalTitle').textContent=`Custom 参数 · ${model}`;$('#customModalTitle').title=model;$('#customStatus').textContent='';
-  const overrides=config.request_overrides&&typeof config.request_overrides==='object'&&!Array.isArray(config.request_overrides)?config.request_overrides:{};
-  $('#customThinking').value=config.thinking;$('#customReasoningEffort').value=config.reasoning_effort||'high';$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customLowestPriceOpenRouter').checked=aggregators.has('openrouter');$('#customLowestPriceVercel').checked=aggregators.has('vercel');$('#customDsmlFallbackEnabled').checked=config.dsml_fallback_enabled;$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;$('#customRequestOverrides').value=Object.keys(overrides).length?JSON.stringify(overrides,null,2):'';
+  clearTimeout(customEditor.timer);++customEditor.requestId;
+  customEditor.providerId=selectedProvider().id;customEditor.model=model;customEditor.preview=null;
+  customEditor.draft=config.advanced_enabled||Object.keys(config.advanced_request||{}).length?JSON.stringify(config.advanced_request||{},null,2):null;
+  $('#customThinking').value=config.thinking;$('#customReasoningEffort').value=config.reasoning_effort||'high';$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customLowestPriceOpenRouter').checked=aggregators.has('openrouter');$('#customLowestPriceVercel').checked=aggregators.has('vercel');$('#customDsmlFallbackEnabled').checked=config.dsml_fallback_enabled;$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
+  $('#customAdvancedEnabled').checked=!!config.advanced_enabled;$('#customAdvancedEnabled').disabled=false;
   syncCustomThinkingFields();syncCustomToolFields();
+  syncAdvancedEditor();
+  if(config.advanced_enabled)$('#customRequestOverrides').value=customEditor.draft;else await refreshCustomPreview();
 }
 function syncCustomThinkingFields(){const protocol=normalizeProviderType((selectedProvider()||{}).provider_type),responses=protocol==='custom_response',messages=protocol==='custom_messages',mimo=isMimoModel(selectedModel()),thinking=$('#customThinking').value==='enabled',effortEnabled=$('#customReasoningEffortEnabled').checked;$('#customThinking').disabled=responses;$('#customReasoningEffort').disabled=!effortEnabled;$('#customReasoningEffortEnabled').disabled=false;$('#customTemperature').disabled=messages?thinking:!responses&&mimo&&thinking;$('#customTopP').disabled=messages?thinking:!responses&&mimo&&thinking;$('#customSamplingNote').textContent=responses?`Responses 协议不发送非标准 thinking 字段；reasoning.effort 将${effortEnabled?'使用当前模型档位':'不发送'}，temperature/top_p 正常发送。`:messages?`Messages 使用 Anthropic adaptive thinking；开启 thinking 时通过 output_config.effort 使用推理档位，且不发送 temperature/top_p。`:`当前模型的 thinking ${thinking?'开启':'关闭'}；reasoning_effort ${effortEnabled?'使用下方独立档位':'不发送'}。已知模型使用官方字段，其他 Custom 使用通用顶层字段；接口不支持时可在这里关闭。`}
 function syncCustomToolFields(){const info=customWebToolInfo[$('#customWebToolBackend').value]||customWebToolInfo.parallel;$('#customToolNote').textContent=`${info.description} 不需要 API Key；不会自动切换、并发调用或回退到其他方案。`}
-function openCustomSettings(){if(!selectedProvider()||!isCustomProviderType(selectedProvider().provider_type)){toast('请先选择 Custom API');return}fillCustomSettings();$('#customModal').showModal()}
+async function openCustomSettings(){if(!isAdmin())return;if(!selectedProvider()||!isCustomProviderType(selectedProvider().provider_type)){toast('请先选择 Custom API');return}await fillCustomSettings();$('#customModal').showModal()}
 async function saveCustomSettings(event){
   event.preventDefault(); if(!isAdmin()){toast('仅管理员可修改共享 Custom 参数');return} const provider=selectedProvider(); if(!provider)return;
-  const model=selectedModel();
+  const model=customEditor.model;
   try{
-    const rawOverrides=$('#customRequestOverrides').value.trim();
-    let requestOverrides={};
-    if(rawOverrides){
-      requestOverrides=JSON.parse(rawOverrides);
-      if(!requestOverrides||Array.isArray(requestOverrides)||typeof requestOverrides!=='object')throw new Error('高级请求 JSON 必须是一个 JSON 对象');
+    const enabled=$('#customAdvancedEnabled').checked;
+    let document={};
+    if(enabled){
+      document=JSON.parse($('#customRequestOverrides').value);
+      if(!document||Array.isArray(document)||typeof document!=='object')throw new Error('高级配置必须是 JSON 对象');
+    }else if(customEditor.draft!==null){
+      try{document=JSON.parse(customEditor.draft);if(!document||Array.isArray(document)||typeof document!=='object')document={}}catch{document={}}
     }
-    const body={model,thinking:$('#customThinking').value,reasoning_effort:$('#customReasoningEffort').value,reasoning_effort_enabled:$('#customReasoningEffortEnabled').checked,lowest_price_aggregators:[$('#customLowestPriceOpenRouter').checked?'openrouter':'',$('#customLowestPriceVercel').checked?'vercel':''].filter(Boolean),dsml_fallback_enabled:$('#customDsmlFallbackEnabled').checked,max_completion_tokens:Number($('#customMaxCompletion').value),temperature:Number($('#customTemperature').value),top_p:Number($('#customTopP').value),web_tool_backend:$('#customWebToolBackend').value,request_overrides:requestOverrides};
-    const updated=await api(`/api/providers/${provider.id}/settings`,{method:'PUT',body});const index=state.providers.findIndex(x=>x.id===provider.id);if(index>=0)state.providers[index]=updated;$('#customModal').close();updateProviderUi();toast(`${model} 的 Custom 参数已保存`)
+    const body={...customFormValues(),advanced_enabled:enabled,advanced_request:document};
+    const updated=await api(`/api/providers/${customEditor.providerId}/settings`,{method:'PUT',body});const index=state.providers.findIndex(x=>x.id===updated.id);if(index>=0)state.providers[index]=updated;$('#customModal').close();updateProviderUi();toast(`${model} 的 Custom 参数已保存`)
   }catch(err){$('#customStatus').textContent=err instanceof SyntaxError?'高级请求 JSON 格式错误：'+err.message:err.message}
 }
 
@@ -1015,6 +1062,9 @@ $('#customSettingsButton').onclick=openCustomSettings;$('#providerSelect').oncha
 $$('.close-modal').forEach(b=>b.onclick=()=>b.closest('dialog').close());$$('dialog').forEach(d=>d.onclick=e=>{if(e.target===d)d.close()});
 $('#testProvider').onclick=testProvider;$('#cancelProviderEdit').onclick=resetProviderEditor;$('#providerForm').onsubmit=async e=>{e.preventDefault();if(!isAdmin()){toast('仅管理员可修改共享 API');return}try{const body=providerFormData();if(state.editingProviderId){await api(`/api/providers/${state.editingProviderId}`,{method:'PUT',body});resetProviderEditor();await loadProviders();toast('API 已更新')}else{await api('/api/providers',{method:'POST',body});resetProviderEditor();await loadProviders();toast('API 已保存')}}catch(err){$('#providerStatus').textContent=err.message}};
 $('#customForm').onsubmit=saveCustomSettings;
+$('#customForm').addEventListener('input',scheduleCustomPreview);
+$('#customForm').addEventListener('change',scheduleCustomPreview);
+$('#customAdvancedEnabled').onchange=toggleAdvancedSettings;
 $('#skillInstallForm').onsubmit=installSkill;
 $('#userForm').onsubmit=async e=>{e.preventDefault();try{await api('/api/users',{method:'POST',body:{username:$('#newUsername').value,password:$('#newPassword').value,is_admin:$('#newAdmin').checked}});e.target.reset();await loadUsers();toast('账号已新增')}catch(err){toast(err.message)}};
 $('#passwordForm').onsubmit=async e=>{e.preventDefault();const password=$('#changePassword').value;if(password!==$('#changePasswordAgain').value){$('#passwordError').textContent='两次输入的密码不一致';return}try{await api(`/api/users/${$('#passwordUserId').value}/password`,{method:'PUT',body:{password}});$('#passwordModal').close();toast('密码已修改')}catch(err){$('#passwordError').textContent=err.message}};

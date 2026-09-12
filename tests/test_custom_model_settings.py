@@ -224,6 +224,43 @@ class CustomModelSettingsTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400, response.text)
         self.assertIn("未在此 custom API", response.json()["detail"])
 
+    def test_preview_and_advanced_settings_are_independent_per_model(self) -> None:
+        provider_id = self.add_legacy_provider()
+        before = main.db.one("SELECT settings_json FROM providers WHERE id=?", (provider_id,))["settings_json"]
+        body = self.settings_body("model-a", temperature=0.6, backend="parallel", effort="low")
+        body.update(advanced_enabled=False, advanced_request={})
+        preview = self.client.post(f"/api/providers/{provider_id}/settings/preview", json=body)
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertEqual(preview.json()["parameters"]["reasoning_effort"], "low")
+        self.assertEqual(preview.json()["parameters"]["temperature"], 0.6)
+        self.assertNotIn("messages", preview.json()["parameters"])
+        self.assertEqual(main.db.one("SELECT settings_json FROM providers WHERE id=?", (provider_id,))["settings_json"], before)
+        body.update(advanced_enabled=True, advanced_request={"temperature": 0.2, "vendor": "custom"})
+        saved = self.client.put(f"/api/providers/{provider_id}/settings", json=body)
+        self.assertEqual(saved.status_code, 200, saved.text)
+        configs = self.client.get("/api/providers").json()[0]["model_settings"]
+        self.assertTrue(configs["model-a"]["advanced_enabled"])
+        self.assertEqual(configs["model-a"]["advanced_request"], body["advanced_request"])
+        self.assertFalse(configs["model-b"]["advanced_enabled"])
+        preview = self.client.post(f"/api/providers/{provider_id}/settings/preview", json=body)
+        self.assertEqual(preview.json()["parameters"], {"model": "model-a", "temperature": 0.2, "vendor": "custom"})
+        body["advanced_enabled"] = False
+        disabled = self.client.put(f"/api/providers/{provider_id}/settings", json=body)
+        self.assertEqual(disabled.status_code, 200, disabled.text)
+        self.assertFalse(disabled.json()["model_settings"]["model-a"]["advanced_enabled"])
+
+    def test_existing_json_extensions_migrate_without_losing_fields(self) -> None:
+        provider_id = self.add_legacy_provider()
+        body = self.settings_body("model-a", temperature=0.6, backend="parallel",
+                                  request_overrides={"reasoning_effort": "low", "session_id": "{{conversation_id}}"})
+        saved = self.client.put(f"/api/providers/{provider_id}/settings", json=body)
+        self.assertEqual(saved.status_code, 200, saved.text)
+        config = saved.json()["model_settings"]["model-a"]
+        self.assertTrue(config["advanced_enabled"])
+        self.assertEqual(config["advanced_request"]["reasoning_effort"], "low")
+        self.assertEqual(config["advanced_request"]["temperature"], 0.6)
+        self.assertEqual(config["advanced_request"]["session_id"], "{{conversation_id}}")
+
     def test_connection_key_protocol_address_and_models_can_be_edited(self) -> None:
         provider_id = self.add_legacy_provider()
         main.migrate_custom_provider_settings()
