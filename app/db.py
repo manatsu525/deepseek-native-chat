@@ -126,6 +126,11 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_attachments_user_pending ON attachments(user_id, draft_id, job_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_attachments_job ON attachments(job_id);
+                CREATE TABLE IF NOT EXISTS responses_capabilities (
+                    capability_key TEXT PRIMARY KEY,
+                    reason TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
                 """
             )
             provider_columns = {row["name"] for row in db.execute("PRAGMA table_info(providers)").fetchall()}
@@ -249,6 +254,24 @@ class Database:
         with self.lock, self.connect() as db:
             cur = db.execute(sql, args)
             return int(cur.lastrowid or 0)
+
+    def responses_capability(self, key: str, *, max_age_seconds: int) -> Optional[str]:
+        """Return the cached reason an upstream rejects Responses chaining, if fresh."""
+        row = self.one(
+            "SELECT reason FROM responses_capabilities WHERE capability_key=? AND updated_at>=?",
+            (key, int(time.time()) - max_age_seconds),
+        )
+        return str(row["reason"]) if row else None
+
+    def set_responses_capability(self, key: str, reason: str) -> None:
+        self.run(
+            "INSERT INTO responses_capabilities(capability_key,reason,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(capability_key) DO UPDATE SET reason=excluded.reason, updated_at=excluded.updated_at",
+            (key, reason, int(time.time())),
+        )
+
+    def clear_responses_capability(self, key: str) -> None:
+        self.run("DELETE FROM responses_capabilities WHERE capability_key=?", (key,))
 
     def update_job(self, job_id: str, **values: Any) -> None:
         if not values:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -75,6 +76,7 @@ from .workspace import (
     EDIT_WORKSPACE_TOOL_NAMES,
     READ_ONLY_WORKSPACE_SYSTEM_PROMPT,
     READ_ONLY_WORKSPACE_TOOL_NAMES,
+    TEXT_REPLACE_SYSTEM_PROMPT,
     WORKSPACE_SYSTEM_PROMPT,
     WORKSPACE_TOOL_NAMES,
     ConversationWorkspace,
@@ -106,8 +108,12 @@ HOST_OPERATION_EVIDENCE_CHARS = 60_000
 # Besides the newest exchange, keep recent complete exchanges up to this size.
 CHECKPOINT_RECENT_EXCHANGE_CHARS = 40_000
 REPEATED_READ_WARNING_COUNT = 3
-WORKSPACE_MUTATION_TOOLS = {"write_file", "apply_line_edits", "apply_patch", "apply_patch_batch", "delete_file"}
+WORKSPACE_MUTATION_TOOLS = {"write_file", "apply_line_edits", "apply_patch", "apply_patch_batch", "replace_text", "delete_file"}
 HOST_READ_TOOLS = {"host_read_file", "frontend_read_page"}
+HOST_FILE_MUTATION_TOOLS = {"host_write_file", "host_apply_patch", "host_delete_path", "frontend_write_page"}
+CONTEXT_CHECKPOINT_MARKER = "\n\nCONTEXT CHECKPOINT:\n"
+RUNTIME_NOTE_MARKER = "\n\n[Runtime note] "
+USER_CONTEXT_MARKER = "\n\n---\n[Context supplied by the application, not written by the user]\n"
 FINAL_ANSWER_PROMPT = (
     "CRITICAL FINALIZATION INSTRUCTION: The tool-call budget is completely exhausted. "
     "Requesting another tool cannot succeed. You MUST stop using tools and answer the "
@@ -326,7 +332,7 @@ def _compact_workspace_call_arguments(
     compact: dict[str, Any] = {"path": path}
     if name == "write_file":
         compact["content"] = "[successful write body omitted from repeated context]"
-    elif name == "apply_patch":
+    elif name in {"apply_patch", "replace_text"}:
         compact.update({"old_text": "[omitted]", "new_text": "[omitted]"})
     elif name == "apply_patch_batch":
         compact["patches"] = [{"old_text": "[omitted]", "new_text": "[omitted]"}]
@@ -352,6 +358,33 @@ def _remember_host_evidence(evidence: list[dict[str, Any]], name: str, arguments
     evidence.append(item)
     while len(evidence) > 30 or len(json.dumps(evidence, ensure_ascii=False)) > HOST_OPERATION_EVIDENCE_CHARS:
         evidence.pop(0)
+
+
+def _short_hash(value: Any) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _forget_host_reads(
+    result_text: str,
+    evidence: dict[tuple[str, int, int | None], dict[str, Any]],
+    revisions: dict[str, str],
+    read_counts: dict[str, int],
+) -> None:
+    """Drop read snapshots of a host path (or directory tree) that was just changed."""
+    try:
+        path = str((json.loads(result_text) or {}).get("path") or "")
+    except (TypeError, ValueError, AttributeError):
+        return
+    if not path:
+        return
+    prefix = path.rstrip("/") + "/"
+    stale = lambda candidate: candidate == path or candidate.startswith(prefix)  # noqa: E731
+    for key in [key for key in evidence if stale(key[0])]:
+        del evidence[key]
+    for mapping in (revisions, read_counts):
+        for key in [key for key in mapping if stale(key)]:
+            del mapping[key]
 
 
 def _snapshot_range(snapshot: dict[str, Any]) -> tuple[int, int]:
@@ -521,8 +554,7 @@ def _maybe_compact_agent_context(
     while the newest complete assistant/tool exchanges are kept verbatim.
     """
     internal = conversation[base_message_count:]
-    marker = "\n\nCONTEXT CHECKPOINT:\n"
-    existing_checkpoint = bool(conversation and marker in str(conversation[0].get("content") or ""))
+    existing_checkpoint = checkpoint_present(conversation[:base_message_count])
     over_high_water = _serialized_chars(internal) > AGENT_CONTEXT_COMPACT_THRESHOLD
     if not over_high_water and not (refresh_existing and existing_checkpoint):
         return False
@@ -615,12 +647,80 @@ def _maybe_compact_agent_context(
         )
     base = [dict(message) for message in conversation[:base_message_count]]
     checkpoint_text = json.dumps(checkpoint, ensure_ascii=False, separators=(",", ":"))
-    if base and base[0].get("role") == "system":
-        original_system = str(base[0].get("content") or "").split(marker, 1)[0]
-        base[0]["content"] = f"{original_system}\n\nCONTEXT CHECKPOINT:\n{checkpoint_text}"
+    if base and base[-1].get("role") == "user":
+        # Attach to the current request rather than the system prompt: the
+        # system prompt and earlier history stay byte-identical, so they remain
+        # a cacheable prefix. Responses/Messages would otherwise hoist a
+        # system checkpoint into the leading instructions.
+        base[-1] = _with_message_block(base[-1], CONTEXT_CHECKPOINT_MARKER, checkpoint_text)
+    elif base and base[0].get("role") == "system":
+        original_system = str(base[0].get("content") or "").split(CONTEXT_CHECKPOINT_MARKER, 1)[0]
+        base[0]["content"] = f"{original_system}{CONTEXT_CHECKPOINT_MARKER}{checkpoint_text}"
     else:
         base.insert(0, {"role": "system", "content": f"CONTEXT CHECKPOINT:\n{checkpoint_text}"})
     conversation[:] = [*base, *keep]
+    return True
+
+
+def _with_message_block(message: dict[str, Any], marker: str, text: str) -> dict[str, Any]:
+    """Return a copy of ``message`` with its ``marker`` block replaced by ``text``."""
+    result = dict(message)
+    content = result.get("content")
+    if isinstance(content, list):
+        label = marker.lstrip("\n")
+        parts = [
+            part for part in content
+            if not (isinstance(part, dict) and part.get("type") == "text" and str(part.get("text") or "").startswith(label))
+        ]
+        if text:
+            parts.append({"type": "text", "text": f"{label}{text}"})
+        result["content"] = parts
+    else:
+        original = str(content or "").split(marker, 1)[0]
+        result["content"] = f"{original}{marker}{text}" if text else original
+    return result
+
+
+def checkpoint_present(messages: list[dict[str, Any]]) -> bool:
+    label = CONTEXT_CHECKPOINT_MARKER.lstrip("\n")
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            if any(isinstance(part, dict) and str(part.get("text") or "").startswith(label) for part in content):
+                return True
+        elif CONTEXT_CHECKPOINT_MARKER in str(content or "") or str(content or "").startswith(label):
+            return True
+    return False
+
+
+def checkpoint_payload(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Decode the checkpoint JSON from wherever it was attached (tests/diagnostics)."""
+    label = CONTEXT_CHECKPOINT_MARKER.lstrip("\n")
+    for message in messages:
+        content = message.get("content")
+        texts = (
+            [str(part.get("text") or "") for part in content if isinstance(part, dict)]
+            if isinstance(content, list) else [str(content or "")]
+        )
+        for text in texts:
+            if label in text:
+                return json.loads(text.split(label, 1)[1])
+    return {}
+
+
+def _append_runtime_note(conversation: list[dict[str, Any]], note: str) -> bool:
+    """Append a runtime note to the newest tool/user message, not the system prompt.
+
+    Returns False when the newest message cannot carry it (caller falls back).
+    """
+    if not conversation or conversation[-1].get("role") not in {"tool", "user"}:
+        return False
+    last = conversation[-1]
+    content = last.get("content")
+    if isinstance(content, list):
+        last["content"] = [*content, {"type": "text", "text": RUNTIME_NOTE_MARKER.lstrip("\n") + note}]
+    else:
+        last["content"] = f"{content or ''}{RUNTIME_NOTE_MARKER}{note}"
     return True
 
 
@@ -1018,8 +1118,13 @@ async def stream_response(
     responses_state: dict[str, Any] | None = None,
     extra_tools: list[dict[str, Any]] | None = None,
     extra_tool_handler: Callable[[str, dict[str, Any]], str | Awaitable[str]] | None = None,
+    user_context_addendum: str = "",
 ) -> dict[str, Any]:
     """Run a custom OpenAI-compatible model with local web tools.
+
+    ``user_context_addendum`` is per-request context (for example previously
+    read web evidence). It is attached to the latest user message instead of
+    the system prompt so the system prompt and older history stay cacheable.
 
     Provider-native search is deliberately not sent here. Keeping search as a
     normal function tool makes it visible to any compatible model. URL scheme
@@ -1027,6 +1132,7 @@ async def stream_response(
     to the model instead of requiring an exact search-result URL match.
     """
     config = _settings(settings)
+    text_replace_enabled = bool(config.get("text_replace_tool"))
     response_chain = ResponsesState(responses_state)
     cached_web_evidence = dict(cached_web_evidence or {})
     extra_tools = list(extra_tools or [])
@@ -1080,8 +1186,17 @@ async def stream_response(
             else WORKSPACE_SYSTEM_PROMPT
         )
         system_prompt = f"{system_prompt}\n\n{workspace_prompt}"
+        if text_replace_enabled and workspace_access != "read_only":
+            system_prompt = f"{system_prompt}\n\n{TEXT_REPLACE_SYSTEM_PROMPT}"
     if system_addendum.strip():
         system_prompt = f"{system_prompt}\n\n{system_addendum.strip()}"
+    # URLs the user actually wrote gate the reader; application context must not.
+    known_urls = _user_urls(messages)
+    messages = [dict(message) for message in messages]
+    if user_context_addendum.strip() and messages and messages[-1].get("role") == "user":
+        messages[-1] = _with_message_block(messages[-1], USER_CONTEXT_MARKER, user_context_addendum.strip())
+    elif user_context_addendum.strip():
+        system_prompt = f"{system_prompt}\n\n{user_context_addendum.strip()}"
     conversation: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}, *[dict(message) for message in messages]]
     if api_protocol == "responses" and response_chain.previous_id:
         # The persisted state belongs to the immediately preceding assistant.
@@ -1100,8 +1215,11 @@ async def stream_response(
     search_count = 0
     fetch_count = 0
     tool_rounds_used = 0
+    budget_noted_messages: set[int] = set()
+    responses_protocol_enabled = api_protocol == "responses"
+    tool_results_start = len(messages) + 1
+    round_stats: list[dict[str, Any]] = []
     searched_queries: set[str] = set()
-    known_urls = _user_urls(messages)
     attempted_urls: set[str] = set()
     reader_enabled = bool(known_urls)
     final_answer_attempts = 0
@@ -1186,7 +1304,11 @@ async def stream_response(
                     else:
                         round_tools.append(KEYLESS_FETCH_WEBPAGE_TOOL)
                 if workspace is not None and workspace_access != "none" and tool_rounds_used < role_tool_round_limit:
-                    round_tools.extend(workspace.tool_definitions(workspace_access))
+                    round_tools.extend(
+                        workspace.tool_definitions(workspace_access, text_replace=True)
+                        if text_replace_enabled and workspace_access != "read_only"
+                        else workspace.tool_definitions(workspace_access)
+                    )
                     if inkling_compat_active:
                         round_tools, inkling_patch_bindings = bind_inkling_patch_tools(
                             round_tools,
@@ -1197,11 +1319,26 @@ async def stream_response(
             final_answer_only = force_final_answer or (tools_expected and not round_tools)
             mimo_model = is_mimo_model(model)
             request_messages = conversation
+            runtime_note_kind = ""
             if web_enabled and (search_count >= search_limit or fetch_count >= fetch_limit) and not final_answer_only:
-                request_messages = [*conversation, {"role": "system", "content":
+                budget_note = (
                     f"Remaining web budget: web_search={max(0, search_limit - search_count)}, "
                     f"fetch_webpage={max(0, fetch_limit - fetch_count)}. "
-                    "Use only tools listed in this request. Answer when the available evidence is sufficient."}]
+                    "Use only tools listed in this request. Answer when the available evidence is sufficient."
+                )
+                if conversation and conversation[-1].get("role") == "tool":
+                    # Persist it on the newest tool result: the request stays
+                    # append-only and Responses/Messages do not hoist it into
+                    # the leading instructions, which would void the cache.
+                    if id(conversation[-1]) not in budget_noted_messages:
+                        _append_runtime_note(conversation, budget_note)
+                        budget_noted_messages.add(id(conversation[-1]))
+                        if responses_protocol_enabled and response_chain.pending is not None:
+                            response_chain.pending = _responses_input(conversation[tool_results_start:])
+                    runtime_note_kind = "budget_tool_result"
+                else:
+                    request_messages = [*conversation, {"role": "system", "content": budget_note}]
+                    runtime_note_kind = "budget_system"
             if final_answer_only:
                 retry_note = (
                     " Your preceding finalization attempt still tried to call a tool and was discarded."
@@ -1270,6 +1407,22 @@ async def stream_response(
                 if config.get("advanced_enabled") and "store" not in parameters:
                     response_chain.disable("advanced_store_omitted")
                 response_chain.prepare(payload, full_response_input)
+            if responses_protocol:
+                leading_prompt = payload.get("instructions")
+            elif messages_protocol:
+                leading_prompt = payload.get("system")
+            else:
+                leading_prompt = request_messages[0].get("content") if request_messages else ""
+            round_stat: dict[str, Any] = {
+                "round": round_number + 1,
+                "system_hash": _short_hash(leading_prompt),
+                "tools_hash": _short_hash(payload.get("tools") or []),
+                "messages": len(request_messages),
+                "chained": bool(payload.get("previous_response_id")),
+                "final_only": bool(final_answer_only),
+            }
+            if runtime_note_kind:
+                round_stat["note"] = runtime_note_kind
             round_answer = ""
             round_preview = ""
             round_reasoning = ""
@@ -1437,6 +1590,16 @@ async def stream_response(
                     )
 
             usage = _merge_usage(usage, round_usage)
+            round_stat.update(
+                {
+                    "input_tokens": int(round_usage.get("input_tokens") or 0),
+                    "cached_tokens": int((round_usage.get("input_tokens_details") or {}).get("cached_tokens") or 0),
+                    "output_tokens": int(round_usage.get("output_tokens") or 0),
+                }
+            )
+            if responses_protocol and response_chain.disabled and response_chain.reason:
+                round_stat["chain_state"] = response_chain.reason
+            round_stats.append(round_stat)
             calls = normalize_tool_calls(_tool_calls(round_tools_by_index, round_number))
             if responses_protocol:
                 # Execution and replay must use the same assembled arguments.
@@ -1717,7 +1880,8 @@ async def stream_response(
                         # Keep the live trace useful for host operations without
                         # copying complete file contents or command arguments.
                         hint = (
-                            arguments.get("path")
+                            (arguments.get("command") if name == "host_run_command" else None)
+                            or arguments.get("path")
                             or arguments.get("cwd")
                             or arguments.get("skill_id")
                             or arguments.get("conversation_id")
@@ -1740,6 +1904,7 @@ async def stream_response(
                             "write_file": ("path", "content"),
                             "apply_line_edits": ("path", "revision", "edits"),
                             "apply_patch": ("path", "old_text", "new_text"),
+                            "replace_text": ("path", "old_text", "new_text"),
                             "apply_patch_batch": ("path", "patches"),
                             "search_files": ("query",),
                             "delete_file": ("path",),
@@ -2107,6 +2272,8 @@ async def stream_response(
                             )
                             if duplicate_read:
                                 step["status"] = "skipped"
+                        elif name in HOST_FILE_MUTATION_TOOLS and not failure:
+                            _forget_host_reads(result_text, host_read_evidence, host_read_revisions, read_counts)
                         _remember_host_evidence(host_evidence, name, arguments, evidence_text, step["status"])
                     else:
                         raise ValueError(f"不支持的工具：{name or '未命名工具'}")
@@ -2191,6 +2358,8 @@ async def stream_response(
                 host_evidence=host_evidence if agent_mode else None,
                 host_read_evidence=host_read_evidence if agent_mode else None,
             )
+            if compacted and round_stats:
+                round_stats[-1]["compacted_after"] = True
             if responses_protocol and compacted:
                 response_chain.reset()
     searches = steps
@@ -2202,6 +2371,7 @@ async def stream_response(
         "usage": usage,
         "tool_calls": [],
         "tool_trace": tool_trace,
+        "round_stats": round_stats,
         "web_evidence": web_evidence,
         "agent_mode": bool(agent_mode),
         "response": {"tool_trace": tool_trace, "agent_mode": bool(agent_mode)},

@@ -27,7 +27,7 @@ from urllib.parse import unquote, urlsplit
 from . import attachments
 from .db import Database
 from .skills import SkillRegistry
-from .workspace import delete_conversation_workspace
+from .workspace import delete_conversation_workspace, edited_excerpt, replace_text_in_content
 from .code_runner import _HtmlScripts
 
 
@@ -127,7 +127,7 @@ HOST_TOOLS = [
     ),
     _function(
         "host_apply_patch",
-        "Replace exact text in a host file. Use replace_all only when every match should change.",
+        "Replace an exact, unique snippet in a host file. Copy old_text verbatim (without the 'N|' prefixes shown by host_read_file) with enough context to be unique. Use replace_all only when every match should change. The result shows the edited region with its new line numbers.",
         {
             "path": {"type": "string", "description": "Absolute path or path relative to /home/share"},
             "old_text": {"type": "string", "description": "Exact existing text"},
@@ -321,19 +321,23 @@ class AgentRuntime:
         path = self._path(arguments.get("path"))
         if not path.is_file():
             raise ValueError(f"文件不存在：{path}")
-        old = str(arguments.get("old_text") or "")
-        if not old:
-            raise ValueError("old_text 不能为空")
         content = path.read_text(encoding="utf-8", errors="replace")
-        matches = content.count(old)
-        replace_all = bool(arguments.get("replace_all", False))
-        if not matches:
-            raise ValueError("old_text 与当前文件不匹配")
-        if matches > 1 and not replace_all:
-            raise ValueError(f"old_text 出现 {matches} 次；请缩小上下文或启用 replace_all")
-        updated = content.replace(old, str(arguments.get("new_text") or ""), -1 if replace_all else 1)
+        updated, count, regions, mode = replace_text_in_content(
+            content,
+            str(arguments.get("old_text") or ""),
+            str(arguments.get("new_text") or ""),
+            bool(arguments.get("replace_all", False)),
+        )
         path.write_text(updated, encoding="utf-8")
-        return {"ok": True, "path": str(path), "replacements": matches if replace_all else 1}
+        return {
+            "ok": True,
+            "path": str(path),
+            "replacements": count,
+            "match": mode,
+            "revision": hashlib.sha256(updated.encode("utf-8")).hexdigest(),
+            "line_count": len(updated.splitlines()),
+            **edited_excerpt(updated, regions),
+        }
 
     def _host_search_files(self, arguments: dict[str, Any]) -> dict[str, Any]:
         query = str(arguments.get("query") or "")

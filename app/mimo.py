@@ -91,6 +91,7 @@ DEFAULT_SETTINGS = {
     "reasoning_effort_enabled": True,
     "lowest_price_aggregators": [],
     "dsml_fallback_enabled": False,
+    "text_replace_tool": False,
     "max_completion_tokens": 65536,
     "temperature": 1.0,
     "top_p": 0.95,

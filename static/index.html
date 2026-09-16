@@ -190,6 +190,7 @@
         <p class="muted custom-cost-note">只勾选当前模型所在的聚合商；未勾选时不会改写模型名或请求路由。</p>
       </div>
       <label class="check wide"><input id="customDsmlFallbackEnabled" type="checkbox"> OpenCode DeepSeek V4 Flash：启用 DSML 工具调用兜底</label>
+      <label class="check wide"><input id="customTextReplaceTool" type="checkbox"> 普通模式编码：提供原文替换编辑工具（replace_text，不依赖行号）</label>
       <label>最大生成 Token<input id="customMaxCompletion" type="number" min="256" max="131072" step="256" value="65536"></label>
       <label>temperature<input id="customTemperature" type="number" min="0" max="1.5" step="0.05" value="1"></label>
       <label>top_p<input id="customTopP" type="number" min="0.01" max="1" step="0.01" value="0.95"></label>
@@ -255,6 +256,6 @@
 
   <div id="toast" class="toast"></div>
   <script src="/assets/vendor/katex/katex.min.js" defer></script>
-  <script src="/assets/app.js?v=20260912-custom-json2" defer></script>
+  <script src="/assets/app.js?v=20260916-text-replace" defer></script>
 </body>
 </html>

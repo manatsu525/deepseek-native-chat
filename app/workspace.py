@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import bisect
+import difflib
 import json
 import hashlib
 import os
@@ -133,9 +135,28 @@ CHECK_WEB_SYNTAX_TOOL = _function(
     ["path"],
 )
 
+REPLACE_TEXT_TOOL = _function(
+    "replace_text",
+    "Replace an exact, unique snippet in an existing file; no revision is needed. Copy old_text verbatim from the file "
+    "(without the 'N|' line-number prefixes shown by read_file) and include enough surrounding lines to make it unique. "
+    "Use replace_all only when every occurrence should change. The result shows the edited region with its new line numbers.",
+    {
+        "path": {"type": "string", "description": "Workspace-relative path"},
+        "old_text": {"type": "string", "description": "Exact existing text to replace"},
+        "new_text": {"type": "string", "description": "Replacement text"},
+        "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring exactly one"},
+    },
+    ["path", "old_text", "new_text"],
+)
+TEXT_REPLACE_SYSTEM_PROMPT = (
+    "For a small local change you may use replace_text with an exact, unique snippet copied from the file instead of "
+    "apply_line_edits; it needs no revision and is not affected by shifted line numbers. Use apply_line_edits for "
+    "large multi-region rewrites."
+)
+
 LEGACY_PATCH_TOOL_NAMES = {"apply_patch", "apply_patch_batch"}
 WORKSPACE_TOOL_NAMES = {
-    item["function"]["name"] for item in [*WORKSPACE_TOOLS, RUN_PYTHON_TOOL, CHECK_WEB_SYNTAX_TOOL]
+    item["function"]["name"] for item in [*WORKSPACE_TOOLS, RUN_PYTHON_TOOL, CHECK_WEB_SYNTAX_TOOL, REPLACE_TEXT_TOOL]
 } | LEGACY_PATCH_TOOL_NAMES
 READ_ONLY_WORKSPACE_TOOL_NAMES = {
     "list_files",
@@ -149,6 +170,159 @@ EDIT_WORKSPACE_TOOL_NAMES = WORKSPACE_TOOL_NAMES - {"run_python", "check_web_syn
 
 class WorkspaceError(ValueError):
     pass
+
+
+EXCERPT_CONTEXT_LINES = 2
+EXCERPT_MAX_CHARS = 6_000
+_LINE_NUMBER_PREFIX = re.compile(r"^\s*\d+\|")
+
+
+def _line_starts(content: str) -> list[int]:
+    starts = [0]
+    for line in content.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    return starts
+
+
+def _line_of_offset(starts: list[int], offset: int) -> int:
+    """1-based line containing ``offset``; ``starts`` comes from _line_starts."""
+    return min(max(1, bisect.bisect_right(starts, offset)), max(1, len(starts) - 1))
+
+
+def edited_excerpt(content: str, regions: list[tuple[int, int]]) -> dict[str, Any]:
+    """Numbered lines around edited character regions of the updated content.
+
+    Returning the edited area lets the model verify the change and see the new
+    line numbers without spending another round on read_file.
+    """
+    lines = content.splitlines()
+    if not lines:
+        return {"updated_excerpt": "", "excerpt_truncated": False}
+    starts = _line_starts(content)
+    spans: list[list[int]] = []
+    for start, end in sorted(regions):
+        first = _line_of_offset(starts, start)
+        last = max(first, _line_of_offset(starts, max(start, end - 1)))
+        first = max(1, first - EXCERPT_CONTEXT_LINES)
+        last = min(len(lines), last + EXCERPT_CONTEXT_LINES)
+        if spans and first <= spans[-1][1] + 1:
+            spans[-1][1] = max(spans[-1][1], last)
+        else:
+            spans.append([first, last])
+    rendered: list[str] = []
+    used = 0
+    truncated = False
+    for index, (first, last) in enumerate(spans):
+        if index:
+            rendered.append("...")
+        for number in range(first, last + 1):
+            text = f"{number}|{lines[number - 1]}"
+            if used + len(text) > EXCERPT_MAX_CHARS:
+                truncated = True
+                break
+            rendered.append(text)
+            used += len(text) + 1
+        if truncated:
+            break
+    return {"updated_excerpt": "\n".join(rendered), "excerpt_truncated": truncated}
+
+
+def _closest_region_hint(content: str, old: str) -> str:
+    old_lines = old.splitlines() or [old]
+    lines = content.splitlines()
+    if not lines:
+        return ""
+    window = max(1, min(len(old_lines), len(lines)))
+    target = "\n".join(line.strip() for line in old_lines)
+    best_ratio, best_start = 0.0, 0
+    anchor = old_lines[0].strip()
+    candidates = [index for index, line in enumerate(lines) if anchor and anchor[:20] in line] or range(0, len(lines) - window + 1)
+    for index in list(candidates)[:2000]:
+        chunk = "\n".join(line.strip() for line in lines[index:index + window])
+        ratio = difflib.SequenceMatcher(None, target, chunk).quick_ratio()
+        if ratio > best_ratio:
+            best_ratio, best_start = ratio, index
+    if best_ratio < 0.5:
+        return ""
+    shown = [f"{number + 1}|{lines[number][:100]}" for number in range(best_start, min(len(lines), best_start + min(window, 8)))]
+    return "最接近的当前内容：\n" + "\n".join(shown)
+
+
+def replace_text_in_content(content: str, old: str, new: str, replace_all: bool) -> tuple[str, int, list[tuple[int, int]], str]:
+    """Exact snippet replacement with conservative recovery for common copy slips.
+
+    Recovery is attempted only when the exact text is absent: copied
+    ``N|`` read_file prefixes are removed, then trailing whitespace and line
+    endings are ignored line by line. Every mode still requires a unique match
+    unless replace_all is set. Returns (updated, count, edited regions, mode).
+    """
+    if not old:
+        raise WorkspaceError("old_text 不能为空")
+    attempts: list[tuple[str, str, str]] = [("exact", old, new)]
+    old_lines = old.splitlines()
+    if old_lines and all(_LINE_NUMBER_PREFIX.match(line) for line in old_lines):
+        stripped_old = "\n".join(_LINE_NUMBER_PREFIX.sub("", line, count=1) for line in old_lines)
+        new_lines = new.splitlines()
+        stripped_new = (
+            "\n".join(_LINE_NUMBER_PREFIX.sub("", line, count=1) for line in new_lines)
+            if new_lines and all(_LINE_NUMBER_PREFIX.match(line) for line in new_lines)
+            else new
+        )
+        if old.endswith("\n"):
+            stripped_old += "\n"
+        attempts.append(("line_numbers_removed", stripped_old, stripped_new))
+    for mode, needle, replacement in attempts:
+        starts: list[int] = []
+        offset = 0
+        while True:
+            found = content.find(needle, offset)
+            if found < 0:
+                break
+            starts.append(found)
+            offset = found + len(needle)
+        if starts:
+            return _apply_spans(content, [(start, start + len(needle)) for start in starts], replacement, replace_all, mode)
+    # Line-wise match that ignores trailing whitespace and CR/LF differences.
+    needle_lines = [line.rstrip() for line in attempts[-1][1].splitlines()]
+    replacement = attempts[-1][2]
+    if needle_lines and any(needle_lines):
+        lines = content.splitlines(keepends=True)
+        starts_at = _line_starts(content)
+        spans: list[tuple[int, int]] = []
+        size = len(needle_lines)
+        index = 0
+        while index + size <= len(lines):
+            if all(lines[index + k].rstrip() == needle_lines[k] for k in range(size)):
+                end = starts_at[index + size]
+                last_line = lines[index + size - 1]
+                if not attempts[-1][1].endswith(("\n", "\r")):
+                    end -= len(last_line) - len(last_line.rstrip("\r\n"))
+                spans.append((starts_at[index], end))
+                index += size
+            else:
+                index += 1
+        if spans:
+            return _apply_spans(content, spans, replacement, replace_all, "whitespace_insensitive")
+    hint = _closest_region_hint(content, attempts[-1][1])
+    raise WorkspaceError("old_text 与当前文件不匹配（已忽略行号前缀和行尾空白）。" + (f"\n{hint}" if hint else "请先读取相关片段后再修改。"))
+
+
+def _apply_spans(content: str, spans: list[tuple[int, int]], replacement: str, replace_all: bool, mode: str) -> tuple[str, int, list[tuple[int, int]], str]:
+    if len(spans) > 1 and not replace_all:
+        lines = _line_starts(content)
+        where = "、".join(str(_line_of_offset(lines, start)) for start, _ in spans[:10])
+        raise WorkspaceError(f"old_text 在文件中出现 {len(spans)} 次（起始行：{where}）；请加入更多上下文使其唯一，或启用 replace_all")
+    targets = spans if replace_all else spans[:1]
+    updated = content
+    for start, end in reversed(targets):
+        updated = updated[:start] + replacement + updated[end:]
+    regions: list[tuple[int, int]] = []
+    shift = 0
+    for start, end in targets:
+        new_start = start + shift
+        regions.append((new_start, new_start + len(replacement)))
+        shift += len(replacement) - (end - start)
+    return updated, len(targets), regions, mode
 
 
 class ConversationWorkspace:
@@ -194,7 +368,7 @@ class ConversationWorkspace:
             for path in self._files()
         ]
 
-    def tool_definitions(self, access: str = "full") -> list[dict[str, Any]]:
+    def tool_definitions(self, access: str = "full", *, text_replace: bool = False) -> list[dict[str, Any]]:
         """Return a byte-stable schema so provider prefix caches stay reusable.
 
         Existing paths are runtime state, not part of a tool's contract.  Putting
@@ -203,6 +377,8 @@ class ConversationWorkspace:
         authoritative way for the model to discover paths.
         """
         tools = [*WORKSPACE_TOOLS, RUN_PYTHON_TOOL, CHECK_WEB_SYNTAX_TOOL]
+        if text_replace:
+            tools.insert(4, REPLACE_TEXT_TOOL)
         if access == "read_only":
             tools = [item for item in tools if item["function"]["name"] in READ_ONLY_WORKSPACE_TOOL_NAMES]
         elif access == "edit":
@@ -313,6 +489,23 @@ class ConversationWorkspace:
         result["replacements"] = matches if bool(replace_all) else 1
         return result
 
+    def replace_text(self, path: Any, old_text: Any, new_text: Any, replace_all: Any = False) -> dict[str, Any]:
+        content, relative = self._read_text(path)
+        updated, count, regions, mode = replace_text_in_content(
+            content, str(old_text or ""), str(new_text or ""), bool(replace_all)
+        )
+        result = self.write_file(relative, updated)
+        result.update(
+            {
+                "replacements": count,
+                "match": mode,
+                "revision": self._revision(updated),
+                "line_count": len(updated.splitlines()),
+                **edited_excerpt(updated, regions),
+            }
+        )
+        return result
+
     def apply_patch_batch(self, path: Any, patches: Any) -> dict[str, Any]:
         if not isinstance(patches, list) or not patches or len(patches) > 20:
             raise WorkspaceError("patches 必须是包含 1 到 20 项的数组")
@@ -411,6 +604,12 @@ class ConversationWorkspace:
         updated = content
         for start_offset, end_offset, new_text, _ in reversed(ordered):
             updated = updated[:start_offset] + new_text + updated[end_offset:]
+        regions: list[tuple[int, int]] = []
+        shift = 0
+        for start_offset, end_offset, new_text, _ in ordered:
+            new_start = start_offset + shift
+            regions.append((new_start, new_start + len(new_text)))
+            shift += len(new_text) - (end_offset - start_offset)
         result = self.write_file(relative, updated)
         result.update(
             {
@@ -418,6 +617,7 @@ class ConversationWorkspace:
                 "previous_revision": current_revision,
                 "revision": self._revision(updated),
                 "line_count": len(updated.splitlines()),
+                **edited_excerpt(updated, regions),
             }
         )
         return result
@@ -482,6 +682,8 @@ class ConversationWorkspace:
             result = self.write_file(arguments.get("path"), arguments.get("content"))
         elif name == "apply_line_edits":
             result = self.apply_line_edits(arguments.get("path"), arguments.get("revision"), arguments.get("edits"))
+        elif name == "replace_text":
+            result = self.replace_text(arguments.get("path"), arguments.get("old_text"), arguments.get("new_text"), arguments.get("replace_all", False))
         elif name == "apply_patch":
             result = self.apply_patch(arguments.get("path"), arguments.get("old_text"), arguments.get("new_text"), arguments.get("replace_all", False))
         elif name == "apply_patch_batch":

@@ -87,7 +87,11 @@ class ResponsesStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["answer"], "完成")
         for payload in transport.payloads[3:5]:
             self.assertEqual([item["name"] for item in payload["tools"]], ["fetch_webpage"])
-            self.assertIn("web_search=0, fetch_webpage=3", payload["instructions"])
+            self.assertIn("web_search=0, fetch_webpage=3", json.dumps(payload, ensure_ascii=False))
+        # After a tool round the budget note rides on the tool output, so the
+        # leading instructions (and their cached prefix) stay unchanged.
+        self.assertNotIn("web_search=0", transport.payloads[3]["instructions"])
+        self.assertEqual(transport.payloads[3]["instructions"], transport.payloads[0]["instructions"])
         self.assertTrue(all(item["status"] == "completed" for item in result["tool_trace"]))
 
     async def test_completed_snapshot_supplies_calls_and_final_text(self):

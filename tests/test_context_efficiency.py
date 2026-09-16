@@ -16,6 +16,7 @@ from app.mimo_local import (
     _final_answer_prompt,
     _maybe_compact_agent_context,
     _select_round_tool_calls,
+    checkpoint_payload,
     stream_response,
 )
 from app.workspace import ConversationWorkspace
@@ -165,10 +166,12 @@ class ContextEfficiencyTests(unittest.TestCase):
                     tool_trace=[{"name": "read_file", "path": "app.py", "status": "completed"}],
                 )
                 self.assertTrue(changed)
-                self.assertTrue(conversation[0]["content"].startswith("system\n\nCONTEXT CHECKPOINT:"))
-                self.assertEqual(conversation[1], base[1])
+                # The system prompt stays byte-identical; the checkpoint rides
+                # on the current user message.
+                self.assertEqual(conversation[0], base[0])
+                self.assertTrue(conversation[1]["content"].startswith("fix it\n\nCONTEXT CHECKPOINT:"))
                 self.assertEqual(conversation[-2:], latest_pair)
-                checkpoint = json.loads(conversation[0]["content"].split("CONTEXT CHECKPOINT:\n", 1)[1])
+                checkpoint = checkpoint_payload(conversation)
                 self.assertEqual(checkpoint["workspace_files"][0]["path"], "app.py")
             finally:
                 workspace_module.WORKSPACES_DIR = original
@@ -221,7 +224,7 @@ class ContextEfficiencyTests(unittest.TestCase):
             )
 
             self.assertTrue(changed)
-            checkpoint = json.loads(conversation[0]["content"].split("CONTEXT CHECKPOINT:\n", 1)[1])
+            checkpoint = checkpoint_payload(conversation)
             self.assertEqual(checkpoint["workspace_read_snapshots"], [snapshot])
             self.assertEqual(reads, {read_key})
             self.assertEqual(conversation[-2:], latest_pair)
@@ -239,7 +242,7 @@ class ContextEfficiencyTests(unittest.TestCase):
                 refresh_existing=True,
             )
             self.assertTrue(refreshed)
-            checkpoint = json.loads(conversation[0]["content"].split("CONTEXT CHECKPOINT:\n", 1)[1])
+            checkpoint = checkpoint_payload(conversation)
             self.assertEqual(checkpoint["workspace_read_snapshots"], [])
 
     def test_checkpoint_invalidates_dedupe_for_evidence_it_cannot_keep(self) -> None:

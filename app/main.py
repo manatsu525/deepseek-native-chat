@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import os
@@ -44,6 +45,7 @@ from .reasoning_effort import DEFAULT as DEFAULT_REASONING_EFFORT
 from .reasoning_effort import LEVELS as REASONING_EFFORT_LEVELS
 from .security import load_secret, make_token, password_hash, password_ok, read_token
 from .skills import SkillRegistry
+from .work_log import build_work_log, with_work_log
 from .workspace import AgentSharedWorkspace, ConversationWorkspace, WorkspaceError, delete_conversation_workspace, delete_user_workspaces
 
 
@@ -125,6 +127,7 @@ class CustomSettingsBody(BaseModel):
     reasoning_effort_enabled: bool = True
     lowest_price_aggregators: list[Literal["openrouter", "vercel"]] = Field(default_factory=list, max_length=2)
     dsml_fallback_enabled: bool = False
+    text_replace_tool: bool = False
     max_completion_tokens: int = Field(default=65536, ge=256, le=MIMO_MAX_COMPLETION_TOKENS)
     temperature: float = Field(default=1.0, ge=0, le=1.5)
     top_p: float = Field(default=0.95, ge=0.01, le=1)
@@ -532,6 +535,37 @@ def _build_web_evidence_context(
     return header + "".join(blocks) if blocks else ""
 
 
+HISTORY_WINDOW_MIN = 20
+HISTORY_WINDOW_STEP = 10
+RESPONSES_CAPABILITY_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+RESPONSES_CAPABILITY_CACHED_REASON = "provider_rejects_response_state_cached"
+RESPONSES_UNSUPPORTED_REASONS = {"upstream_rejected_response_state", "upstream_missing_stored_response_id"}
+
+
+def history_window_size(total: int) -> int:
+    """Number of newest messages to replay: at least 20, fewer than 30.
+
+    The window's first message only moves every HISTORY_WINDOW_STEP messages,
+    so the replayed history stays a stable, cacheable prefix across several
+    turns instead of shifting by one message on every request.
+    """
+    if total <= HISTORY_WINDOW_MIN:
+        return max(total, 1)
+    return HISTORY_WINDOW_MIN + (total - HISTORY_WINDOW_MIN) % HISTORY_WINDOW_STEP
+
+
+def responses_capability_key(provider: dict[str, Any], model: str) -> str:
+    base_url = str(provider.get("base_url") or "").strip().rstrip("/")
+    return hashlib.sha256(f"{base_url}\n{model}".encode("utf-8")).hexdigest()
+
+
+def record_responses_capability(key: str, state: dict[str, Any]) -> None:
+    if state.get("disabled") and state.get("fallback_reason") in RESPONSES_UNSUPPORTED_REASONS:
+        db.set_responses_capability(key, str(state["fallback_reason"]))
+    elif state.get("response_id") and not state.get("disabled"):
+        db.clear_responses_capability(key)
+
+
 async def _execute_job(job_id: str) -> None:
     job = db.one("SELECT * FROM jobs WHERE id=?", (job_id,))
     if not job or job["status"] not in {"queued", "running"}:
@@ -554,15 +588,24 @@ async def _execute_job(job_id: str) -> None:
     # Agent jobs never create or mount an ordinary per-conversation workspace.
     job_workspace: ConversationWorkspace | None = None if agent_job else ConversationWorkspace(job["user_id"], job["conversation_id"])
     agent_workspace = AgentSharedWorkspace()
+    message_total = int((db.one("SELECT COUNT(*) AS n FROM messages WHERE conversation_id=?", (job["conversation_id"],)) or {}).get("n") or 0)
     history_rows = db.all(
-        "SELECT role, content, meta_json FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 20",
-        (job["conversation_id"],),
+        "SELECT role, content, meta_json FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT ?",
+        (job["conversation_id"], history_window_size(message_total)),
     )
     response_scope = ""
     response_options: dict[str, Any] = {}
     if kind == "custom_response":
         response_scope = state_scope(provider, job, custom_settings_for_model(provider, job["model"]))
-        response_options["responses_state"] = resume_state(history_rows, response_scope)
+        response_state = resume_state(history_rows, response_scope)
+        capability_key = responses_capability_key(provider, job["model"])
+        if not response_state:
+            unsupported = db.responses_capability(capability_key, max_age_seconds=RESPONSES_CAPABILITY_MAX_AGE_SECONDS)
+            if unsupported:
+                # This upstream already rejected response chaining; skip the
+                # request that would fail with 400 before the full-input retry.
+                response_state = {"disabled": True, "fallback_reason": RESPONSES_CAPABILITY_CACHED_REASON}
+        response_options["responses_state"] = response_state
     history: list[dict[str, Any]] = []
     for row in reversed(history_rows):
         meta = db.decode(row.get("meta_json", "{}"), {})
@@ -588,6 +631,8 @@ async def _execute_job(job_id: str) -> None:
         if kind == "custom" and is_mimo_model(job.get("model")) and row["role"] == "assistant":
             if meta.get("reasoning") and not meta.get("invalid_answer"):
                 message["reasoning_content"] = meta.get("reasoning", "")
+        if row["role"] == "assistant" and meta.get("work_log"):
+            message["content"] = with_work_log(message["content"], str(meta["work_log"]))
         history.append(message)
     prior_web_evidence = db.web_evidence_for_conversation(
         job["user_id"],
@@ -680,10 +725,8 @@ async def _execute_job(job_id: str) -> None:
                 web_tool_round_limit=96,
                 cached_web_evidence=cached_web_evidence,
                 **response_options,
-                system_addendum=(
-                    build_agent_skills_prompt()
-                    + (f"\n\n{web_evidence_context}" if web_evidence_context else "")
-                ),
+                system_addendum=build_agent_skills_prompt(),
+                user_context_addendum=web_evidence_context,
             )
         elif is_custom_provider(kind):
             provider_settings = custom_settings_for_model(provider, job["model"])
@@ -702,7 +745,7 @@ async def _execute_job(job_id: str) -> None:
                 effort=provider_settings.get("reasoning_effort") or job["effort"],
                 workspace=job_workspace,
                 cached_web_evidence=cached_web_evidence,
-                system_addendum=web_evidence_context,
+                user_context_addendum=web_evidence_context,
                 **response_options,
             )
         else:
@@ -727,8 +770,14 @@ async def _execute_job(job_id: str) -> None:
         meta = {"job_id": job_id, "conversation_id": job["conversation_id"], "provider_id": job["provider_id"], "provider_type": kind, "model": job["model"], "chat_mode": job.get("chat_mode") or "standard", "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"], "agents": result.get("agents", []), "workspace_files": display_files}
         if result.get("tool_trace"):
             meta["tool_trace"] = result["tool_trace"]
+            work_log = build_work_log(result["tool_trace"])
+            if work_log:
+                meta["work_log"] = work_log
+        if result.get("round_stats"):
+            meta["round_stats"] = result["round_stats"]
         if kind == "custom_response" and result.get("responses_state"):
             meta["responses_state"] = {**result["responses_state"], "scope": response_scope}
+            record_responses_capability(capability_key, result["responses_state"])
         db.run(
             "INSERT INTO messages(conversation_id, role, content, meta_json, created_at) VALUES(?,?,?,?,?)",
             (job["conversation_id"], "assistant", result["answer"], json.dumps(meta, ensure_ascii=False), now()),

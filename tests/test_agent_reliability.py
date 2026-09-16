@@ -15,7 +15,7 @@ from app import agent as agent_module
 from app.agent import AgentRuntime
 from app import mimo_local
 from app.mimo_local import (
-    _maybe_compact_agent_context, _process_host_read, _remember_host_evidence,
+    _maybe_compact_agent_context, _process_host_read, _remember_host_evidence, checkpoint_payload,
     AGENT_CONTEXT_COMPACT_THRESHOLD, CHECKPOINT_READ_EVIDENCE_CHARS,
 )
 
@@ -34,7 +34,7 @@ class CheckpointTests(unittest.TestCase):
         kwargs = dict(base_message_count=2, workspace=None, sources={}, tool_trace=[], host_evidence=evidence)
         self.assertTrue(_maybe_compact_agent_context(history, **kwargs))
         self.assertEqual(history[2:], latest)
-        checkpoint = json.loads(history[0]['content'].split('CONTEXT CHECKPOINT:\n')[1])
+        checkpoint = checkpoint_payload(history)
         self.assertEqual(checkpoint['host_operation_evidence'][0]['arguments']['new_text'], 'new')
         history[2]['content'] = 'x' * (AGENT_CONTEXT_COMPACT_THRESHOLD + 1)
         self.assertTrue(_maybe_compact_agent_context(history, **kwargs))
@@ -69,7 +69,7 @@ class CheckpointTests(unittest.TestCase):
         self.assertTrue(_maybe_compact_agent_context(
             history, base_message_count=2, workspace=None, sources={}, tool_trace=[],
             host_evidence=[], host_read_evidence=evidence))
-        checkpoint = json.loads(history[0]['content'].split('CONTEXT CHECKPOINT:\n')[1])
+        checkpoint = checkpoint_payload(history)
         # Newest wins; the oversized older one no longer fits and is forgotten.
         self.assertEqual([item['path'] for item in checkpoint['host_read_snapshots']], ['/b'])
         self.assertEqual(list(evidence), [('/b', 1, None)])
@@ -243,7 +243,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 extra_tools=runtime.tool_definitions, extra_tool_handler=runtime.execute_async)
         self.assertEqual(result['tool_trace'][0]['status'], 'failed')
         self.assertIn('文件不存在', result['searches'][0]['error'])
-        checkpoint = json.loads(requests[1]['messages'][0]['content'].split('CONTEXT CHECKPOINT:\n')[1])
+        checkpoint = checkpoint_payload(requests[1]['messages'])
         self.assertEqual(checkpoint['host_operation_evidence'][0]['status'], 'failed')
         self.assertIn('文件不存在', checkpoint['host_operation_evidence'][0]['result'])
 
@@ -283,7 +283,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result['answer'], 'done')
             self.assertEqual([item['status'] for item in result['tool_trace']], ['completed', 'skipped'])
             # After the first round was checkpointed, the content is still available.
-            checkpoint = json.loads(requests[1]['messages'][0]['content'].split('CONTEXT CHECKPOINT:\n')[1])
+            checkpoint = checkpoint_payload(requests[1]['messages'])
             self.assertIn('"spell": "old"', checkpoint['host_read_snapshots'][0]['numbered_content'])
             self.assertNotIn('"spell"', json.dumps(checkpoint['host_operation_evidence'], ensure_ascii=False))
             second_result = json.loads(requests[2]['messages'][-1]['content'])
