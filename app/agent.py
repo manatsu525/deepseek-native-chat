@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import hashlib
 import os
 import shlex
 import signal
@@ -34,6 +35,7 @@ from .code_runner import _HtmlScripts
 # path keeps its own per-conversation workspace under data/workspaces.
 AGENT_PROJECT_ROOT = Path(os.getenv("AGENT_WORKSPACE_ROOT", os.getenv("AGENT_PROJECT_ROOT", "/home/share")))
 HOST_READ_MAX_BYTES = 8 * 1024 * 1024
+HOST_READ_MAX_CHARS = 60_000
 HOST_WRITE_MAX_BYTES = 32 * 1024 * 1024
 HOST_OUTPUT_MAX_CHARS = 100_000
 HOST_LIST_MAX_ENTRIES = 4_000
@@ -106,7 +108,7 @@ HOST_TOOLS = [
     ),
     _function(
         "host_read_file",
-        "Read a UTF-8 text file from anywhere on the host with line numbers.",
+        "Read a UTF-8 text file from anywhere on the host with line numbers. Large results are truncated; continue from next_start_line when needed.",
         {
             "path": {"type": "string", "description": "Absolute path or path relative to /home/share"},
             "start_line": {"type": "integer", "minimum": 1, "description": "Optional first line"},
@@ -279,9 +281,31 @@ class AgentRuntime:
         if first > len(lines) and lines:
             raise ValueError(f"start_line 超出文件范围（共 {len(lines)} 行）")
         last = min(max(0, last), len(lines))
-        selected = lines[first - 1:last] if lines else []
-        numbered = "\n".join(f"{first + index}|{line}" for index, line in enumerate(selected))
-        return {"path": str(path), "line_count": len(lines), "start_line": first, "end_line": last, "content": numbered}
+        # Bound one read so a large file cannot push the whole Agent history
+        # over the checkpoint high-water mark in a single tool result.
+        rendered: list[str] = []
+        rendered_chars = 0
+        returned_through = min(first - 1, last)
+        for number in range(first, last + 1):
+            numbered_line = f"{number}|{lines[number - 1]}"
+            added = len(numbered_line) + (1 if rendered else 0)
+            if rendered and rendered_chars + added > HOST_READ_MAX_CHARS:
+                break
+            rendered.append(numbered_line)
+            rendered_chars += added
+            returned_through = number
+        result = {
+            "path": str(path),
+            "revision": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "line_count": len(lines),
+            "start_line": first,
+            "end_line": returned_through,
+            "truncated": returned_through < last,
+            "content": "\n".join(rendered),
+        }
+        if result["truncated"]:
+            result["next_start_line"] = returned_through + 1
+        return result
 
     def _host_write_file(self, arguments: dict[str, Any]) -> dict[str, Any]:
         path = self._path(arguments.get("path"))

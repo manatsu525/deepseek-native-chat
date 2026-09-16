@@ -72,7 +72,7 @@ WORKSPACE_TOOLS = [
     ),
     _function(
         "apply_line_edits",
-        "Atomically edit numbered line ranges from one read_file snapshot. Pass the exact returned revision and put every non-overlapping edit in one call. start_line..end_line replaces inclusive lines. To insert before line N use start_line=N,end_line=N-1; to append use start_line=line_count+1,end_line=line_count. Read again before any later edit call.",
+        "Atomically edit numbered line ranges from one read_file snapshot. Pass the exact returned revision and put every non-overlapping edit in one call. start_line..end_line replaces inclusive lines. To insert before line N use start_line=N,end_line=N-1; to append use start_line=line_count+1,end_line=line_count. A successful edit returns the new revision; line numbers after an inserted or removed range shift, so before a later edit re-read only the region you will change, not the whole file.",
         {
             "path": {"type": "string", "description": "Workspace-relative path"},
             "revision": {"type": "string", "description": "Exact opaque revision returned by the latest read_file"},

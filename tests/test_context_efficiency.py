@@ -11,6 +11,7 @@ from app.mimo import custom_auth_headers
 from app import mimo_local
 from app.mimo_local import (
     AGENT_CONTEXT_COMPACT_THRESHOLD,
+    CHECKPOINT_READ_EVIDENCE_CHARS,
     _compact_workspace_call_arguments,
     _final_answer_prompt,
     _maybe_compact_agent_context,
@@ -202,7 +203,7 @@ class ContextEfficiencyTests(unittest.TestCase):
                     "content": "research",
                     "tool_calls": [{"id": "search", "function": {"name": "web_search", "arguments": "{}"}}],
                 },
-                {"role": "tool", "tool_call_id": "search", "content": "result" * 10_000},
+                {"role": "tool", "tool_call_id": "search", "content": "result" * (AGENT_CONTEXT_COMPACT_THRESHOLD // 6 + 1)},
             ]
             conversation = [*base, *read_pair, *latest_pair]
 
@@ -253,7 +254,7 @@ class ContextEfficiencyTests(unittest.TestCase):
             read_key: {
                 "path": "huge.py",
                 "revision": "r",
-                "numbered_content": "x" * 70_000,
+                "numbered_content": "x" * (CHECKPOINT_READ_EVIDENCE_CHARS + 1),
             }
         }
         reads = {read_key}

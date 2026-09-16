@@ -95,9 +95,19 @@ WORKSPACE_ARGUMENT_COMPACT_THRESHOLD = 4096
 # large writes are still compacted, and the high-water checkpoint remains a
 # second safety valve for oversized agent histories.
 FRESH_WRITE_CONTEXT_THRESHOLD = 60_000
-AGENT_CONTEXT_COMPACT_THRESHOLD = 80_000
-CHECKPOINT_READ_EVIDENCE_CHARS = 60_000
+# A single large file read is ~60K characters, so the high-water mark must
+# leave room for several reads plus web evidence; otherwise every round
+# checkpoints and the model loses what it just read.
+AGENT_CONTEXT_COMPACT_THRESHOLD = 160_000
+# Read snapshots (workspace and host) share this budget. It must exceed one
+# maximal read plus JSON overhead or a full read can never survive a checkpoint.
+CHECKPOINT_READ_EVIDENCE_CHARS = 90_000
+HOST_OPERATION_EVIDENCE_CHARS = 60_000
+# Besides the newest exchange, keep recent complete exchanges up to this size.
+CHECKPOINT_RECENT_EXCHANGE_CHARS = 40_000
+REPEATED_READ_WARNING_COUNT = 3
 WORKSPACE_MUTATION_TOOLS = {"write_file", "apply_line_edits", "apply_patch", "apply_patch_batch", "delete_file"}
+HOST_READ_TOOLS = {"host_read_file", "frontend_read_page"}
 FINAL_ANSWER_PROMPT = (
     "CRITICAL FINALIZATION INSTRUCTION: The tool-call budget is completely exhausted. "
     "Requesting another tool cannot succeed. You MUST stop using tools and answer the "
@@ -334,12 +344,150 @@ def _compact_workspace_call_arguments(
 def _remember_host_evidence(evidence: list[dict[str, Any]], name: str, arguments: dict[str, Any], result: str, status: str) -> None:
     """Keep bounded, chronological evidence, not claims about current disk state."""
     item = {"name": name, "arguments": dict(arguments), "result": result, "status": status}
-    if len(json.dumps(item, ensure_ascii=False)) > CHECKPOINT_READ_EVIDENCE_CHARS:
+    if len(json.dumps(item, ensure_ascii=False)) > HOST_OPERATION_EVIDENCE_CHARS:
         item = {"name": name, "path": str(arguments.get("path") or arguments.get("cwd") or ""),
-                "status": status, "evidence_omitted": "Operation exceeded checkpoint capacity; inspect the file if its contents are needed."}
+                "status": status, "evidence_omitted": (
+                    "The operation completed with the recorded status, but its full record exceeded checkpoint capacity. "
+                    "Do not repeat it only to recover this record; inspect just the specific range you still need.")}
     evidence.append(item)
-    while len(evidence) > 30 or len(json.dumps(evidence, ensure_ascii=False)) > CHECKPOINT_READ_EVIDENCE_CHARS:
+    while len(evidence) > 30 or len(json.dumps(evidence, ensure_ascii=False)) > HOST_OPERATION_EVIDENCE_CHARS:
         evidence.pop(0)
+
+
+def _snapshot_range(snapshot: dict[str, Any]) -> tuple[int, int]:
+    """Return the (first, last) returned lines of a workspace or host snapshot."""
+    try:
+        return (
+            int(snapshot.get("from_line", snapshot.get("returned_from_line")) or 0),
+            int(snapshot.get("through_line", snapshot.get("returned_through_line")) or 0),
+        )
+    except (TypeError, ValueError):
+        return 0, 0
+
+
+def _snapshot_covers(snapshot: dict[str, Any], start: int, end: int | None) -> bool:
+    """Whether a kept read snapshot already contains the requested line range."""
+    have_from, have_through = _snapshot_range(snapshot)
+    try:
+        line_count = int(snapshot.get("line_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    want_through = min(line_count, end) if end is not None else line_count
+    if have_from < 1 or want_through < start:
+        return False
+    return have_from <= start and have_through >= want_through
+
+
+def _find_covering_read(
+    evidence: dict[tuple[str, int, int | None], dict[str, Any]],
+    path: str,
+    revision: str | None,
+    start: int,
+    end: int | None,
+) -> dict[str, Any] | None:
+    """Find a kept snapshot containing the range.
+
+    ``revision=None`` is for workspace evidence, which is already purged of a
+    path on every workspace mutation and therefore only holds current content.
+    """
+    for (evidence_path, _, _), snapshot in evidence.items():
+        if evidence_path != path or (revision is not None and snapshot.get("revision") != revision):
+            continue
+        if _snapshot_covers(snapshot, start, end):
+            return snapshot
+    return None
+
+
+def _unchanged_read_result(path: str, revision: str, covering: dict[str, Any], read_count: int) -> str:
+    result: dict[str, Any] = {
+        "ok": True,
+        "path": path,
+        "revision": revision,
+        "unchanged": True,
+        "already_read_lines": list(_snapshot_range(covering)),
+        "message": (
+            "文件自上次读取后未改变，且请求的行范围已包含在之前的读取结果中（见本轮上下文或 CONTEXT CHECKPOINT "
+            "的读取快照），不再重复返回全文。请直接使用已有内容继续修改或回答。"
+        ),
+    }
+    return json.dumps(_with_repeated_read_warning(result, read_count), ensure_ascii=False)
+
+
+def _with_repeated_read_warning(result: dict[str, Any], read_count: int) -> dict[str, Any]:
+    if read_count >= REPEATED_READ_WARNING_COUNT:
+        result["warning"] = (
+            f"这是在文件未发生变化的情况下第 {read_count} 次读取同一文件。重复读取不会带来新信息；"
+            "请立即根据已有内容修改文件，或者结束工具调用并回答用户。"
+        )
+    return result
+
+
+def _host_read_key(arguments: dict[str, Any], path: str) -> tuple[str, int, int | None]:
+    return (
+        path,
+        max(1, int(arguments.get("start_line", 1) or 1)),
+        int(arguments["end_line"]) if arguments.get("end_line") is not None else None,
+    )
+
+
+def _process_host_read(
+    result_text: str,
+    arguments: dict[str, Any],
+    evidence: dict[tuple[str, int, int | None], dict[str, Any]],
+    revisions: dict[str, str],
+    read_counts: dict[str, int],
+) -> tuple[str, str, bool]:
+    """Deduplicate a host read and keep its content as checkpoint evidence.
+
+    Returns the text for the model, a compact record for the operation log,
+    and whether the content was suppressed as an unchanged duplicate.
+    """
+    try:
+        data = json.loads(result_text)
+    except (TypeError, ValueError):
+        return result_text, result_text, False
+    if not isinstance(data, dict) or not data.get("revision") or "content" not in data:
+        return result_text, result_text, False
+    path = str(data.get("path") or "")
+    revision = str(data["revision"])
+    if revisions.get(path) != revision:
+        # The file changed (or is new): older snapshots of it are stale.
+        for key in [key for key in evidence if key[0] == path]:
+            del evidence[key]
+        read_counts[path] = 0
+        revisions[path] = revision
+    read_counts[path] = read_counts.get(path, 0) + 1
+    key = _host_read_key(arguments, path)
+    record = json.dumps(
+        {field: data.get(field) for field in ("path", "revision", "line_count", "start_line", "end_line", "truncated")}
+        | {"content_location": "host_read_snapshots"},
+        ensure_ascii=False,
+    )
+    covering = _find_covering_read(evidence, path, revision, key[1], key[2])
+    if covering is not None:
+        return _unchanged_read_result(path, revision, covering, read_counts[path]), record, True
+    snapshot = {
+        "path": path,
+        "revision": revision,
+        "line_count": data.get("line_count"),
+        "from_line": data.get("start_line") if data.get("content") else 0,
+        "through_line": data.get("end_line"),
+        "truncated": bool(data.get("truncated")),
+        "numbered_content": data.get("content"),
+    }
+    new_from, new_through = _snapshot_range(snapshot)
+    for existing_key in [
+        existing_key
+        for existing_key, existing in evidence.items()
+        if existing_key[0] == path
+        and new_from <= _snapshot_range(existing)[0]
+        and new_through >= _snapshot_range(existing)[1]
+    ]:
+        # Same revision (stale ones were dropped above) and fully contained.
+        del evidence[existing_key]
+    evidence.pop(key, None)
+    evidence[key] = snapshot
+    return result_text, record, False
 
 
 def _tool_result_failure(result: str) -> str:
@@ -363,13 +511,14 @@ def _maybe_compact_agent_context(
     workspace_reads: set[tuple[str, int, int | None]] | None = None,
     refresh_existing: bool = False,
     host_evidence: list[dict[str, Any]] | None = None,
+    host_read_evidence: dict[tuple[str, int, int | None], dict[str, Any]] | None = None,
 ) -> bool:
     """Checkpoint oversized internal tool history without another model call.
 
     This deliberately triggers only at a high-water mark.  Between checkpoints
     history is append-only for prompt-cache hits.  At a checkpoint the durable
     workspace and compact source metadata replace verbose stale tool traffic,
-    while the newest complete assistant/tool exchange is kept verbatim.
+    while the newest complete assistant/tool exchanges are kept verbatim.
     """
     internal = conversation[base_message_count:]
     marker = "\n\nCONTEXT CHECKPOINT:\n"
@@ -379,12 +528,17 @@ def _maybe_compact_agent_context(
         return False
     keep = internal
     if over_high_water:
-        # One assistant message can own many tool results. Keep that entire
-        # exchange, including provider-specific Responses reasoning items.
-        for index in range(len(internal) - 1, -1, -1):
-            if internal[index].get("role") == "assistant":
-                keep = internal[index:]
-                break
+        # One assistant message can own many tool results. Keep entire
+        # exchanges, including provider-specific Responses reasoning items:
+        # always the newest one, plus earlier ones while they stay small.
+        starts = [index for index, message in enumerate(internal) if message.get("role") == "assistant"]
+        if starts:
+            keep_from = starts[-1]
+            for start in reversed(starts[:-1]):
+                if _serialized_chars(internal[start:]) > CHECKPOINT_RECENT_EXCHANGE_CHARS:
+                    break
+                keep_from = start
+            keep = internal[keep_from:]
     files = workspace.list_files() if workspace is not None else []
     source_state = [
         {
@@ -425,6 +579,19 @@ def _maybe_compact_agent_context(
         for read_key in list(workspace_read_evidence):
             if read_key not in preserved_read_keys:
                 del workspace_read_evidence[read_key]
+    host_read_snapshots: list[dict[str, Any]] = []
+    if host_read_evidence:
+        # Shares the read budget with workspace snapshots, newest first. A
+        # snapshot that cannot be kept is forgotten, so a later read of that
+        # range returns real content instead of an "unchanged" pointer.
+        for read_key, snapshot in reversed(list(host_read_evidence.items())):
+            snapshot_chars = len(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")))
+            if evidence_chars + snapshot_chars > CHECKPOINT_READ_EVIDENCE_CHARS:
+                del host_read_evidence[read_key]
+                continue
+            host_read_snapshots.append(dict(snapshot))
+            evidence_chars += snapshot_chars
+        host_read_snapshots.reverse()
     checkpoint = {
         "context_checkpoint": True,
         "instruction": (
@@ -439,10 +606,12 @@ def _maybe_compact_agent_context(
     }
     if host_evidence is not None:
         checkpoint["host_operation_evidence"] = host_evidence
+        checkpoint["host_read_snapshots"] = host_read_snapshots
         checkpoint["instruction"] += (
             " host_operation_evidence preserves historical arguments and results in execution order, including edits. "
-            "Later writes or commands may supersede earlier reads; these are not guaranteed current file snapshots. "
-            "Use the recorded changes to continue completed work. Evidence explicitly marked omitted may require inspection."
+            "host_read_snapshots contain the exact content of host files at the recorded revision; use them instead of "
+            "reading those ranges again. If a later edit or command may have changed a file, re-read only the part you "
+            "need to change. Use the recorded changes to continue completed work instead of re-inspecting finished steps."
         )
     base = [dict(message) for message in conversation[:base_message_count]]
     checkpoint_text = json.dumps(checkpoint, ensure_ascii=False, separators=(",", ":"))
@@ -940,6 +1109,10 @@ async def stream_response(
     workspace_reads: set[tuple[str, int, int | None]] = set()
     workspace_read_evidence: dict[tuple[str, int, int | None], dict[str, Any]] = {}
     host_evidence: list[dict[str, Any]] = []
+    host_read_evidence: dict[tuple[str, int, int | None], dict[str, Any]] = {}
+    host_read_revisions: dict[str, str] = {}
+    # Reads per path since that path last changed; drives the loop warning.
+    read_counts: dict[str, int] = {}
     workspace_searches: set[str] = set()
     workspace_validations: set[tuple[int, str]] = set()
     workspace_list_generations: set[int] = set()
@@ -1616,14 +1789,31 @@ async def stream_response(
                             )
                         elif workspace_name == "read_file" and read_key in workspace_reads:
                             workspace_call_skipped = True
+                            read_counts[normalized_path] = read_counts.get(normalized_path, 0) + 1
                             result_text = json.dumps(
-                                {
-                                    "ok": True,
-                                    "path": normalized_path,
-                                    "unchanged": True,
-                                    "message": "文件自上次读取后未改变；请使用本轮上下文中上一次 read_file 返回的内容，不再重复返回全文。",
-                                },
+                                _with_repeated_read_warning(
+                                    {
+                                        "ok": True,
+                                        "path": normalized_path,
+                                        "unchanged": True,
+                                        "message": "文件自上次读取后未改变；请使用本轮上下文中上一次 read_file 返回的内容，不再重复返回全文。",
+                                    },
+                                    read_counts[normalized_path],
+                                ),
                                 ensure_ascii=False,
+                            )
+                        elif workspace_name == "read_file" and (
+                            covering_read := _find_covering_read(
+                                workspace_read_evidence, normalized_path, None, read_key[1], read_key[2]
+                            )
+                        ) is not None:
+                            workspace_call_skipped = True
+                            read_counts[normalized_path] = read_counts.get(normalized_path, 0) + 1
+                            result_text = _unchanged_read_result(
+                                normalized_path,
+                                str(covering_read.get("revision") or ""),
+                                covering_read,
+                                read_counts[normalized_path],
                             )
                         elif workspace_name == "search_files":
                             search_key = json.dumps(
@@ -1663,10 +1853,12 @@ async def stream_response(
                                 workspace_list_generations.add(workspace_generation)
                             elif workspace_name == "read_file":
                                 workspace_reads.add(read_key)
+                                read_counts[normalized_path] = read_counts.get(normalized_path, 0) + 1
                             elif workspace_name in {"run_python", "check_web_syntax"}:
                                 workspace_validations.add((workspace_generation, validation_key))
                             elif workspace_name in WORKSPACE_MUTATION_TOOLS:
                                 workspace_generation += 1
+                                read_counts.pop(normalized_path, None)
                                 workspace_reads = {item for item in workspace_reads if item[0] != normalized_path}
                                 workspace_read_evidence = {
                                     key: value
@@ -1906,7 +2098,16 @@ async def stream_response(
                         failure = _tool_result_failure(result_text)
                         step["status"] = "failed" if failure else "completed"
                         step["error"] = failure
-                        _remember_host_evidence(host_evidence, name, arguments, result_text, step["status"])
+                        evidence_text = result_text
+                        if name in HOST_READ_TOOLS and not failure:
+                            # Read content lives in host_read_snapshots; the
+                            # chronological log only needs the metadata.
+                            result_text, evidence_text, duplicate_read = _process_host_read(
+                                result_text, arguments, host_read_evidence, host_read_revisions, read_counts
+                            )
+                            if duplicate_read:
+                                step["status"] = "skipped"
+                        _remember_host_evidence(host_evidence, name, arguments, evidence_text, step["status"])
                     else:
                         raise ValueError(f"不支持的工具：{name or '未命名工具'}")
                 except asyncio.CancelledError:
@@ -1988,6 +2189,7 @@ async def stream_response(
                 workspace_reads=workspace_reads,
                 refresh_existing=workspace_generation != generation_before_calls,
                 host_evidence=host_evidence if agent_mode else None,
+                host_read_evidence=host_read_evidence if agent_mode else None,
             )
             if responses_protocol and compacted:
                 response_chain.reset()
