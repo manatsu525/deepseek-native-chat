@@ -1046,6 +1046,7 @@ async def stream_response(
     fetch_count = 0
     tool_rounds_used = 0
     budget_noted_messages: set[int] = set()
+    refused_web_calls = 0
     responses_protocol_enabled = api_protocol == "responses"
     tool_results_start = len(messages) + 1
     round_stats: list[dict[str, Any]] = []
@@ -1094,6 +1095,8 @@ async def stream_response(
     search_limit = max(0, int(web_search_limit)) if agent_mode else max(0, min(MIMO_MAX_SEARCHES, int(web_search_limit)))
     fetch_limit = max(0, int(web_fetch_limit)) if agent_mode else max(0, min(JINA_MAX_FETCHES_PER_RESPONSE, int(web_fetch_limit)))
     web_round_limit = max(0, int(web_tool_round_limit)) if agent_mode else max(0, min(MIMO_MAX_TOOL_ROUNDS, int(web_tool_round_limit)))
+    # A web budget that is empty from the start never lists the tools at all.
+    web_tools_offered = web_enabled and web_round_limit > 0 and (search_limit > 0 or fetch_limit > 0)
     async with (
         httpx.AsyncClient(timeout=api_limits) as api_client,
         search_context as search_client,
@@ -1113,17 +1116,33 @@ async def stream_response(
             round_tools: list[dict[str, Any]] = []
             inkling_patch_bindings: dict[str, tuple[str, str]] = {}
             if not force_final_answer:
-                if web_enabled and tool_rounds_used < min(web_round_limit, role_tool_round_limit) and search_count < search_limit:
+                # Web tools stay listed even after their quota is spent while
+                # other tools remain: removing a tool changes the leading tool
+                # schema and voids the provider's prompt cache for every later
+                # round, so exhausted calls are refused when executed instead.
+                # With nothing else to call (a pure web answer), or after the
+                # model keeps calling refused tools, drop them as before so the
+                # answer is finalized instead of looping.
+                web_budget_spent = tool_rounds_used >= web_round_limit or (
+                    search_count >= search_limit and fetch_count >= fetch_limit
+                )
+                other_tools_listed = (
+                    (workspace is not None and workspace_access != "none") or extra_tools_expected
+                )
+                list_web_tools = (
+                    web_tools_offered
+                    and tool_rounds_used < role_tool_round_limit
+                    and refused_web_calls < 2
+                    and (not web_budget_spent or other_tools_listed)
+                )
+                if list_web_tools:
                     if parallel_mode:
                         round_tools.append(PARALLEL_SEARCH_WEB_TOOL)
                     elif legacy_mode:
                         round_tools.append(SEARCH_WEB_TOOL)
                     else:
                         round_tools.append(KEYLESS_SEARCH_WEB_TOOL)
-                # Keep the initial web-tool schema stable. Public URL safety is
-                # enforced by fetch_webpage itself, so it need not appear only
-                # after the first search result changes runtime state.
-                if web_enabled and tool_rounds_used < min(web_round_limit, role_tool_round_limit) and fetch_count < fetch_limit:
+                if list_web_tools:
                     if parallel_mode:
                         round_tools.append(PARALLEL_FETCH_WEBPAGE_TOOL)
                     elif legacy_mode:
@@ -1143,11 +1162,14 @@ async def stream_response(
             mimo_model = is_mimo_model(model)
             request_messages = conversation
             runtime_note_kind = ""
-            if web_enabled and (search_count >= search_limit or fetch_count >= fetch_limit) and not final_answer_only:
+            web_rounds_spent = tool_rounds_used >= web_round_limit
+            if web_enabled and (search_count >= search_limit or fetch_count >= fetch_limit or web_rounds_spent) and not final_answer_only:
+                search_left = 0 if web_rounds_spent else max(0, search_limit - search_count)
+                fetch_left = 0 if web_rounds_spent else max(0, fetch_limit - fetch_count)
                 budget_note = (
-                    f"Remaining web budget: web_search={max(0, search_limit - search_count)}, "
-                    f"fetch_webpage={max(0, fetch_limit - fetch_count)}. "
-                    "Use only tools listed in this request. Answer when the available evidence is sufficient."
+                    f"Remaining web budget: web_search={search_left}, fetch_webpage={fetch_left}. "
+                    "A web tool with no remaining budget is still listed but will be refused; do not call it. "
+                    "Answer when the available evidence is sufficient."
                 )
                 if conversation and conversation[-1].get("role") == "tool":
                     # Persist it on the newest tool result: the request stays
@@ -1655,6 +1677,12 @@ async def stream_response(
                     # Quota errors must take precedence over argument validation. If
                     # the model calls an exhausted tool with malformed arguments,
                     # tell it to stop using that tool instead of inviting a retry.
+                    # tool_rounds_used already counts this round.
+                    if (is_search or name == "fetch_webpage") and tool_rounds_used > web_round_limit:
+                        raise ToolQuotaExceeded(
+                            f"联网工具（web_search / fetch_webpage）的轮次额度已用完（最多 {web_round_limit} 轮），"
+                            "本回答中不能再调用；列表中的其他工具仍可继续使用，资料足够时请直接回答。"
+                        )
                     if is_search and search_count >= search_limit:
                         raise ToolQuotaExceeded(
                             _tool_quota_message(
@@ -2072,6 +2100,7 @@ async def stream_response(
                     step["error"] = str(exc)[:1000]
                     if isinstance(exc, ToolQuotaExceeded):
                         result_text = str(exc)[:1000]
+                        refused_web_calls += 1
                     elif is_search:
                         engine = (
                             "Parallel Search MCP"

@@ -190,6 +190,44 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("参数为空", error)
         self.assertIn("拆成更小的 edit_file", error)
 
+    async def test_web_tools_stay_listed_after_web_rounds_in_coding(self):
+        class NoWeb:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            async def call_tool(self, *_):
+                raise AssertionError("refused web calls must not reach the network")
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "web-rounds")
+            workspace.root = Path(directory)
+            workspace.write_file("a.js", "x();\n")
+            rounds = [tool_round(f"l{n}", "list_files", {}) for n in range(6)]
+            rounds += [
+                tool_round("s1", "web_search", {"objective": "o", "search_queries": ["q"]}),
+                tool_round("s2", "web_search", {"objective": "o", "search_queries": ["q2"]}),
+                tool_round("l7", "list_files", {}),
+                answer_round("done"),
+            ]
+            with patch.object(mimo_local, "ParallelMCPClient", NoWeb):
+                result, requests = await run_stream(workspace, rounds, web_enabled=True)
+        stats = result["round_stats"]
+        # Same tool schema through the refused calls, then web tools are
+        # dropped after two refusals instead of looping on them.
+        self.assertEqual(len({item["tools_hash"] for item in stats[:8]}), 1)
+        self.assertNotEqual(stats[8]["tools_hash"], stats[0]["tools_hash"])
+        names = lambda request: {tool["function"]["name"] for tool in request["tools"]}  # noqa: E731
+        self.assertIn("web_search", names(requests[7]))
+        self.assertNotIn("web_search", names(requests[8]))
+        self.assertIn("edit_file", names(requests[8]))
+        refused = [item for item in result["tool_trace"] if item["name"] == "web_search"]
+        self.assertEqual([item["status"] for item in refused], ["failed", "failed"])
+        self.assertIn("轮次额度已用完", refused[0]["error"])
+        self.assertIn("web_search=0, fetch_webpage=0", json.dumps(requests[7], ensure_ascii=False))
+
     async def test_file_written_by_the_model_is_not_read_back(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = ConversationWorkspace(1, "write-flow")

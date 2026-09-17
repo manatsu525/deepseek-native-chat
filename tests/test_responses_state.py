@@ -85,14 +85,20 @@ class ResponsesStateTests(unittest.IsolatedAsyncioTestCase):
                                           settings={"web_tool_backend": "parallel"})
         self.assertEqual(requests, ["web_search"] * 3 + ["web_fetch"])
         self.assertEqual(result["answer"], "完成")
+        # The tool schema stays identical so the cached prefix survives; the
+        # spent search tool is refused when called instead of being removed.
+        for payload in transport.payloads[1:5]:
+            self.assertEqual(payload["tools"], transport.payloads[0]["tools"])
+        self.assertEqual([item["name"] for item in transport.payloads[0]["tools"]], ["web_search", "fetch_webpage"])
         for payload in transport.payloads[3:5]:
-            self.assertEqual([item["name"] for item in payload["tools"]], ["fetch_webpage"])
             self.assertIn("web_search=0, fetch_webpage=3", json.dumps(payload, ensure_ascii=False))
         # After a tool round the budget note rides on the tool output, so the
         # leading instructions (and their cached prefix) stay unchanged.
         self.assertNotIn("web_search=0", transport.payloads[3]["instructions"])
         self.assertEqual(transport.payloads[3]["instructions"], transport.payloads[0]["instructions"])
-        self.assertTrue(all(item["status"] == "completed" for item in result["tool_trace"]))
+        self.assertEqual([item["status"] for item in result["tool_trace"]],
+                         ["completed", "completed", "completed", "failed", "completed"])
+        self.assertIn("fetch_webpage 仍然可用", result["tool_trace"][3]["error"])
 
     async def test_completed_snapshot_supplies_calls_and_final_text(self):
         events = call("resp_tool")[-1:]
