@@ -58,7 +58,6 @@ from .mimo import (
     is_mimo_model,
 )
 from .parallel_mcp import ParallelMCPClient
-from .opencode_dsml_fallback import DsmlStreamBuffer, applies_to as dsml_fallback_applies, recover_tool_calls
 from .minimax_tool_fallback import (
     MiniMaxStreamBuffer,
     applies_to as minimax_fallback_applies,
@@ -1141,11 +1140,6 @@ async def stream_response(
         for item in extra_tools
         if isinstance(item, dict)
     }
-    dsml_fallback_active = dsml_fallback_applies(
-        base_url,
-        model,
-        bool(config.get("dsml_fallback_enabled", True)),
-    )
     minimax_fallback_active = minimax_fallback_applies(model)
     inkling_compat_active = inkling_compat_applies(model)
     web_tool_backend = str(config.get("web_tool_backend") or "parallel")
@@ -1434,8 +1428,6 @@ async def stream_response(
             markup_stream = (
                 InklingStreamBuffer()
                 if inkling_compat_active
-                else DsmlStreamBuffer()
-                if dsml_fallback_active
                 else MiniMaxStreamBuffer()
                 if minimax_fallback_active
                 else None
@@ -1643,13 +1635,6 @@ async def stream_response(
                         response_chain.disable("upstream_tool_arguments_required_reassembly")
             if markup_stream is not None:
                 round_preview += markup_stream.flush()
-            if dsml_fallback_active:
-                round_answer, calls = recover_tool_calls(
-                    round_answer,
-                    calls,
-                    id_prefix=f"dsml-{round_number + 1}",
-                    tools_available=bool(round_tools),
-                )
             if minimax_fallback_active:
                 round_answer, calls = recover_minimax_tool_calls(
                     round_answer,

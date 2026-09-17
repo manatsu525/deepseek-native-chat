@@ -90,7 +90,6 @@ DEFAULT_SETTINGS = {
     "reasoning_effort": "high",
     "reasoning_effort_enabled": True,
     "lowest_price_aggregators": [],
-    "dsml_fallback_enabled": False,
     "text_replace_tool": False,
     "max_completion_tokens": 65536,
     "temperature": 1.0,
@@ -152,14 +151,6 @@ def _settings(value: dict[str, Any] | None) -> dict[str, Any]:
     return result
 
 
-def is_opencode_base_url(base_url: str) -> bool:
-    try:
-        hostname = (urlsplit(str(base_url or "")).hostname or "").casefold()
-    except ValueError:
-        return False
-    return hostname == "opencode.ai" or hostname.endswith(".opencode.ai")
-
-
 def custom_auth_headers(
     api_key: str,
     *,
@@ -180,13 +171,6 @@ def custom_auth_headers(
     }
     if stream:
         headers["Accept"] = "text/event-stream"
-    if is_opencode_base_url(base_url):
-        headers["User-Agent"] = "opencode/1.18.16"
-        if conversation_id:
-            # OpenCode uses this value to keep each chat's provider-side
-            # session separate. Do not send an empty value for model-list or
-            # connection-test requests, which have no conversation context.
-            headers["x-opencode-session"] = str(conversation_id)[:128]
     try:
         hostname = (urlsplit(str(base_url or "")).hostname or "").casefold()
     except ValueError:

@@ -99,7 +99,6 @@ class SharedResourceAccessTests(unittest.TestCase):
             "reasoning_effort": "high",
             "reasoning_effort_enabled": True,
             "lowest_price_aggregators": [],
-            "dsml_fallback_enabled": False,
             "max_completion_tokens": 4096,
             "temperature": 1,
             "top_p": 0.95,

@@ -126,7 +126,6 @@ class CustomSettingsBody(BaseModel):
     reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] = DEFAULT_REASONING_EFFORT
     reasoning_effort_enabled: bool = True
     lowest_price_aggregators: list[Literal["openrouter", "vercel"]] = Field(default_factory=list, max_length=2)
-    dsml_fallback_enabled: bool = False
     text_replace_tool: bool = False
     max_completion_tokens: int = Field(default=65536, ge=256, le=MIMO_MAX_COMPLETION_TOKENS)
     temperature: float = Field(default=1.0, ge=0, le=1.5)

@@ -109,7 +109,6 @@ class CustomModelSettingsTests(unittest.TestCase):
             "reasoning_effort": effort,
             "reasoning_effort_enabled": True,
             "lowest_price_aggregators": list(aggregators),
-            "dsml_fallback_enabled": False,
             "max_completion_tokens": 8192,
             "temperature": temperature,
             "top_p": 0.9,
@@ -160,7 +159,8 @@ class CustomModelSettingsTests(unittest.TestCase):
         self.assertEqual(provider["model_settings"]["model-a"]["temperature"], 1.1)
         self.assertEqual(provider["model_settings"]["model-b"]["temperature"], 0.4)
         self.assertEqual(provider["model_settings"]["model-c"]["temperature"], 1.0)
-        self.assertFalse(provider["model_settings"]["model-c"]["dsml_fallback_enabled"])
+        # Settings saved by older releases may still carry the removed DSML flag.
+        self.assertNotIn("dsml_fallback_enabled", provider["model_settings"]["model-a"])
 
     def test_job_receives_only_the_selected_models_settings(self) -> None:
         provider_id = self.add_legacy_provider()
