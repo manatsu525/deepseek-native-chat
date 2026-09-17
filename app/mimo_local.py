@@ -80,6 +80,7 @@ from .workspace import (
     WORKSPACE_SYSTEM_PROMPT,
     WORKSPACE_TOOL_NAMES,
     ConversationWorkspace,
+    normalize_file_tool_arguments,
     numbered_window,
 )
 
@@ -1248,6 +1249,7 @@ async def stream_response(
             round_answer = ""
             round_preview = ""
             round_reasoning = ""
+            round_finish = ""
             round_usage: dict[str, Any] = {}
             anthropic_usage: dict[str, Any] = {}
             anthropic_thinking_blocks: dict[int, dict[str, Any]] = {}
@@ -1295,6 +1297,9 @@ async def stream_response(
                     raw_usage = data.get("usage")
                     if event_type in {"response.completed", "response.incomplete"}:
                         completed_response = data.get("response") or {}
+                        if event_type == "response.incomplete":
+                            reason = (completed_response.get("incomplete_details") or {}).get("reason")
+                            round_finish = f"incomplete:{reason or 'unknown'}"
                         raw_usage = completed_response.get("usage") or raw_usage
                         if responses_protocol:
                             for output_index, output_item in enumerate(completed_response.get("output") or []):
@@ -1310,6 +1315,8 @@ async def stream_response(
                                 )
                     if messages_protocol and event_type == "message_start":
                         raw_usage = (data.get("message") or {}).get("usage") or raw_usage
+                    if messages_protocol and event_type == "message_delta":
+                        round_finish = str((data.get("delta") or {}).get("stop_reason") or round_finish)
                     if isinstance(raw_usage, dict):
                         if messages_protocol:
                             anthropic_usage.update(raw_usage)
@@ -1384,6 +1391,8 @@ async def stream_response(
                         round_answer += delta_content
                         if markup_stream is not None:
                             round_preview += markup_stream.feed(delta_content)
+                        if choice.get("finish_reason"):
+                            round_finish = str(choice["finish_reason"])
                         delta_reasoning = delta.get("reasoning_content") or delta.get("reasoning")
                         round_reasoning += str(delta_reasoning or "")
                         if message.get("content") and not delta.get("content"):
@@ -1417,6 +1426,8 @@ async def stream_response(
                     "output_tokens": int(round_usage.get("output_tokens") or 0),
                 }
             )
+            if round_finish:
+                round_stat["finish_reason"] = round_finish
             if responses_protocol and response_chain.disabled and response_chain.reason:
                 round_stat["chain_state"] = response_chain.reason
             round_stats.append(round_stat)
@@ -1686,9 +1697,12 @@ async def stream_response(
                                     fetch_limit=fetch_limit,
                                 )
                             )
-                    arguments = json.loads(str(function.get("arguments") or "{}"))
+                    raw_arguments_text = str(function.get("arguments") or "")
+                    arguments = json.loads(raw_arguments_text or "{}")
                     if not isinstance(arguments, dict):
                         raise ValueError("工具参数必须是 JSON 对象")
+                    received_keys = sorted(arguments)
+                    arguments = normalize_file_tool_arguments(workspace_name if is_workspace else name, arguments)
                     if is_extra:
                         # Keep the live trace useful for host operations without
                         # copying complete file contents or command arguments.
@@ -1733,7 +1747,20 @@ async def stream_response(
                             or (key in non_empty_arguments and str(arguments[key]).strip() == "")
                         ]
                         if missing:
-                            raise ValueError(f"{workspace_name} 缺少必填参数：{', '.join(missing)}。请严格按工具 JSON Schema 重新调用，不要省略字段")
+                            # Say what actually arrived: an empty object usually
+                            # means the provider cut off a very long call.
+                            step["received_argument_keys"] = received_keys[:20]
+                            step["received_argument_chars"] = len(raw_arguments_text)
+                            received = "、".join(received_keys[:20]) if received_keys else "无（参数为空）"
+                            hint = (
+                                "参数为空，通常是一次调用内容过长被截断；请把修改拆成更小的 edit_file 调用，每次只包含必要的片段。"
+                                if not received_keys
+                                else "请严格按工具 JSON Schema 使用字段名重新调用，不要省略字段。"
+                            )
+                            raise ValueError(
+                                f"{workspace_name} 缺少必填参数：{', '.join(missing)}（收到的字段：{received}；"
+                                f"参数长度 {len(raw_arguments_text)} 字符）。{hint}"
+                            )
                         normalized_path = ""
                         if "path" in arguments:
                             _, normalized_path = workspace.resolve(arguments["path"], allow_root=workspace_name == "search_files")
@@ -2079,7 +2106,7 @@ async def stream_response(
                     "status": step["status"],
                     "error": step["error"],
                 }
-                for field in ("cached", "quota_counted"):
+                for field in ("cached", "quota_counted", "received_argument_keys", "received_argument_chars"):
                     if field in step:
                         trace_item[field] = step[field]
                 if is_workspace and workspace_name == "read_file":

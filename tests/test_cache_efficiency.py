@@ -169,6 +169,27 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("edit_file", tool_names)
         self.assertNotIn("apply_line_edits", tool_names)
 
+    async def test_other_argument_conventions_and_empty_arguments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "aliases")
+            workspace.root = Path(directory)
+            workspace.write_file("a.js", "let x = 1;\n")
+            result, requests = await run_stream(workspace, [
+                tool_round("e0", "edit_file", {}),
+                tool_round("e1", "edit_file", {"file_path": "a.js", "old_string": "x = 1", "new_string": "x = 2"}),
+                tool_round("e2", "edit_file", {"arguments": {"path": "a.js", "changes": [
+                    {"old": "x = 2", "new": "x = 3"}]}}),
+                answer_round("done"),
+            ])
+            self.assertEqual(workspace.read_file("a.js"), "let x = 3;\n")
+        statuses = [(item["name"], item["status"]) for item in result["tool_trace"]]
+        self.assertEqual(statuses, [("edit_file", "failed"), ("edit_file", "completed"), ("edit_file", "completed")])
+        failed = result["tool_trace"][0]
+        self.assertEqual((failed["received_argument_keys"], failed["received_argument_chars"]), ([], 2))
+        error = [m["content"] for m in requests[-1]["messages"] if m["role"] == "tool"][0]
+        self.assertIn("参数为空", error)
+        self.assertIn("拆成更小的 edit_file", error)
+
     async def test_file_written_by_the_model_is_not_read_back(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = ConversationWorkspace(1, "write-flow")

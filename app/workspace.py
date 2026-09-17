@@ -286,6 +286,75 @@ def numbered_window(content: str, start_line: Any = None, max_chars: int = MAX_R
     return result
 
 
+_PATH_ALIASES = ("file_path", "filepath", "file", "filename")
+_EDITS_ALIASES = ("changes", "replacements", "patches")
+_OLD_ALIASES = ("old_string", "old", "search", "find")
+_NEW_ALIASES = ("new_string", "new", "replace", "replacement")
+_CONTENT_ALIASES = ("contents", "text", "code")
+FILE_TOOL_NAMES = {
+    "read_file", "write_file", "edit_file", "delete_file", "run_python", "check_web_syntax",
+    "host_read_file", "host_write_file", "host_edit_file", "host_delete_path",
+    "frontend_read_page", "frontend_write_page", "frontend_validate_page",
+}
+
+
+def _first_alias(source: dict[str, Any], aliases: tuple[str, ...]) -> Any:
+    return next((source[key] for key in aliases if key in source), None)
+
+
+def normalize_file_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Accept common argument spellings from other agent tool conventions.
+
+    Models trained on other tools often send file_path, old_string/new_string,
+    a single top-level edit, or wrap everything in one object. Only missing
+    canonical fields are filled in; canonical fields always win.
+    """
+    if name not in FILE_TOOL_NAMES or not isinstance(arguments, dict):
+        return arguments
+    result = dict(arguments)
+    if len(result) == 1:
+        (only,) = result.values()
+        if isinstance(only, str):
+            try:
+                only = json.loads(only)
+            except (TypeError, ValueError):
+                pass
+        if isinstance(only, dict) and ({"path", "edits", "content"} | set(_PATH_ALIASES)) & set(only):
+            result = dict(only)
+    if "path" not in result:
+        alias = _first_alias(result, _PATH_ALIASES)
+        if alias is not None:
+            result["path"] = alias
+    if name in {"write_file", "host_write_file", "frontend_write_page"} and "content" not in result:
+        alias = _first_alias(result, _CONTENT_ALIASES)
+        if alias is not None:
+            result["content"] = alias
+    if name in {"edit_file", "host_edit_file"}:
+        edits = result.get("edits", _first_alias(result, _EDITS_ALIASES))
+        if isinstance(edits, str):
+            try:
+                edits = json.loads(edits)
+            except (TypeError, ValueError):
+                pass
+        if isinstance(edits, dict):
+            edits = [edits]
+        if edits is None and ("old_text" in result or _first_alias(result, _OLD_ALIASES) is not None):
+            edits = [{key: result[key] for key in ("old_text", "new_text", "replace_all", *_OLD_ALIASES, *_NEW_ALIASES) if key in result}]
+        if isinstance(edits, list):
+            normalized = []
+            for edit in edits:
+                if isinstance(edit, dict):
+                    edit = dict(edit)
+                    if "old_text" not in edit and _first_alias(edit, _OLD_ALIASES) is not None:
+                        edit["old_text"] = _first_alias(edit, _OLD_ALIASES)
+                    if "new_text" not in edit and _first_alias(edit, _NEW_ALIASES) is not None:
+                        edit["new_text"] = _first_alias(edit, _NEW_ALIASES)
+                    edit = {key: edit[key] for key in ("old_text", "new_text", "replace_all") if key in edit}
+                normalized.append(edit)
+            result["edits"] = normalized
+    return result
+
+
 def edit_list(name: str, arguments: dict[str, Any]) -> Any:
     """Normalize edit_file and legacy single/batch patch arguments to an edit list."""
     if name == "apply_patch_batch":
