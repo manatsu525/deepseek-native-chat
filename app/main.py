@@ -651,13 +651,22 @@ async def _execute_job(job_id: str) -> None:
     db.update_job(job_id, status="running", error="", stop_requested=0)
     last_write = 0.0
     attachment_lock_acquired = False
+    # Latest tool trace/round stats, kept so failed or stopped answers can be
+    # diagnosed the same way as completed ones.
+    live_diagnostics: dict[str, Any] = {}
 
     def stopped() -> bool:
         state = db.one("SELECT stop_requested FROM jobs WHERE id=?", (job_id,))
         return not state or bool(state["stop_requested"])
 
+    def diagnostics_meta() -> dict[str, Any]:
+        return {key: value for key, value in live_diagnostics.items() if value}
+
     async def update(state: dict[str, Any]) -> None:
         nonlocal last_write
+        for key in ("tool_trace", "round_stats"):
+            if key in state:
+                live_diagnostics[key] = list(state[key])
         state_evidence = state.get("web_evidence") or []
         if state_evidence:
             db.upsert_web_evidence(
@@ -809,6 +818,7 @@ async def _execute_job(job_id: str) -> None:
                 "usage": db.decode(partial.get("usage_json", "{}"), {}),
                 "agents": partial_agents,
                 "workspace_files": agent_workspace.list_files() if agent_job else job_workspace.list_files(),
+                **diagnostics_meta(),
             }
             db.run(
                 "INSERT INTO messages(conversation_id, role, content, meta_json, created_at) VALUES(?,?,?,?,?)",
@@ -837,6 +847,7 @@ async def _execute_job(job_id: str) -> None:
             "usage": db.decode(partial.get("usage_json", "{}"), {}),
             "agents": db.decode(partial.get("agents_json", "[]"), []),
             "workspace_files": agent_workspace.list_files() if agent_job else job_workspace.list_files(),
+            **diagnostics_meta(),
         }
         failed_at = now()
         with db.lock, db.connect() as connection:

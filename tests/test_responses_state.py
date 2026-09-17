@@ -145,6 +145,17 @@ class ResponsesStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("host_check", [item["name"] for item in transport.payloads[1]["tools"]])
         self.assertIn("Available tools", transport.payloads[1]["instructions"])
 
+    async def test_answer_only_round_sends_no_tool_choice(self):
+        # Some gateways accept only tool_choice="auto"; the forced final
+        # answer after the tool budget must not send "none".
+        transport = Transport([call("resp_tool"), final()])
+        result = await self.run_stream(transport, max_tool_rounds=1)
+        self.assertEqual(result["answer"], "完成")
+        self.assertEqual(transport.payloads[0]["tool_choice"], "auto")
+        self.assertNotIn("tool_choice", transport.payloads[1])
+        self.assertNotIn("tools", transport.payloads[1])
+        self.assertTrue(result["round_stats"][1]["final_only"])
+
     async def run_stream(self, transport, **kwargs):
         async def update(state):
             pass

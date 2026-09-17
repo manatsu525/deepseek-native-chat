@@ -1375,9 +1375,9 @@ async def stream_response(
                 if round_tools:
                     payload["tools"] = _responses_tools(round_tools)
                     payload["tool_choice"] = "auto"
-                elif final_answer_only:
-                    payload["tools"] = []
-                    payload["tool_choice"] = "none"
+                # Answer-only rounds send no tools at all, like Chat Completions.
+                # Some gateways reject tool_choice="none" (only "auto" is
+                # accepted), which used to fail the whole job at finalization.
             elif messages_protocol:
                 system_value, anthropic_history = _anthropic_messages(request_messages)
                 payload = {
@@ -2327,6 +2327,8 @@ async def stream_response(
                         "usage": usage,
                         "sources": list(sources.values()),
                         "web_evidence": web_evidence,
+                        "tool_trace": tool_trace,
+                        "round_stats": round_stats,
                     }
                 )
             if responses_protocol:
