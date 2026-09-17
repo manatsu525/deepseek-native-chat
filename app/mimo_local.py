@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import uuid
+from pathlib import Path
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any
@@ -18,7 +19,8 @@ from curl_cffi import requests as curl_requests
 from .custom_tool_normalization import normalize_tool_calls
 from .custom_request import apply_request_overrides, expand_advanced_request
 from .responses_state import ResponsesState
-from .agent import AGENT_SYSTEM_PROMPT
+from .agent import AGENT_SYSTEM_PROMPT, HOST_READ_MAX_CHARS, AgentRuntime
+from .file_knowledge import FileKnowledge
 from .keyless_web import (
     KEYLESS_CUSTOM_SYSTEM_PROMPT,
     KEYLESS_FETCH_WEBPAGE_TOOL,
@@ -75,10 +77,10 @@ from .workspace import (
     EDIT_WORKSPACE_TOOL_NAMES,
     READ_ONLY_WORKSPACE_SYSTEM_PROMPT,
     READ_ONLY_WORKSPACE_TOOL_NAMES,
-    TEXT_REPLACE_SYSTEM_PROMPT,
     WORKSPACE_SYSTEM_PROMPT,
     WORKSPACE_TOOL_NAMES,
     ConversationWorkspace,
+    numbered_window,
 )
 
 
@@ -96,20 +98,23 @@ WORKSPACE_ARGUMENT_COMPACT_THRESHOLD = 4096
 # large writes are still compacted, and the high-water checkpoint remains a
 # second safety valve for oversized agent histories.
 FRESH_WRITE_CONTEXT_THRESHOLD = 60_000
-# A single large file read is ~60K characters, so the high-water mark must
-# leave room for several reads plus web evidence; otherwise every round
+# A single large file read is up to ~100K characters, so the high-water mark must
+# leave room for a full read plus web evidence; otherwise every round
 # checkpoints and the model loses what it just read.
 AGENT_CONTEXT_COMPACT_THRESHOLD = 160_000
 # Read snapshots (workspace and host) share this budget. It must exceed one
 # maximal read plus JSON overhead or a full read can never survive a checkpoint.
-CHECKPOINT_READ_EVIDENCE_CHARS = 90_000
+CHECKPOINT_READ_EVIDENCE_CHARS = 110_000
 HOST_OPERATION_EVIDENCE_CHARS = 60_000
 # Besides the newest exchange, keep recent complete exchanges up to this size.
 CHECKPOINT_RECENT_EXCHANGE_CHARS = 40_000
-REPEATED_READ_WARNING_COUNT = 3
-WORKSPACE_MUTATION_TOOLS = {"write_file", "apply_line_edits", "apply_patch", "apply_patch_batch", "replace_text", "delete_file"}
+WORKSPACE_MUTATION_TOOLS = {"write_file", "edit_file", "apply_patch", "apply_patch_batch", "replace_text", "delete_file"}
+WORKSPACE_EDIT_TOOLS = {"edit_file", "apply_patch", "apply_patch_batch", "replace_text"}
 HOST_READ_TOOLS = {"host_read_file", "frontend_read_page"}
-HOST_FILE_MUTATION_TOOLS = {"host_write_file", "host_apply_patch", "host_delete_path", "frontend_write_page"}
+HOST_FILE_MUTATION_TOOLS = {"host_write_file", "host_edit_file", "host_apply_patch", "host_delete_path", "frontend_write_page"}
+HOST_WRITE_TOOLS = {"host_write_file", "frontend_write_page"}
+# Unadvertised older host tool names that are still executed when emitted.
+HOST_LEGACY_TOOL_ALIASES = {"host_apply_patch": "host_edit_file"}
 CONTEXT_CHECKPOINT_MARKER = "\n\nCONTEXT CHECKPOINT:\n"
 RUNTIME_NOTE_MARKER = "\n\n[Runtime note] "
 USER_CONTEXT_MARKER = "\n\n---\n[Context supplied by the application, not written by the user]\n"
@@ -335,13 +340,8 @@ def _compact_workspace_call_arguments(
         compact.update({"old_text": "[omitted]", "new_text": "[omitted]"})
     elif name == "apply_patch_batch":
         compact["patches"] = [{"old_text": "[omitted]", "new_text": "[omitted]"}]
-    elif name == "apply_line_edits":
-        compact.update(
-            {
-                "revision": "[consumed]",
-                "edits": [{"start_line": 1, "end_line": 0, "new_text": "[omitted]"}],
-            }
-        )
+    elif name == "edit_file":
+        compact["edits"] = [{"old_text": "[omitted]", "new_text": "[omitted]"}]
     function["arguments"] = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
     return True
 
@@ -364,162 +364,36 @@ def _short_hash(value: Any) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
 
 
-def _forget_host_reads(
-    result_text: str,
-    evidence: dict[tuple[str, int, int | None], dict[str, Any]],
-    revisions: dict[str, str],
-    read_counts: dict[str, int],
-) -> None:
-    """Drop read snapshots of a host path (or directory tree) that was just changed."""
+def _json_object(text: str) -> dict[str, Any]:
     try:
-        path = str((json.loads(result_text) or {}).get("path") or "")
-    except (TypeError, ValueError, AttributeError):
-        return
-    if not path:
-        return
-    prefix = path.rstrip("/") + "/"
-    stale = lambda candidate: candidate == path or candidate.startswith(prefix)  # noqa: E731
-    for key in [key for key in evidence if stale(key[0])]:
-        del evidence[key]
-    for mapping in (revisions, read_counts):
-        for key in [key for key in mapping if stale(key)]:
-            del mapping[key]
-
-
-def _snapshot_range(snapshot: dict[str, Any]) -> tuple[int, int]:
-    """Return the (first, last) returned lines of a workspace or host snapshot."""
-    try:
-        return (
-            int(snapshot.get("from_line", snapshot.get("returned_from_line")) or 0),
-            int(snapshot.get("through_line", snapshot.get("returned_through_line")) or 0),
-        )
+        value = json.loads(text)
     except (TypeError, ValueError):
-        return 0, 0
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
-def _snapshot_covers(snapshot: dict[str, Any], start: int, end: int | None) -> bool:
-    """Whether a kept read snapshot already contains the requested line range."""
-    have_from, have_through = _snapshot_range(snapshot)
-    try:
-        line_count = int(snapshot.get("line_count") or 0)
-    except (TypeError, ValueError):
-        return False
-    want_through = min(line_count, end) if end is not None else line_count
-    if have_from < 1 or want_through < start:
-        return False
-    return have_from <= start and have_through >= want_through
-
-
-def _find_covering_read(
-    evidence: dict[tuple[str, int, int | None], dict[str, Any]],
-    path: str,
-    revision: str | None,
-    start: int,
-    end: int | None,
-) -> dict[str, Any] | None:
-    """Find a kept snapshot containing the range.
-
-    ``revision=None`` is for workspace evidence, which is already purged of a
-    path on every workspace mutation and therefore only holds current content.
-    """
-    for (evidence_path, _, _), snapshot in evidence.items():
-        if evidence_path != path or (revision is not None and snapshot.get("revision") != revision):
-            continue
-        if _snapshot_covers(snapshot, start, end):
-            return snapshot
-    return None
-
-
-def _unchanged_read_result(path: str, revision: str, covering: dict[str, Any], read_count: int) -> str:
-    result: dict[str, Any] = {
-        "ok": True,
+def _host_read_snapshot(path: str) -> dict[str, Any] | None:
+    """Read a host file the same way host_read_file does (for own-change tracking)."""
+    target = Path(path)
+    if not target.is_file():
+        return None
+    content = AgentRuntime._read_host_text(target)
+    return {
         "path": path,
-        "revision": revision,
-        "unchanged": True,
-        "already_read_lines": list(_snapshot_range(covering)),
-        "message": (
-            "文件自上次读取后未改变，且请求的行范围已包含在之前的读取结果中（见本轮上下文或 CONTEXT CHECKPOINT "
-            "的读取快照），不再重复返回全文。请直接使用已有内容继续修改或回答。"
-        ),
+        "revision": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        **numbered_window(content, None, HOST_READ_MAX_CHARS),
     }
-    return json.dumps(_with_repeated_read_warning(result, read_count), ensure_ascii=False)
 
 
-def _with_repeated_read_warning(result: dict[str, Any], read_count: int) -> dict[str, Any]:
-    if read_count >= REPEATED_READ_WARNING_COUNT:
-        result["warning"] = (
-            f"这是在文件未发生变化的情况下第 {read_count} 次读取同一文件。重复读取不会带来新信息；"
-            "请立即根据已有内容修改文件，或者结束工具调用并回答用户。"
-        )
-    return result
+def _host_revision(path: str) -> str | None:
+    snapshot = _host_read_snapshot(path)
+    return str(snapshot["revision"]) if snapshot else None
 
 
-def _host_read_key(arguments: dict[str, Any], path: str) -> tuple[str, int, int | None]:
-    return (
-        path,
-        max(1, int(arguments.get("start_line", 1) or 1)),
-        int(arguments["end_line"]) if arguments.get("end_line") is not None else None,
-    )
-
-
-def _process_host_read(
-    result_text: str,
-    arguments: dict[str, Any],
-    evidence: dict[tuple[str, int, int | None], dict[str, Any]],
-    revisions: dict[str, str],
-    read_counts: dict[str, int],
-) -> tuple[str, str, bool]:
-    """Deduplicate a host read and keep its content as checkpoint evidence.
-
-    Returns the text for the model, a compact record for the operation log,
-    and whether the content was suppressed as an unchanged duplicate.
-    """
-    try:
-        data = json.loads(result_text)
-    except (TypeError, ValueError):
-        return result_text, result_text, False
-    if not isinstance(data, dict) or not data.get("revision") or "content" not in data:
-        return result_text, result_text, False
-    path = str(data.get("path") or "")
-    revision = str(data["revision"])
-    if revisions.get(path) != revision:
-        # The file changed (or is new): older snapshots of it are stale.
-        for key in [key for key in evidence if key[0] == path]:
-            del evidence[key]
-        read_counts[path] = 0
-        revisions[path] = revision
-    read_counts[path] = read_counts.get(path, 0) + 1
-    key = _host_read_key(arguments, path)
-    record = json.dumps(
-        {field: data.get(field) for field in ("path", "revision", "line_count", "start_line", "end_line", "truncated")}
-        | {"content_location": "host_read_snapshots"},
-        ensure_ascii=False,
-    )
-    covering = _find_covering_read(evidence, path, revision, key[1], key[2])
-    if covering is not None:
-        return _unchanged_read_result(path, revision, covering, read_counts[path]), record, True
-    snapshot = {
-        "path": path,
-        "revision": revision,
-        "line_count": data.get("line_count"),
-        "from_line": data.get("start_line") if data.get("content") else 0,
-        "through_line": data.get("end_line"),
-        "truncated": bool(data.get("truncated")),
-        "numbered_content": data.get("content"),
-    }
-    new_from, new_through = _snapshot_range(snapshot)
-    for existing_key in [
-        existing_key
-        for existing_key, existing in evidence.items()
-        if existing_key[0] == path
-        and new_from <= _snapshot_range(existing)[0]
-        and new_through >= _snapshot_range(existing)[1]
-    ]:
-        # Same revision (stale ones were dropped above) and fully contained.
-        del evidence[existing_key]
-    evidence.pop(key, None)
-    evidence[key] = snapshot
-    return result_text, record, False
+def _read_record(data: dict[str, Any]) -> str:
+    """Operation-log entry for a read; the content itself lives in file_snapshots."""
+    fields = ("path", "revision", "line_count", "from_line", "through_line", "truncated", "unchanged")
+    return json.dumps({key: data[key] for key in fields if key in data}, ensure_ascii=False)
 
 
 def _tool_result_failure(result: str) -> str:
@@ -539,11 +413,9 @@ def _maybe_compact_agent_context(
     workspace: ConversationWorkspace | None,
     sources: dict[str, dict[str, str]],
     tool_trace: list[dict[str, Any]],
-    workspace_read_evidence: dict[tuple[str, int, int | None], dict[str, Any]] | None = None,
-    workspace_reads: set[tuple[str, int, int | None]] | None = None,
+    knowledge: FileKnowledge | None = None,
     refresh_existing: bool = False,
     host_evidence: list[dict[str, Any]] | None = None,
-    host_read_evidence: dict[tuple[str, int, int | None], dict[str, Any]] | None = None,
 ) -> bool:
     """Checkpoint oversized internal tool history without another model call.
 
@@ -589,60 +461,26 @@ def _maybe_compact_agent_context(
         }
         for item in tool_trace[-30:]
     ]
-    read_snapshots: list[dict[str, Any]] = []
-    preserved_read_keys: set[tuple[str, int, int | None]] = set()
-    evidence_chars = 0
-    if workspace_read_evidence:
-        for read_key, snapshot in reversed(list(workspace_read_evidence.items())):
-            snapshot_chars = len(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")))
-            if evidence_chars + snapshot_chars > CHECKPOINT_READ_EVIDENCE_CHARS:
-                continue
-            read_snapshots.append(dict(snapshot))
-            preserved_read_keys.add(read_key)
-            evidence_chars += snapshot_chars
-        read_snapshots.reverse()
-    if workspace_reads is not None:
-        # A duplicate may only be skipped while its exact returned content is
-        # still present in the request. Compaction and deduplication must share
-        # the same source of truth.
-        workspace_reads.intersection_update(preserved_read_keys)
-    if workspace_read_evidence is not None:
-        for read_key in list(workspace_read_evidence):
-            if read_key not in preserved_read_keys:
-                del workspace_read_evidence[read_key]
-    host_read_snapshots: list[dict[str, Any]] = []
-    if host_read_evidence:
-        # Shares the read budget with workspace snapshots, newest first. A
-        # snapshot that cannot be kept is forgotten, so a later read of that
-        # range returns real content instead of an "unchanged" pointer.
-        for read_key, snapshot in reversed(list(host_read_evidence.items())):
-            snapshot_chars = len(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")))
-            if evidence_chars + snapshot_chars > CHECKPOINT_READ_EVIDENCE_CHARS:
-                del host_read_evidence[read_key]
-                continue
-            host_read_snapshots.append(dict(snapshot))
-            evidence_chars += snapshot_chars
-        host_read_snapshots.reverse()
+    # The tracker drops whatever does not fit, so a later read of it returns
+    # real content instead of an "unchanged" pointer to text that is gone.
+    file_snapshots = knowledge.snapshots(CHECKPOINT_READ_EVIDENCE_CHARS) if knowledge is not None else []
     checkpoint = {
         "context_checkpoint": True,
         "instruction": (
-            "Verbose older tool traffic was compacted. workspace_read_snapshots below contain exact current file "
-            "content, line numbers, and revisions that remain available in this request; do not read those ranges "
-            "again. workspace_files is metadata only. Do not repeat completed searches or operations."
+            "Verbose older tool traffic was compacted. file_snapshots below contain the exact current content of "
+            "those files (numbered lines, including your own edits); use them instead of reading the files again. "
+            "workspace_files is metadata only. Do not repeat completed searches or operations."
         ),
         "workspace_files": files,
-        "workspace_read_snapshots": read_snapshots,
+        "file_snapshots": file_snapshots,
         "sources": source_state,
         "recent_operations": operations,
     }
     if host_evidence is not None:
         checkpoint["host_operation_evidence"] = host_evidence
-        checkpoint["host_read_snapshots"] = host_read_snapshots
         checkpoint["instruction"] += (
             " host_operation_evidence preserves historical arguments and results in execution order, including edits. "
-            "host_read_snapshots contain the exact content of host files at the recorded revision; use them instead of "
-            "reading those ranges again. If a later edit or command may have changed a file, re-read only the part you "
-            "need to change. Use the recorded changes to continue completed work instead of re-inspecting finished steps."
+            "Use the recorded changes to continue completed work instead of re-inspecting finished steps."
         )
     base = [dict(message) for message in conversation[:base_message_count]]
     checkpoint_text = json.dumps(checkpoint, ensure_ascii=False, separators=(",", ":"))
@@ -1131,7 +969,6 @@ async def stream_response(
     to the model instead of requiring an exact search-result URL match.
     """
     config = _settings(settings)
-    text_replace_enabled = bool(config.get("text_replace_tool"))
     response_chain = ResponsesState(responses_state)
     cached_web_evidence = dict(cached_web_evidence or {})
     extra_tools = list(extra_tools or [])
@@ -1180,8 +1017,6 @@ async def stream_response(
             else WORKSPACE_SYSTEM_PROMPT
         )
         system_prompt = f"{system_prompt}\n\n{workspace_prompt}"
-        if text_replace_enabled and workspace_access != "read_only":
-            system_prompt = f"{system_prompt}\n\n{TEXT_REPLACE_SYSTEM_PROMPT}"
     if system_addendum.strip():
         system_prompt = f"{system_prompt}\n\n{system_addendum.strip()}"
     # URLs the user actually wrote gate the reader; application context must not.
@@ -1218,13 +1053,10 @@ async def stream_response(
     reader_enabled = bool(known_urls)
     final_answer_attempts = 0
     force_final_answer = False
-    workspace_reads: set[tuple[str, int, int | None]] = set()
-    workspace_read_evidence: dict[tuple[str, int, int | None], dict[str, Any]] = {}
     host_evidence: list[dict[str, Any]] = []
-    host_read_evidence: dict[tuple[str, int, int | None], dict[str, Any]] = {}
-    host_read_revisions: dict[str, str] = {}
-    # Reads per path since that path last changed; drives the loop warning.
-    read_counts: dict[str, int] = {}
+    # Host files can also change through shell commands, so their snapshots
+    # are revalidated against disk before a checkpoint reuses them.
+    knowledge = FileKnowledge(validate=_host_revision if agent_mode else None)
     workspace_searches: set[str] = set()
     workspace_validations: set[tuple[int, str]] = set()
     workspace_list_generations: set[int] = set()
@@ -1298,11 +1130,7 @@ async def stream_response(
                     else:
                         round_tools.append(KEYLESS_FETCH_WEBPAGE_TOOL)
                 if workspace is not None and workspace_access != "none" and tool_rounds_used < role_tool_round_limit:
-                    round_tools.extend(
-                        workspace.tool_definitions(workspace_access, text_replace=True)
-                        if text_replace_enabled and workspace_access != "read_only"
-                        else workspace.tool_definitions(workspace_access)
-                    )
+                    round_tools.extend(workspace.tool_definitions(workspace_access))
                     if inkling_compat_active:
                         round_tools, inkling_patch_bindings = bind_inkling_patch_tools(
                             round_tools,
@@ -1784,7 +1612,7 @@ async def stream_response(
                 workspace_name, bound_path = inkling_patch_bindings.get(name, (name, ""))
                 is_search = name == "web_search"
                 is_workspace = workspace_name in WORKSPACE_TOOL_NAMES
-                is_extra = name in extra_tool_names
+                is_extra = name in extra_tool_names or HOST_LEGACY_TOOL_ALIASES.get(name) in extra_tool_names
                 step: dict[str, Any] = {
                     "id": call_id,
                     "status": "running",
@@ -1887,7 +1715,7 @@ async def stream_response(
                         required_arguments = {
                             "read_file": ("path",),
                             "write_file": ("path", "content"),
-                            "apply_line_edits": ("path", "revision", "edits"),
+                            "edit_file": ("path", "edits"),
                             "apply_patch": ("path", "old_text", "new_text"),
                             "replace_text": ("path", "old_text", "new_text"),
                             "apply_patch_batch": ("path", "patches"),
@@ -1896,7 +1724,7 @@ async def stream_response(
                             "run_python": ("path",),
                             "check_web_syntax": ("path",),
                         }.get(workspace_name, ())
-                        non_empty_arguments = {"path", "query", "old_text", "revision"}
+                        non_empty_arguments = {"path", "query", "old_text"}
                         missing = [
                             key
                             for key in required_arguments
@@ -1909,18 +1737,10 @@ async def stream_response(
                         normalized_path = ""
                         if "path" in arguments:
                             _, normalized_path = workspace.resolve(arguments["path"], allow_root=workspace_name == "search_files")
-                        read_key = (
-                            normalized_path,
-                            int(arguments.get("start_line", 1) or 1),
-                            int(arguments["end_line"]) if arguments.get("end_line") is not None else None,
-                        )
                         if workspace_name == "read_file":
-                            # Persist the requested range so repeated reads can be
-                            # diagnosed after the live model/tool context is gone.
-                            # A null end means the model requested the file through
-                            # EOF rather than supplying an explicit last line.
-                            step["requested_start_line"] = read_key[1]
-                            step["requested_end_line"] = read_key[2]
+                            # Persist the request so reading patterns can be
+                            # diagnosed after the live context is gone.
+                            step["requested_start_line"] = arguments.get("start_line")
                         workspace_call_skipped = False
                         validation_key = json.dumps(
                             [workspace_name, normalized_path, arguments.get("arguments") or []],
@@ -1936,34 +1756,6 @@ async def stream_response(
                                     "message": "工作区自上次列出后未改变；请使用已有文件列表继续。",
                                 },
                                 ensure_ascii=False,
-                            )
-                        elif workspace_name == "read_file" and read_key in workspace_reads:
-                            workspace_call_skipped = True
-                            read_counts[normalized_path] = read_counts.get(normalized_path, 0) + 1
-                            result_text = json.dumps(
-                                _with_repeated_read_warning(
-                                    {
-                                        "ok": True,
-                                        "path": normalized_path,
-                                        "unchanged": True,
-                                        "message": "文件自上次读取后未改变；请使用本轮上下文中上一次 read_file 返回的内容，不再重复返回全文。",
-                                    },
-                                    read_counts[normalized_path],
-                                ),
-                                ensure_ascii=False,
-                            )
-                        elif workspace_name == "read_file" and (
-                            covering_read := _find_covering_read(
-                                workspace_read_evidence, normalized_path, None, read_key[1], read_key[2]
-                            )
-                        ) is not None:
-                            workspace_call_skipped = True
-                            read_counts[normalized_path] = read_counts.get(normalized_path, 0) + 1
-                            result_text = _unchanged_read_result(
-                                normalized_path,
-                                str(covering_read.get("revision") or ""),
-                                covering_read,
-                                read_counts[normalized_path],
                             )
                         elif workspace_name == "search_files":
                             search_key = json.dumps(
@@ -2002,64 +1794,39 @@ async def stream_response(
                             if workspace_name == "list_files":
                                 workspace_list_generations.add(workspace_generation)
                             elif workspace_name == "read_file":
-                                workspace_reads.add(read_key)
-                                read_counts[normalized_path] = read_counts.get(normalized_path, 0) + 1
+                                read_result = _json_object(result_text)
+                                for field in ("line_count", "from_line", "through_line", "truncated"):
+                                    if field in read_result:
+                                        step[field] = read_result[field]
+                                replacement = knowledge.record_read(read_result)
+                                if replacement is not None:
+                                    workspace_call_skipped = True
+                                    result_text = replacement
                             elif workspace_name in {"run_python", "check_web_syntax"}:
                                 workspace_validations.add((workspace_generation, validation_key))
                             elif workspace_name in WORKSPACE_MUTATION_TOOLS:
                                 workspace_generation += 1
-                                read_counts.pop(normalized_path, None)
-                                workspace_reads = {item for item in workspace_reads if item[0] != normalized_path}
-                                workspace_read_evidence = {
-                                    key: value
-                                    for key, value in workspace_read_evidence.items()
-                                    if key[0] != normalized_path
-                                }
                                 workspace_searches.clear()
-                        if workspace_name == "read_file" and not workspace_call_skipped:
-                            try:
-                                read_result = json.loads(result_text)
-                            except (TypeError, ValueError, json.JSONDecodeError):
-                                read_result = {}
-                            if isinstance(read_result, dict):
-                                for field in (
-                                    "line_count",
-                                    "returned_from_line",
-                                    "returned_through_line",
-                                    "truncated",
-                                ):
-                                    if field in read_result:
-                                        step[field] = read_result[field]
-                                snapshot = {
-                                    field: read_result[field]
-                                    for field in (
-                                        "path",
-                                        "revision",
-                                        "line_count",
-                                        "returned_from_line",
-                                        "returned_through_line",
-                                        "truncated",
-                                        "numbered_content",
+                                if workspace_name == "delete_file":
+                                    knowledge.forget(normalized_path)
+                                else:
+                                    # The model still sees the file if its own
+                                    # arguments stay in context, or if an edit's
+                                    # excerpt shows every changed region.
+                                    raw_arguments = str(function.get("arguments") or "")
+                                    if workspace_name == "write_file":
+                                        visible = len(raw_arguments) <= FRESH_WRITE_CONTEXT_THRESHOLD
+                                    else:
+                                        visible = (
+                                            len(raw_arguments) <= WORKSPACE_ARGUMENT_COMPACT_THRESHOLD
+                                            or not _json_object(result_text).get("excerpt_truncated")
+                                        )
+                                    fresh = _json_object(
+                                        await asyncio.to_thread(workspace.execute, "read_file", {"path": normalized_path})
                                     )
-                                    if field in read_result
-                                }
-                                snapshot_from = int(read_result.get("returned_from_line") or 0)
-                                snapshot_through = int(read_result.get("returned_through_line") or 0)
-                                covered_by_existing = False
-                                for existing_key, existing in list(workspace_read_evidence.items()):
-                                    if existing_key[0] != normalized_path or existing.get("revision") != snapshot.get("revision"):
-                                        continue
-                                    existing_from = int(existing.get("returned_from_line") or 0)
-                                    existing_through = int(existing.get("returned_through_line") or 0)
-                                    if existing_from <= snapshot_from and existing_through >= snapshot_through:
-                                        workspace_read_evidence.pop(existing_key)
-                                        workspace_read_evidence[existing_key] = existing
-                                        covered_by_existing = True
-                                        break
-                                    if snapshot_from <= existing_from and snapshot_through >= existing_through:
-                                        del workspace_read_evidence[existing_key]
-                                if not covered_by_existing and snapshot.get("numbered_content") is not None:
-                                    workspace_read_evidence[read_key] = snapshot
+                                    knowledge.record_own_change(
+                                        fresh, visible=visible, created=workspace_name == "write_file"
+                                    )
                         step["status"] = "skipped" if workspace_call_skipped else "completed"
                     elif is_search:
                         if parallel_mode:
@@ -2250,15 +2017,24 @@ async def stream_response(
                         step["error"] = failure
                         evidence_text = result_text
                         if name in HOST_READ_TOOLS and not failure:
-                            # Read content lives in host_read_snapshots; the
-                            # chronological log only needs the metadata.
-                            result_text, evidence_text, duplicate_read = _process_host_read(
-                                result_text, arguments, host_read_evidence, host_read_revisions, read_counts
-                            )
-                            if duplicate_read:
+                            read_result = _json_object(result_text)
+                            if read_result:
+                                evidence_text = _read_record(read_result)
+                            replacement = knowledge.record_read(read_result)
+                            if replacement is not None:
+                                result_text = replacement
                                 step["status"] = "skipped"
                         elif name in HOST_FILE_MUTATION_TOOLS and not failure:
-                            _forget_host_reads(result_text, host_read_evidence, host_read_revisions, read_counts)
+                            workspace_generation += 1
+                            changed_path = str(_json_object(result_text).get("path") or "")
+                            if changed_path and name == "host_delete_path":
+                                knowledge.forget(changed_path)
+                            elif changed_path:
+                                knowledge.record_own_change(
+                                    await asyncio.to_thread(_host_read_snapshot, changed_path),
+                                    visible=True,
+                                    created=name in HOST_WRITE_TOOLS,
+                                )
                         _remember_host_evidence(host_evidence, name, arguments, evidence_text, step["status"])
                     else:
                         raise ValueError(f"不支持的工具：{name or '未命名工具'}")
@@ -2309,10 +2085,9 @@ async def stream_response(
                 if is_workspace and workspace_name == "read_file":
                     for field in (
                         "requested_start_line",
-                        "requested_end_line",
                         "line_count",
-                        "returned_from_line",
-                        "returned_through_line",
+                        "from_line",
+                        "through_line",
                         "truncated",
                     ):
                         if field in step:
@@ -2339,11 +2114,9 @@ async def stream_response(
                 workspace=workspace,
                 sources=sources,
                 tool_trace=tool_trace,
-                workspace_read_evidence=workspace_read_evidence,
-                workspace_reads=workspace_reads,
+                knowledge=knowledge,
                 refresh_existing=workspace_generation != generation_before_calls,
                 host_evidence=host_evidence if agent_mode else None,
-                host_read_evidence=host_read_evidence if agent_mode else None,
             )
             if compacted and round_stats:
                 round_stats[-1]["compacted_after"] = True

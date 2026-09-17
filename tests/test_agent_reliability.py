@@ -14,8 +14,9 @@ from unittest.mock import patch
 from app import agent as agent_module
 from app.agent import AgentRuntime
 from app import mimo_local
+from app.file_knowledge import FileKnowledge
 from app.mimo_local import (
-    _maybe_compact_agent_context, _process_host_read, _remember_host_evidence, checkpoint_payload,
+    _maybe_compact_agent_context, _remember_host_evidence, checkpoint_payload,
     AGENT_CONTEXT_COMPACT_THRESHOLD, CHECKPOINT_READ_EVIDENCE_CHARS,
 )
 
@@ -59,89 +60,102 @@ class CheckpointTests(unittest.TestCase):
         self.assertTrue(_maybe_compact_agent_context(history, base_message_count=2, workspace=None, sources={}, tool_trace=[]))
         self.assertEqual(history[2:], recent + latest)
 
-    def test_checkpoint_carries_host_read_snapshots_within_budget(self):
-        evidence = {
-            ('/a', 1, None): {'path': '/a', 'revision': 'r1', 'numbered_content': 'x' * (CHECKPOINT_READ_EVIDENCE_CHARS - 60)},
-            ('/b', 1, None): {'path': '/b', 'revision': 'r2', 'numbered_content': '1|keep'},
-        }
+    def test_checkpoint_carries_file_snapshots_within_budget(self):
+        knowledge = FileKnowledge()
+        for path, content in (('/a', 'x' * (CHECKPOINT_READ_EVIDENCE_CHARS - 60)), ('/b', '1|keep')):
+            knowledge.record_read({'path': path, 'revision': 'r' + path, 'line_count': 1, 'from_line': 1,
+                                   'through_line': 1, 'truncated': False, 'content': content})
         history = [{'role': 'system', 'content': 'system'}, {'role': 'user', 'content': 'fix'},
                    {'role': 'assistant', 'content': 'x' * (AGENT_CONTEXT_COMPACT_THRESHOLD + 1)}]
         self.assertTrue(_maybe_compact_agent_context(
             history, base_message_count=2, workspace=None, sources={}, tool_trace=[],
-            host_evidence=[], host_read_evidence=evidence))
+            host_evidence=[], knowledge=knowledge))
         checkpoint = checkpoint_payload(history)
-        # Newest wins; the oversized older one no longer fits and is forgotten.
-        self.assertEqual([item['path'] for item in checkpoint['host_read_snapshots']], ['/b'])
-        self.assertEqual(list(evidence), [('/b', 1, None)])
+        # Newest wins; the older one no longer fits in the shared budget and is forgotten.
+        self.assertEqual([item['path'] for item in checkpoint['file_snapshots']], ['/b'])
+        self.assertEqual((knowledge.known('/a'), knowledge.known('/b')), (False, True))
 
 
 class HostReadTests(unittest.TestCase):
-    def test_host_read_is_bounded_and_paginated(self):
+    def read(self, runtime, knowledge, path, **arguments):
+        text = runtime.execute('host_read_file', {'path': str(path), **arguments})
+        replacement = knowledge.record_read(json.loads(text))
+        return json.loads(replacement or text), replacement is not None
+
+    def test_host_read_returns_whole_file_and_splits_only_when_too_large(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'big.txt'
-            path.write_text(''.join(f'{"y" * 99}\n' for _ in range(2000)))
-            result = json.loads(AgentRuntime(None, 1, 'test').execute('host_read_file', {'path': str(path)}))
+            runtime = AgentRuntime(None, 1, 'test')
+            small = Path(directory) / 'small.js'
+            small.write_text(''.join(f'line {n}\n' for n in range(1, 101)))
+            result = json.loads(runtime.execute('host_read_file', {'path': str(small), 'start_line': 40, 'end_line': 60}))
+            self.assertEqual((result['from_line'], result['through_line'], result['truncated']), (1, 100, False))
+            self.assertIn('1|line 1\n', result['content'])
+            big = Path(directory) / 'big.txt'
+            big.write_text(''.join(f'{"y" * 99}\n' for _ in range(2000)))
+            result = json.loads(runtime.execute('host_read_file', {'path': str(big)}))
             self.assertTrue(result['truncated'])
             self.assertLessEqual(len(result['content']), agent_module.HOST_READ_MAX_CHARS)
-            self.assertEqual(result['next_start_line'], result['end_line'] + 1)
+            self.assertEqual(result['next_start_line'], result['through_line'] + 1)
             self.assertEqual(result['line_count'], 2000)
             self.assertTrue(result['revision'])
+            schema = next(item for item in runtime.tool_definitions if item['function']['name'] == 'host_read_file')
+            self.assertEqual(set(schema['function']['parameters']['properties']), {'path', 'start_line'})
 
-    def test_unchanged_host_reads_are_deduplicated_until_file_changes(self):
+    def test_unchanged_host_reads_are_short_until_the_file_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'app.js'
             path.write_text(''.join(f'line {n}\n' for n in range(1, 101)))
-            runtime = AgentRuntime(None, 1, 'test')
-            evidence, revisions, counts = {}, {}, {}
-
-            def read(**arguments):
-                arguments['path'] = str(path)
-                text, record, duplicate = _process_host_read(
-                    runtime.execute('host_read_file', arguments), arguments, evidence, revisions, counts)
-                self.assertNotIn('line 1', record)
-                return json.loads(text), duplicate
-
-            first, duplicate = read()
+            runtime, knowledge = AgentRuntime(None, 1, 'test'), FileKnowledge()
+            first, duplicate = self.read(runtime, knowledge, path)
             self.assertFalse(duplicate)
             self.assertIn('1|line 1', first['content'])
-            again, duplicate = read()
+            again, duplicate = self.read(runtime, knowledge, path)
             self.assertTrue(duplicate)
             self.assertTrue(again['unchanged'])
             self.assertNotIn('content', again)
-            subrange, duplicate = read(start_line=10, end_line=20)
+            # Asking again right away means the model lost track: give it the file.
+            third, duplicate = self.read(runtime, knowledge, path)
+            self.assertFalse(duplicate)
+            self.assertIn('1|line 1', third['content'])
+            fourth, duplicate = self.read(runtime, knowledge, path)
             self.assertTrue(duplicate)
-            self.assertIn('warning', subrange)
+            self.assertIn('warning', fourth)
             path.write_text('changed\n')
-            changed, duplicate = read()
+            changed, duplicate = self.read(runtime, knowledge, path)
             self.assertFalse(duplicate)
             self.assertIn('1|changed', changed['content'])
-            self.assertEqual(len(evidence), 1)
-            partial, duplicate = read(start_line=1, end_line=1)
-            self.assertTrue(duplicate)
 
-    def test_partial_host_read_does_not_hide_other_ranges(self):
+    def test_own_host_edit_keeps_the_file_known(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'app.js'
-            path.write_text(''.join(f'line {n}\n' for n in range(1, 101)))
-            runtime = AgentRuntime(None, 1, 'test')
-            evidence, revisions, counts = {}, {}, {}
-            for start, end, expected_duplicate in ((1, 50, False), (40, 60, False), (45, 55, True), (1, 60, False)):
-                arguments = {'path': str(path), 'start_line': start, 'end_line': end}
-                _, _, duplicate = _process_host_read(
-                    runtime.execute('host_read_file', arguments), arguments, evidence, revisions, counts)
-                self.assertEqual(duplicate, expected_duplicate, (start, end))
-            # The 1-60 read supersedes both narrower snapshots.
-            self.assertEqual(list(evidence), [(str(path), 1, 60)])
+            path = Path(directory) / 'mod.json'
+            path.write_text('{\r\n  "spell": "old"\r\n}\r\n')
+            runtime, knowledge = AgentRuntime(None, 1, 'test'), FileKnowledge(validate=mimo_local._host_revision)
+            self.read(runtime, knowledge, path)
+            result = json.loads(runtime.execute('host_edit_file', {'path': str(path), 'edits': [
+                {'old_text': '"spell": "old"', 'new_text': '"spell": "new"'}]}))
+            self.assertTrue(result['ok'], result)
+            self.assertEqual(path.read_bytes(), b'{\r\n  "spell": "new"\r\n}\r\n')
+            knowledge.record_own_change(mimo_local._host_read_snapshot(str(path)), visible=True)
+            after, duplicate = self.read(runtime, knowledge, path)
+            self.assertTrue(duplicate)
+            self.assertIn('updated_excerpt', after['message'])
+            # A change made outside the model's own edits is detected at checkpoint time.
+            path.write_text('other\n')
+            self.assertEqual(knowledge.snapshots(10_000), [])
+            self.assertFalse(knowledge.known(str(path)))
 
-    def test_workspace_subrange_is_covered_by_kept_full_read(self):
-        evidence = {('app.js', 1, None): {'path': 'app.js', 'revision': 'r', 'line_count': 100,
-                                          'returned_from_line': 1, 'returned_through_line': 100,
-                                          'numbered_content': '...'}}
-        self.assertIsNotNone(mimo_local._find_covering_read(evidence, 'app.js', None, 30, 60))
-        self.assertIsNotNone(mimo_local._find_covering_read(evidence, 'app.js', None, 90, None))
-        self.assertIsNone(mimo_local._find_covering_read(evidence, 'other.js', None, 30, 60))
-        evidence[('app.js', 1, None)]['returned_through_line'] = 50
-        self.assertIsNone(mimo_local._find_covering_read(evidence, 'app.js', None, 30, 60))
+    def test_host_apply_patch_alias_and_atomic_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'a.txt'
+            path.write_text('one\ntwo\n')
+            runtime = AgentRuntime(None, 1, 'test')
+            alias = json.loads(runtime.execute('host_apply_patch', {'path': str(path), 'old_text': 'one', 'new_text': 'ONE'}))
+            self.assertTrue(alias['ok'], alias)
+            failed = json.loads(runtime.execute('host_edit_file', {'path': str(path), 'edits': [
+                {'old_text': 'two', 'new_text': 'TWO'}, {'old_text': 'missing', 'new_text': 'x'}]}))
+            self.assertFalse(failed['ok'])
+            self.assertIn('整个批次未修改', failed['error'])
+            self.assertEqual(path.read_text(), 'ONE\ntwo\n')
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -284,7 +298,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([item['status'] for item in result['tool_trace']], ['completed', 'skipped'])
             # After the first round was checkpointed, the content is still available.
             checkpoint = checkpoint_payload(requests[1]['messages'])
-            self.assertIn('"spell": "old"', checkpoint['host_read_snapshots'][0]['numbered_content'])
+            self.assertIn('"spell": "old"', checkpoint['file_snapshots'][0]['content'])
             self.assertNotIn('"spell"', json.dumps(checkpoint['host_operation_evidence'], ensure_ascii=False))
             second_result = json.loads(requests[2]['messages'][-1]['content'])
             self.assertTrue(second_result['unchanged'])

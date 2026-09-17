@@ -16,7 +16,7 @@ WORK_LOG_MAX_CHARS = 1_500
 MAX_ITEMS_PER_LINE = 12
 
 WRITE_TOOLS = {"write_file", "host_write_file", "frontend_write_page"}
-EDIT_TOOLS = {"apply_line_edits", "apply_patch", "apply_patch_batch", "replace_text", "host_apply_patch"}
+EDIT_TOOLS = {"edit_file", "host_edit_file", "apply_line_edits", "apply_patch", "apply_patch_batch", "replace_text", "host_apply_patch"}
 DELETE_TOOLS = {"delete_file", "host_delete_path"}
 READ_TOOLS = {"read_file", "host_read_file", "frontend_read_page"}
 VALIDATION_TOOLS = {"run_python", "check_web_syntax", "frontend_validate_page"}

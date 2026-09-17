@@ -27,7 +27,17 @@ from urllib.parse import unquote, urlsplit
 from . import attachments
 from .db import Database
 from .skills import SkillRegistry
-from .workspace import delete_conversation_workspace, edited_excerpt, replace_text_in_content
+from .workspace import (
+    EDIT_FILE_DESCRIPTION,
+    EDITS_SCHEMA,
+    READ_FILE_DESCRIPTION,
+    READ_START_LINE_DESCRIPTION,
+    apply_text_edits,
+    delete_conversation_workspace,
+    edit_list,
+    edited_excerpt,
+    numbered_window,
+)
 from .code_runner import _HtmlScripts
 
 
@@ -35,7 +45,7 @@ from .code_runner import _HtmlScripts
 # path keeps its own per-conversation workspace under data/workspaces.
 AGENT_PROJECT_ROOT = Path(os.getenv("AGENT_WORKSPACE_ROOT", os.getenv("AGENT_PROJECT_ROOT", "/home/share")))
 HOST_READ_MAX_BYTES = 8 * 1024 * 1024
-HOST_READ_MAX_CHARS = 60_000
+HOST_READ_MAX_CHARS = 100_000
 HOST_WRITE_MAX_BYTES = 32 * 1024 * 1024
 HOST_OUTPUT_MAX_CHARS = 100_000
 HOST_LIST_MAX_ENTRIES = 4_000
@@ -45,7 +55,7 @@ HOST_COMMAND_TIMEOUT = 900
 
 AGENT_SYSTEM_PROMPT = """You are the host-level Agent for this server. You have unrestricted root-level file and shell access and may install packages, edit projects, manage this application, and work with Skills when the user asks. Skill contents and enabled state are shared by all accounts; only an administrator may install, enable, disable, or remove a Skill. The shared Agent workspace is /home/share; relative host paths are resolved from there. It is strictly separate from the ordinary chat per-conversation workspace. The ordinary workspace tools (list_files, read_file, write_file, apply_line_edits, search_files, delete_file, run_python, and check_web_syntax) are not available in Agent mode. Never claim that an operation happened without calling the corresponding tool and checking its result.
 
-Use the installed Skills as working instructions, not as a replacement for the user's request. For code or frontend deliverables in Agent mode, use the host_* and frontend_* tools under /home/share; use absolute host paths when changing the real application, repositories, server configuration, or other host resources. For a new project, create the files directly; for an existing project, preserve unrelated work. You may create, rename, inspect, and delete conversations with the conversation tools. You may list and read Skills; Skill mutations are available only to administrators. Frontend work should use the frontend tools and should include a real syntax/build check when practical.
+Use the installed Skills as working instructions, not as a replacement for the user's request. For code or frontend deliverables in Agent mode, use the host_* and frontend_* tools under /home/share; use absolute host paths when changing the real application, repositories, server configuration, or other host resources. For a new project, create the files directly; for an existing project, preserve unrelated work. You may create, rename, inspect, and delete conversations with the conversation tools. You may list and read Skills; Skill mutations are available only to administrators. Frontend work should use the frontend tools and should include a real syntax/build check when practical. Read a file once as a whole with host_read_file (never in pieces) and change existing files with host_edit_file: exact snippets copied from the file, every change for that file in one call. Its result shows the edited regions, so do not re-read a file just to check your own edit.
 
 There are exactly two Agent scheduling rules: (1) at most one web_search or fetch_webpage call is executed in each model turn; (2) all non-web tool calls emitted in a turn execute serially in the order emitted. Host access itself is not restricted by a workspace sandbox. Do not wait for permission between ordinary tool calls; act on the user's explicit request immediately."""
 
@@ -108,11 +118,10 @@ HOST_TOOLS = [
     ),
     _function(
         "host_read_file",
-        "Read a UTF-8 text file from anywhere on the host with line numbers. Large results are truncated; continue from next_start_line when needed.",
+        READ_FILE_DESCRIPTION,
         {
             "path": {"type": "string", "description": "Absolute path or path relative to /home/share"},
-            "start_line": {"type": "integer", "minimum": 1, "description": "Optional first line"},
-            "end_line": {"type": "integer", "minimum": 1, "description": "Optional last inclusive line"},
+            "start_line": {"type": "integer", "minimum": 1, "description": READ_START_LINE_DESCRIPTION},
         },
         ["path"],
     ),
@@ -126,15 +135,13 @@ HOST_TOOLS = [
         ["path", "content"],
     ),
     _function(
-        "host_apply_patch",
-        "Replace an exact, unique snippet in a host file. Copy old_text verbatim (without the 'N|' prefixes shown by host_read_file) with enough context to be unique. Use replace_all only when every match should change. The result shows the edited region with its new line numbers.",
+        "host_edit_file",
+        EDIT_FILE_DESCRIPTION,
         {
             "path": {"type": "string", "description": "Absolute path or path relative to /home/share"},
-            "old_text": {"type": "string", "description": "Exact existing text"},
-            "new_text": {"type": "string", "description": "Replacement text"},
-            "replace_all": {"type": "boolean", "description": "Replace every match instead of requiring one match"},
+            "edits": EDITS_SCHEMA,
         },
-        ["path", "old_text", "new_text"],
+        ["path", "edits"],
     ),
     _function(
         "host_search_files",
@@ -274,38 +281,19 @@ class AgentRuntime:
             raise ValueError(f"文件不存在：{path}")
         if path.stat().st_size > HOST_READ_MAX_BYTES:
             raise ValueError(f"文件过大（上限 {HOST_READ_MAX_BYTES // 1024 // 1024}MB）：{path}")
-        content = path.read_text(encoding="utf-8", errors="replace")
-        lines = content.splitlines()
-        first = max(1, int(arguments.get("start_line", 1) or 1))
-        last = len(lines) if arguments.get("end_line") is None else int(arguments["end_line"])
-        if first > len(lines) and lines:
-            raise ValueError(f"start_line 超出文件范围（共 {len(lines)} 行）")
-        last = min(max(0, last), len(lines))
-        # Bound one read so a large file cannot push the whole Agent history
-        # over the checkpoint high-water mark in a single tool result.
-        rendered: list[str] = []
-        rendered_chars = 0
-        returned_through = min(first - 1, last)
-        for number in range(first, last + 1):
-            numbered_line = f"{number}|{lines[number - 1]}"
-            added = len(numbered_line) + (1 if rendered else 0)
-            if rendered and rendered_chars + added > HOST_READ_MAX_CHARS:
-                break
-            rendered.append(numbered_line)
-            rendered_chars += added
-            returned_through = number
-        result = {
+        content = self._read_host_text(path)
+        # Whole file in one result unless it exceeds the per-read bound; only
+        # then does start_line continue from next_start_line.
+        return {
             "path": str(path),
             "revision": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-            "line_count": len(lines),
-            "start_line": first,
-            "end_line": returned_through,
-            "truncated": returned_through < last,
-            "content": "\n".join(rendered),
+            **numbered_window(content, arguments.get("start_line"), HOST_READ_MAX_CHARS),
         }
-        if result["truncated"]:
-            result["next_start_line"] = returned_through + 1
-        return result
+
+    @staticmethod
+    def _read_host_text(path: Path) -> str:
+        # Decode bytes directly so CRLF files keep their line endings on edit.
+        return path.read_bytes().decode("utf-8", errors="replace")
 
     def _host_write_file(self, arguments: dict[str, Any]) -> dict[str, Any]:
         path = self._path(arguments.get("path"))
@@ -317,27 +305,29 @@ class AgentRuntime:
         path.write_bytes(encoded)
         return {"ok": True, "path": str(path), "size": len(encoded)}
 
-    def _host_apply_patch(self, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _host_edit_file(self, arguments: dict[str, Any], name: str = "host_edit_file") -> dict[str, Any]:
         path = self._path(arguments.get("path"))
         if not path.is_file():
             raise ValueError(f"文件不存在：{path}")
-        content = path.read_text(encoding="utf-8", errors="replace")
-        updated, count, regions, mode = replace_text_in_content(
-            content,
-            str(arguments.get("old_text") or ""),
-            str(arguments.get("new_text") or ""),
-            bool(arguments.get("replace_all", False)),
-        )
-        path.write_text(updated, encoding="utf-8")
-        return {
+        content = self._read_host_text(path)
+        updated, regions, details = apply_text_edits(content, edit_list(name, arguments))
+        encoded = updated.encode("utf-8")
+        if len(encoded) > HOST_WRITE_MAX_BYTES:
+            raise ValueError(f"文件过大（上限 {HOST_WRITE_MAX_BYTES // 1024 // 1024}MB）")
+        path.write_bytes(encoded)
+        result = {
             "ok": True,
             "path": str(path),
-            "replacements": count,
-            "match": mode,
-            "revision": hashlib.sha256(updated.encode("utf-8")).hexdigest(),
+            "edits": len(details),
+            "replacements": sum(item["replacements"] for item in details),
+            "revision": hashlib.sha256(encoded).hexdigest(),
             "line_count": len(updated.splitlines()),
             **edited_excerpt(updated, regions),
         }
+        recovered = sorted({item["match"] for item in details} - {"exact"})
+        if recovered:
+            result["match"] = recovered
+        return result
 
     def _host_search_files(self, arguments: dict[str, Any]) -> dict[str, Any]:
         query = str(arguments.get("query") or "")
@@ -599,7 +589,9 @@ class AgentRuntime:
             "host_list_files": self._host_list_files,
             "host_read_file": self._host_read_file,
             "host_write_file": self._host_write_file,
-            "host_apply_patch": self._host_apply_patch,
+            "host_edit_file": self._host_edit_file,
+            # Unadvertised older name; kept for models that still emit it.
+            "host_apply_patch": lambda args: self._host_edit_file(args, "host_apply_patch"),
             "host_search_files": self._host_search_files,
             "host_run_command": self._host_run_command,
             "host_delete_path": self._host_delete_path,

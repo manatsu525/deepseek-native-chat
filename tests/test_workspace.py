@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,13 +20,13 @@ class WorkspaceTests(unittest.TestCase):
         workspace.WORKSPACES_DIR = self.original_root
         self.temp.cleanup()
 
-    def test_write_read_patch_search_list_and_delete(self) -> None:
+    def test_write_read_edit_search_list_and_delete(self) -> None:
         written = self.workspace.write_file("src/app.py", "name = 'old'\nprint(name)\n")
         self.assertEqual(written["path"], "src/app.py")
         self.assertEqual(self.workspace.read_file("src/app.py"), "name = 'old'\nprint(name)\n")
 
-        patched = self.workspace.apply_patch("src/app.py", "'old'", "'new'")
-        self.assertEqual(patched["replacements"], 1)
+        edited = self.workspace.edit_file("src/app.py", [{"old_text": "'old'", "new_text": "'new'"}])
+        self.assertEqual(edited["replacements"], 1)
         self.assertEqual(self.workspace.read_file("src/app.py"), "name = 'new'\nprint(name)\n")
         self.assertEqual(self.workspace.search_files("PRINT")["matches"][0]["line"], 2)
         self.assertEqual(self.workspace.list_files()[0]["path"], "src/app.py")
@@ -47,11 +48,11 @@ class WorkspaceTests(unittest.TestCase):
             self.workspace.write_file("link", "changed")
         self.assertEqual(outside.read_text(encoding="utf-8"), "secret")
 
-    def test_patch_refuses_ambiguous_match(self) -> None:
+    def test_edit_refuses_ambiguous_match_unless_replace_all(self) -> None:
         self.workspace.write_file("same.txt", "x\nx\n")
-        with self.assertRaises(WorkspaceError):
-            self.workspace.apply_patch("same.txt", "x", "y")
-        result = self.workspace.apply_patch("same.txt", "x", "y", True)
+        with self.assertRaisesRegex(WorkspaceError, "出现 2 次"):
+            self.workspace.edit_file("same.txt", [{"old_text": "x", "new_text": "y"}])
+        result = self.workspace.edit_file("same.txt", [{"old_text": "x", "new_text": "y", "replace_all": True}])
         self.assertEqual(result["replacements"], 2)
         self.assertEqual(self.workspace.read_file("same.txt"), "y\ny\n")
 
@@ -60,11 +61,12 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn('"ok": true', result)
         self.assertIn('"path": "index.html"', result)
 
-        snapshot = self.workspace.execute("read_file", {"path": "index.html"})
-        self.assertIn('"revision":', snapshot)
-        self.assertIn('"numbered_content": "1|<h1>Hi</h1>"', snapshot)
+        snapshot = json.loads(self.workspace.execute("read_file", {"path": "index.html"}))
+        self.assertTrue(snapshot["revision"])
+        self.assertEqual(snapshot["content"], "1|<h1>Hi</h1>")
+        self.assertEqual((snapshot["from_line"], snapshot["through_line"], snapshot["truncated"]), (1, 1, False))
 
-    def test_tool_schema_is_stable_as_files_change(self) -> None:
+    def test_tool_schema_is_stable_and_has_no_line_number_editing(self) -> None:
         before = self.workspace.tool_definitions()
         self.workspace.write_file("index.html", "<h1>Hi</h1>")
         self.workspace.write_file("src/app.js", "start()")
@@ -72,11 +74,13 @@ class WorkspaceTests(unittest.TestCase):
         after = self.workspace.tool_definitions()
         self.assertEqual(before, after)
         names = {item["function"]["name"] for item in after}
-        self.assertIn("apply_line_edits", names)
-        self.assertNotIn("apply_patch", names)
-        self.assertNotIn("apply_patch_batch", names)
+        self.assertIn("edit_file", names)
+        for removed in ("apply_line_edits", "apply_patch", "apply_patch_batch", "replace_text"):
+            self.assertNotIn(removed, names)
         self.assertIn("run_python", names)
         self.assertIn("check_web_syntax", names)
+        read_schema = next(item for item in after if item["function"]["name"] == "read_file")["function"]["parameters"]
+        self.assertEqual(set(read_schema["properties"]), {"path", "start_line"})
         for tool in after:
             path_schema = tool["function"]["parameters"]["properties"].get("path")
             if path_schema:
@@ -88,54 +92,76 @@ class WorkspaceTests(unittest.TestCase):
         self.assertIn("read_file", names)
         self.assertIn("search_files", names)
         self.assertIn("write_file", names)
-        self.assertIn("apply_line_edits", names)
+        self.assertIn("edit_file", names)
         self.assertNotIn("run_python", names)
         self.assertNotIn("check_web_syntax", names)
+        read_only = {item["function"]["name"] for item in self.workspace.tool_definitions("read_only")}
+        self.assertNotIn("edit_file", read_only)
 
-    def test_revisioned_line_edits_are_atomic_and_do_not_match_old_text(self) -> None:
+    def test_read_returns_whole_file_even_when_a_start_line_is_given(self) -> None:
         self.workspace.write_file("app.js", "one\ntwo\nthree\nfour\n")
-        snapshot = self.workspace.read_snapshot("app.js")
-        self.assertEqual(snapshot["numbered_content"], "1|one\n2|two\n3|three\n4|four")
-        result = self.workspace.apply_line_edits(
-            "app.js",
-            snapshot["revision"],
-            [
-                {"start_line": 2, "end_line": 2, "new_text": "TWO"},
-                {"start_line": 4, "end_line": 3, "new_text": "inserted"},
-            ],
-        )
-        self.assertNotEqual(result["revision"], snapshot["revision"])
-        self.assertEqual(self.workspace.read_file("app.js"), "one\nTWO\nthree\ninserted\nfour\n")
+        snapshot = self.workspace.read_snapshot("app.js", 3)
+        self.assertEqual(snapshot["content"], "1|one\n2|two\n3|three\n4|four")
+        self.assertEqual((snapshot["from_line"], snapshot["through_line"], snapshot["line_count"]), (1, 4, 4))
+        self.assertIn("note", snapshot)
+        with self.assertRaises(WorkspaceError):
+            self.workspace.read_snapshot("app.js", 9)
 
-        latest = self.workspace.read_snapshot("app.js")
-        self.workspace.apply_line_edits(
-            "app.js",
-            latest["revision"],
-            [{"start_line": 5, "end_line": 5, "new_text": "FOUR"}],
-        )
-        self.assertTrue(self.workspace.read_file("app.js").endswith("FOUR\n"))
+    def test_only_an_oversized_file_is_split_and_continued(self) -> None:
+        self.workspace.write_file("big.txt", "".join(f"{'z' * 99}\n" for _ in range(1500)))
+        first = self.workspace.read_snapshot("big.txt")
+        self.assertTrue(first["truncated"])
+        self.assertLessEqual(len(first["content"]), workspace.MAX_READ_CHARS)
+        rest = self.workspace.read_snapshot("big.txt", first["next_start_line"])
+        self.assertEqual(rest["from_line"], first["through_line"] + 1)
+        self.assertEqual(rest["through_line"], 1500)
+        self.assertFalse(rest["truncated"])
 
-    def test_snapshot_can_read_a_numbered_line_range(self) -> None:
-        self.workspace.write_file("app.js", "one\ntwo\nthree\nfour\n")
-        snapshot = self.workspace.read_snapshot("app.js", 2, 3)
-        self.assertEqual(snapshot["returned_from_line"], 2)
-        self.assertEqual(snapshot["returned_through_line"], 3)
-        self.assertEqual(snapshot["line_count"], 4)
-        self.assertEqual(snapshot["numbered_content"], "2|two\n3|three")
-        self.assertFalse(snapshot["truncated"])
+    def test_edit_is_atomic_across_all_snippets(self) -> None:
+        original = "alpha = 1\nbeta = 2\ngamma = 3\n"
+        self.workspace.write_file("app.py", original)
+        result = self.workspace.edit_file("app.py", [
+            {"old_text": "alpha = 1", "new_text": "alpha = 10"},
+            {"old_text": "gamma = 3", "new_text": "gamma = 30"},
+        ])
+        self.assertEqual((result["edits"], result["replacements"]), (2, 2))
+        self.assertEqual(self.workspace.read_file("app.py"), "alpha = 10\nbeta = 2\ngamma = 30\n")
+        self.assertIn("1|alpha = 10", result["updated_excerpt"])
+        self.assertIn("3|gamma = 30", result["updated_excerpt"])
 
-    def test_line_edits_reject_stale_revision_without_changing_file(self) -> None:
-        self.workspace.write_file("app.js", "one\ntwo\n")
-        stale = self.workspace.read_snapshot("app.js")
-        self.workspace.write_file("app.js", "one\nchanged\n")
-        before = self.workspace.read_file("app.js")
-        with self.assertRaisesRegex(WorkspaceError, "文件版本已经变化"):
-            self.workspace.apply_line_edits(
-                "app.js",
-                stale["revision"],
-                [{"start_line": 2, "end_line": 2, "new_text": "TWO"}],
-            )
-        self.assertEqual(self.workspace.read_file("app.js"), before)
+        before_failure = self.workspace.read_file("app.py")
+        with self.assertRaisesRegex(WorkspaceError, "第 2 处修改.*整个批次未修改"):
+            self.workspace.edit_file("app.py", [
+                {"old_text": "beta = 2", "new_text": "beta = 20"},
+                {"old_text": "missing", "new_text": "value"},
+            ])
+        with self.assertRaisesRegex(WorkspaceError, "范围重叠"):
+            self.workspace.edit_file("app.py", [
+                {"old_text": "alpha = 10\nbeta", "new_text": "x"},
+                {"old_text": "beta = 2", "new_text": "y"},
+            ])
+        with self.assertRaisesRegex(WorkspaceError, "old_text 不能为空"):
+            self.workspace.edit_file("app.py", [{"old_text": "", "new_text": "y"}])
+        self.assertEqual(self.workspace.read_file("app.py"), before_failure)
+
+    def test_edits_do_not_depend_on_line_numbers(self) -> None:
+        self.workspace.write_file("app.js", "a();\nb();\nc();\n")
+        # Inserting lines above does not invalidate a later snippet edit.
+        self.workspace.edit_file("app.js", [{"old_text": "a();\n", "new_text": "setup();\nmore();\na();\n"}])
+        result = self.workspace.edit_file("app.js", [{"old_text": "c();", "new_text": "done();"}])
+        self.assertEqual(self.workspace.read_file("app.js"), "setup();\nmore();\na();\nb();\ndone();\n")
+        self.assertIn("5|done();", result["updated_excerpt"])
+
+    def test_legacy_patch_names_run_as_edit_file(self) -> None:
+        self.workspace.write_file("app.py", "a = 1\nb = 2\n")
+        single = json.loads(self.workspace.execute("apply_patch", {"path": "app.py", "old_text": "a = 1", "new_text": "a = 5"}))
+        self.assertEqual(single["replacements"], 1)
+        batch = json.loads(self.workspace.execute("apply_patch_batch", {"path": "app.py", "patches": [
+            {"old_text": "a = 5", "new_text": "a = 6"}, {"old_text": "b = 2", "new_text": "b = 7"}]}))
+        self.assertEqual(batch["edits"], 2)
+        self.assertEqual(self.workspace.read_file("app.py"), "a = 6\nb = 7\n")
+        with self.assertRaises(WorkspaceError):
+            self.workspace.execute("apply_line_edits", {"path": "app.py"})
 
     def test_agent_shared_workspace_lists_and_resolves_only_shared_files(self) -> None:
         shared_root = Path(self.temp.name) / "share"
@@ -165,45 +191,6 @@ class WorkspaceTests(unittest.TestCase):
         with self.assertRaises(WorkspaceError):
             agent_workspace.delete_file("outside-link")
         self.assertEqual(outside.read_text(encoding="utf-8"), "secret")
-
-    def test_line_edits_reject_overlapping_ranges_atomically(self) -> None:
-        original = "one\ntwo\nthree\n"
-        self.workspace.write_file("app.js", original)
-        snapshot = self.workspace.read_snapshot("app.js")
-        with self.assertRaisesRegex(WorkspaceError, "范围重叠"):
-            self.workspace.apply_line_edits(
-                "app.js",
-                snapshot["revision"],
-                [
-                    {"start_line": 1, "end_line": 2, "new_text": "first"},
-                    {"start_line": 2, "end_line": 3, "new_text": "second"},
-                ],
-            )
-        self.assertEqual(self.workspace.read_file("app.js"), original)
-
-    def test_batch_patch_is_atomic_and_uses_one_snapshot(self) -> None:
-        original = "alpha = 1\nbeta = 2\ngamma = 3\n"
-        self.workspace.write_file("app.py", original)
-        result = self.workspace.apply_patch_batch(
-            "app.py",
-            [
-                {"old_text": "alpha = 1", "new_text": "alpha = 10"},
-                {"old_text": "gamma = 3", "new_text": "gamma = 30"},
-            ],
-        )
-        self.assertEqual(result["changes"], 2)
-        self.assertEqual(self.workspace.read_file("app.py"), "alpha = 10\nbeta = 2\ngamma = 30\n")
-
-        before_failure = self.workspace.read_file("app.py")
-        with self.assertRaises(WorkspaceError):
-            self.workspace.apply_patch_batch(
-                "app.py",
-                [
-                    {"old_text": "beta = 2", "new_text": "beta = 20"},
-                    {"old_text": "missing", "new_text": "value"},
-                ],
-            )
-        self.assertEqual(self.workspace.read_file("app.py"), before_failure)
 
 
 if __name__ == "__main__":

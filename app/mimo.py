@@ -90,7 +90,6 @@ DEFAULT_SETTINGS = {
     "reasoning_effort": "high",
     "reasoning_effort_enabled": True,
     "lowest_price_aggregators": [],
-    "text_replace_tool": False,
     "max_completion_tokens": 65536,
     "temperature": 1.0,
     "top_p": 0.95,

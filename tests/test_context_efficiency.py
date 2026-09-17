@@ -19,6 +19,7 @@ from app.mimo_local import (
     checkpoint_payload,
     stream_response,
 )
+from app.file_knowledge import FileKnowledge
 from app.workspace import ConversationWorkspace
 
 
@@ -114,21 +115,20 @@ class ContextEfficiencyTests(unittest.TestCase):
         )
         self.assertEqual(function["arguments"], raw)
 
-    def test_large_line_edit_is_compacted_after_success(self) -> None:
+    def test_large_edit_is_compacted_after_success(self) -> None:
         function = {
-            "name": "apply_line_edits",
+            "name": "edit_file",
             "arguments": json.dumps(
                 {
                     "path": "app.js",
-                    "revision": "a" * 64,
-                    "edits": [{"start_line": 1, "end_line": 20, "new_text": "x" * 10_000}],
+                    "edits": [{"old_text": "old();", "new_text": "x" * 10_000}],
                 }
             ),
         }
         self.assertTrue(
             _compact_workspace_call_arguments(
                 function,
-                name="apply_line_edits",
+                name="edit_file",
                 path="app.js",
                 succeeded=True,
             )
@@ -185,9 +185,8 @@ class ContextEfficiencyTests(unittest.TestCase):
                 "".join(f"line {number}: {'x' * 36}\n" for number in range(1, 801)),
             )
             snapshot = json.loads(workspace.execute("read_file", {"path": "app.py"}))
-            read_key = ("app.py", 1, None)
-            evidence = {read_key: snapshot}
-            reads = {read_key}
+            knowledge = FileKnowledge()
+            self.assertIsNone(knowledge.record_read(snapshot))
             base = [
                 {"role": "system", "content": "system"},
                 {"role": "user", "content": "fix it"},
@@ -219,48 +218,43 @@ class ContextEfficiencyTests(unittest.TestCase):
                     {"name": "read_file", "path": "app.py", "status": "completed"},
                     {"name": "web_search", "status": "completed"},
                 ],
-                workspace_read_evidence=evidence,
-                workspace_reads=reads,
+                knowledge=knowledge,
             )
 
             self.assertTrue(changed)
             checkpoint = checkpoint_payload(conversation)
-            self.assertEqual(checkpoint["workspace_read_snapshots"], [snapshot])
-            self.assertEqual(reads, {read_key})
+            [kept] = checkpoint["file_snapshots"]
+            self.assertEqual(kept["content"], snapshot["content"])
+            self.assertEqual((kept["path"], kept["revision"]), ("app.py", snapshot["revision"]))
             self.assertEqual(conversation[-2:], latest_pair)
+            # The read content is still in the request, so a re-read is short.
+            self.assertIn('"unchanged": true', knowledge.record_read(snapshot))
 
-            evidence.clear()
-            reads.clear()
+            knowledge.forget("app.py")
             refreshed = _maybe_compact_agent_context(
                 conversation,
                 base_message_count=len(base),
                 workspace=workspace,
                 sources={},
-                tool_trace=[{"name": "apply_line_edits", "path": "app.py", "status": "completed"}],
-                workspace_read_evidence=evidence,
-                workspace_reads=reads,
+                tool_trace=[{"name": "delete_file", "path": "app.py", "status": "completed"}],
+                knowledge=knowledge,
                 refresh_existing=True,
             )
             self.assertTrue(refreshed)
             checkpoint = checkpoint_payload(conversation)
-            self.assertEqual(checkpoint["workspace_read_snapshots"], [])
+            self.assertEqual(checkpoint["file_snapshots"], [])
 
-    def test_checkpoint_invalidates_dedupe_for_evidence_it_cannot_keep(self) -> None:
+    def test_checkpoint_forgets_content_it_cannot_keep(self) -> None:
         conversation = [
             {"role": "system", "content": "system"},
             {"role": "user", "content": "fix"},
             {"role": "assistant", "content": "x" * (AGENT_CONTEXT_COMPACT_THRESHOLD + 1)},
             {"role": "tool", "tool_call_id": "latest", "content": "latest"},
         ]
-        read_key = ("huge.py", 1, None)
-        evidence = {
-            read_key: {
-                "path": "huge.py",
-                "revision": "r",
-                "numbered_content": "x" * (CHECKPOINT_READ_EVIDENCE_CHARS + 1),
-            }
-        }
-        reads = {read_key}
+        knowledge = FileKnowledge()
+        huge = {"path": "huge.py", "revision": "r", "line_count": 1, "from_line": 1, "through_line": 1,
+                "truncated": False, "content": "1|" + "x" * (CHECKPOINT_READ_EVIDENCE_CHARS + 1)}
+        knowledge.record_read(huge)
 
         self.assertTrue(
             _maybe_compact_agent_context(
@@ -269,12 +263,12 @@ class ContextEfficiencyTests(unittest.TestCase):
                 workspace=None,
                 sources={},
                 tool_trace=[],
-                workspace_read_evidence=evidence,
-                workspace_reads=reads,
+                knowledge=knowledge,
             )
         )
-        self.assertEqual(reads, set())
-        self.assertEqual(evidence, {})
+        self.assertFalse(knowledge.known("huge.py"))
+        # Its content is gone from the request, so the next read returns it again.
+        self.assertIsNone(knowledge.record_read(huge))
 
 
 class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
@@ -385,10 +379,9 @@ class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
         )
         read_trace = result["tool_trace"][0]
         self.assertEqual(read_trace["requested_start_line"], 1)
-        self.assertEqual(read_trace["requested_end_line"], 1)
         self.assertEqual(read_trace["line_count"], 1)
-        self.assertEqual(read_trace["returned_from_line"], 1)
-        self.assertEqual(read_trace["returned_through_line"], 1)
+        self.assertEqual(read_trace["from_line"], 1)
+        self.assertEqual(read_trace["through_line"], 1)
         self.assertFalse(read_trace["truncated"])
 
 

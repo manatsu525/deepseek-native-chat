@@ -19,15 +19,45 @@ AGENT_WORKSPACE_ROOT = Path(os.getenv("AGENT_WORKSPACE_ROOT", "/home/share"))
 MAX_FILES = 200
 MAX_FILE_BYTES = 512 * 1024
 MAX_TOTAL_BYTES = 10 * 1024 * 1024
-MAX_READ_CHARS = 60_000
+# One read returns a whole file up to this size (typical single-file apps fit).
+MAX_READ_CHARS = 100_000
 MAX_SEARCH_RESULTS = 20
 AGENT_MAX_FILES = 4_000
 
-WORKSPACE_SYSTEM_PROMPT = """A persistent, isolated coding workspace is available for this conversation. When the user asks you to create code or a multi-file project, use the workspace tools to save the actual files instead of only printing complete files in chat. Keep planning proportional to the next concrete action: once you know the next useful workspace operation, call the tool immediately. For an implementation request, start with the smallest useful workspace operation—list_files or read_file—and make the first concrete edit as soon as its target and revision are known. When several workspace operations are needed, emit calls with known arguments in dependency order; the server executes workspace calls serially in this turn. Never respond with a promise such as "I will create the file" or "the file is being created"; perform the operation in the current turn. On later requests, inspect the existing workspace files and modify only what needs to change. Do not recreate or overwrite unrelated files. Every workspace tool call must include every field marked required in its JSON schema. File tools must include a non-empty workspace-relative path exactly as listed by list_files (or the intended new relative path for write_file), except when a tool's own description explicitly says its path is already bound; a pre-bound tool must not receive path. read_file returns numbered lines and an opaque revision. For an existing file, use one apply_line_edits call with that exact revision and all non-overlapping edits from the same read; do not use write_file to replace the whole file for a local change. If the revision is stale, read the file again. Saved Python programs can be verified with run_python. Saved HTML and JavaScript must be checked with check_web_syntax when that tool is available; it parses HTML and runs Node.js syntax checks on inline, event-handler, and local JavaScript without executing it. These tools run without network in disposable resource-limited copies. Treat a nonzero exit or ok=false as a real failure and fix it before claiming success. After a successful validation, answer the user. Repeat a read, search, or validation only when a new edit or new evidence requires it. A failed validation may justify inspection and an edit, but rerunning it without changing the workspace is not progress. Syntax success does not prove browser behavior is correct, so state that limitation. After editing, briefly summarize changed files; the UI supplies download links automatically."""
+WORKSPACE_SYSTEM_PROMPT = """A persistent, isolated coding workspace is available for this conversation. When the user asks you to create code or a multi-file project, use the workspace tools to save the actual files instead of only printing complete files in chat. Keep planning proportional to the next concrete action: once you know the next useful workspace operation, call the tool immediately. For an implementation request, start with the smallest useful workspace operation—list_files or read_file—and make the first concrete edit as soon as its target is known. When several workspace operations are needed, emit calls with known arguments in dependency order; the server executes workspace calls serially in this turn. Never respond with a promise such as "I will create the file" or "the file is being created"; perform the operation in the current turn. On later requests, inspect the existing workspace files and modify only what needs to change. Do not recreate or overwrite unrelated files. Every workspace tool call must include every field marked required in its JSON schema. File tools must include a non-empty workspace-relative path exactly as listed by list_files (or the intended new relative path for write_file), except when a tool's own description explicitly says its path is already bound; a pre-bound tool must not receive path. read_file returns the whole file as numbered lines in one call; only a file too large for one response is truncated, and then you continue from next_start_line. Never read a file in pieces. To change an existing file, make one edit_file call containing every change for that file: each old_text is an exact snippet copied from the file without the N| prefixes and long enough to be unique. Do not use write_file to replace a whole file for a local change. edit_file shows the edited regions and you already know the rest of the file, so do not re-read a file just to check your own edit. Saved Python programs can be verified with run_python. Saved HTML and JavaScript must be checked with check_web_syntax when that tool is available; it parses HTML and runs Node.js syntax checks on inline, event-handler, and local JavaScript without executing it. These tools run without network in disposable resource-limited copies. Treat a nonzero exit or ok=false as a real failure and fix it before claiming success. After a successful validation, answer the user. Repeat a read, search, or validation only when a new edit or new evidence requires it. A failed validation may justify inspection and an edit, but rerunning it without changing the workspace is not progress. Syntax success does not prove browser behavior is correct, so state that limitation. After editing, briefly summarize changed files; the UI supplies download links automatically."""
 
 READ_ONLY_WORKSPACE_SYSTEM_PROMPT = """A persistent coding workspace is available in read-only review mode. You may list, read, and search files and run the supplied validation tools, but you must not create, edit, replace, or delete files. Report concrete findings with file paths and test evidence. You may emit multiple read, search, or validation calls in one turn when their arguments are known; they execute serially. If a change is needed, describe it for the programmer instead of attempting the mutation yourself."""
 
-EDIT_WORKSPACE_SYSTEM_PROMPT = """A persistent coding workspace is available in implementation-only mode. You may list, read, search, create, edit, and delete workspace files as needed to implement the requested change. Keep planning proportional to the next concrete action: once you know the next useful workspace operation, call the tool immediately. For an implementation request, start with the smallest useful workspace operation—list_files or read_file—and make the first concrete edit as soon as its target and revision are known. When several workspace operations are needed, emit calls with known arguments in dependency order; the server executes workspace calls serially in this turn. Never respond with a promise such as "I will create the file" or "the file is being created"; perform the operation in the current turn. Runtime execution and syntax-validation tools are intentionally unavailable because a separate reviewer is responsible for verification. Read only what is needed, make the actual edits, and then report the changed files; verification is handled by a separate reviewer."""
+EDIT_WORKSPACE_SYSTEM_PROMPT = """A persistent coding workspace is available in implementation-only mode. You may list, read, search, create, edit, and delete workspace files as needed to implement the requested change. Keep planning proportional to the next concrete action: once you know the next useful workspace operation, call the tool immediately. For an implementation request, start with the smallest useful workspace operation—list_files or read_file—and make the first concrete edit as soon as its target is known. When several workspace operations are needed, emit calls with known arguments in dependency order; the server executes workspace calls serially in this turn. Never respond with a promise such as "I will create the file" or "the file is being created"; perform the operation in the current turn. Read each file once as a whole and change existing files with edit_file using exact snippets. Runtime execution and syntax-validation tools are intentionally unavailable because a separate reviewer is responsible for verification. Read only what is needed, make the actual edits, and then report the changed files; verification is handled by a separate reviewer."""
+
+
+READ_FILE_DESCRIPTION = (
+    "Read a whole UTF-8 file as numbered lines ('N|text') in one call. Read a file once and reuse what you saw; "
+    "the file is never split unless it exceeds the response limit, in which case truncated=true and next_start_line tells where to continue."
+)
+READ_START_LINE_DESCRIPTION = "Only for continuing a truncated read: pass the previous next_start_line. Omit otherwise."
+EDIT_FILE_DESCRIPTION = (
+    "Change an existing file by replacing exact text snippets. Put every change for this file in one call; all edits are "
+    "applied together or not at all. Each old_text must be copied verbatim from the file (without the 'N|' prefixes) and "
+    "contain enough surrounding lines to match exactly one place, unless replace_all is true. To insert, include a nearby "
+    "anchor line in old_text and repeat it in new_text. To delete, use an empty new_text. The result shows each edited "
+    "region with its new line numbers; the rest of the file is unchanged, so you do not need to read it again."
+)
+EDITS_SCHEMA = {
+    "type": "array",
+    "minItems": 1,
+    "maxItems": 30,
+    "items": {
+        "type": "object",
+        "properties": {
+            "old_text": {"type": "string", "description": "Exact existing text to replace"},
+            "new_text": {"type": "string", "description": "Replacement text (may be empty)"},
+            "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring exactly one"},
+        },
+        "required": ["old_text", "new_text"],
+        "additionalProperties": False,
+    },
+}
 
 
 def _function(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -55,47 +85,26 @@ WORKSPACE_TOOLS = [
     ),
     _function(
         "read_file",
-        "Read a UTF-8 file as numbered lines and receive its exact revision. Use the returned revision with apply_line_edits.",
+        READ_FILE_DESCRIPTION,
         {
             "path": {"type": "string", "description": "Workspace-relative path"},
-            "start_line": {"type": "integer", "minimum": 1, "description": "Optional first line; defaults to 1"},
-            "end_line": {"type": "integer", "minimum": 1, "description": "Optional last inclusive line; defaults to end of file"},
+            "start_line": {"type": "integer", "minimum": 1, "description": READ_START_LINE_DESCRIPTION},
         },
         ["path"],
     ),
     _function(
         "write_file",
-        "Create a new UTF-8 text file, or completely replace a file only when a full rewrite is genuinely intended. Use apply_line_edits for local changes.",
+        "Create a new UTF-8 text file, or completely replace a file only when a full rewrite is genuinely intended. Use edit_file for changes to an existing file.",
         {
             "path": {"type": "string", "description": "Workspace-relative path"},
             "content": {"type": "string", "description": "Complete file contents"},
         },
         ["path", "content"],
     ),
-    _function(
-        "apply_line_edits",
-        "Atomically edit numbered line ranges from one read_file snapshot. Pass the exact returned revision and put every non-overlapping edit in one call. start_line..end_line replaces inclusive lines. To insert before line N use start_line=N,end_line=N-1; to append use start_line=line_count+1,end_line=line_count. A successful edit returns the new revision; line numbers after an inserted or removed range shift, so before a later edit re-read only the region you will change, not the whole file.",
-        {
-            "path": {"type": "string", "description": "Workspace-relative path"},
-            "revision": {"type": "string", "description": "Exact opaque revision returned by the latest read_file"},
-            "edits": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 20,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "start_line": {"type": "integer", "minimum": 1, "description": "First 1-based line to replace, or insertion position"},
-                        "end_line": {"type": "integer", "minimum": 0, "description": "Last inclusive line; use start_line-1 for insertion"},
-                        "new_text": {"type": "string", "description": "Complete replacement text for this range"},
-                    },
-                    "required": ["start_line", "end_line", "new_text"],
-                    "additionalProperties": False,
-                },
-            },
-        },
-        ["path", "revision", "edits"],
-    ),
+    _function("edit_file", EDIT_FILE_DESCRIPTION, {
+        "path": {"type": "string", "description": "Workspace-relative path of an existing file"},
+        "edits": EDITS_SCHEMA,
+    }, ["path", "edits"]),
     _function(
         "search_files",
         "Search text across workspace files and return matching paths and line snippets.",
@@ -135,28 +144,11 @@ CHECK_WEB_SYNTAX_TOOL = _function(
     ["path"],
 )
 
-REPLACE_TEXT_TOOL = _function(
-    "replace_text",
-    "Replace an exact, unique snippet in an existing file; no revision is needed. Copy old_text verbatim from the file "
-    "(without the 'N|' line-number prefixes shown by read_file) and include enough surrounding lines to make it unique. "
-    "Use replace_all only when every occurrence should change. The result shows the edited region with its new line numbers.",
-    {
-        "path": {"type": "string", "description": "Workspace-relative path"},
-        "old_text": {"type": "string", "description": "Exact existing text to replace"},
-        "new_text": {"type": "string", "description": "Replacement text"},
-        "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring exactly one"},
-    },
-    ["path", "old_text", "new_text"],
-)
-TEXT_REPLACE_SYSTEM_PROMPT = (
-    "For a small local change you may use replace_text with an exact, unique snippet copied from the file instead of "
-    "apply_line_edits; it needs no revision and is not affected by shifted line numbers. Use apply_line_edits for "
-    "large multi-region rewrites."
-)
-
-LEGACY_PATCH_TOOL_NAMES = {"apply_patch", "apply_patch_batch"}
+# Older single/batch patch names that some models or text-markup fallbacks
+# still emit. They are not advertised and are executed as edit_file.
+LEGACY_PATCH_TOOL_NAMES = {"apply_patch", "apply_patch_batch", "replace_text"}
 WORKSPACE_TOOL_NAMES = {
-    item["function"]["name"] for item in [*WORKSPACE_TOOLS, RUN_PYTHON_TOOL, CHECK_WEB_SYNTAX_TOOL, REPLACE_TEXT_TOOL]
+    item["function"]["name"] for item in [*WORKSPACE_TOOLS, RUN_PYTHON_TOOL, CHECK_WEB_SYNTAX_TOOL]
 } | LEGACY_PATCH_TOOL_NAMES
 READ_ONLY_WORKSPACE_TOOL_NAMES = {
     "list_files",
@@ -248,16 +240,121 @@ def _closest_region_hint(content: str, old: str) -> str:
     return "最接近的当前内容：\n" + "\n".join(shown)
 
 
-def replace_text_in_content(content: str, old: str, new: str, replace_all: bool) -> tuple[str, int, list[tuple[int, int]], str]:
-    """Exact snippet replacement with conservative recovery for common copy slips.
+def numbered_window(content: str, start_line: Any = None, max_chars: int = MAX_READ_CHARS) -> dict[str, Any]:
+    """Render a file as numbered lines, whole whenever it fits in one response.
 
-    Recovery is attempted only when the exact text is absent: copied
-    ``N|`` read_file prefixes are removed, then trailing whitespace and line
-    endings are ignored line by line. Every mode still requires a unique match
-    unless replace_all is set. Returns (updated, count, edited regions, mode).
+    ``start_line`` only continues a read that was truncated. If the whole file
+    fits, it is returned from line 1 regardless, so a model can never turn one
+    read into several overlapping partial reads.
     """
-    if not old:
-        raise WorkspaceError("old_text 不能为空")
+    lines = content.splitlines()
+    try:
+        first = int(start_line) if start_line not in (None, "") else 1
+    except (TypeError, ValueError) as exc:
+        raise WorkspaceError("start_line 无效") from exc
+    if first < 1:
+        raise WorkspaceError("start_line 必须大于等于 1")
+    if lines and first > len(lines):
+        raise WorkspaceError(f"start_line 超出文件范围（共 {len(lines)} 行）")
+    whole_size = sum(len(str(number)) + 2 + len(line) for number, line in enumerate(lines, 1))
+    note = ""
+    if whole_size <= max_chars:
+        if first != 1:
+            note = "文件可以一次读完，已忽略 start_line 并返回全文。"
+        first = 1
+    rendered: list[str] = []
+    used = 0
+    through = first - 1 if lines else 0
+    for number in range(first, len(lines) + 1):
+        text = f"{number}|{lines[number - 1]}"
+        if rendered and used + len(text) + 1 > max_chars:
+            break
+        rendered.append(text)
+        used += len(text) + 1
+        through = number
+    result: dict[str, Any] = {
+        "line_count": len(lines),
+        "from_line": first if rendered else 0,
+        "through_line": through,
+        "truncated": through < len(lines),
+        "content": "\n".join(rendered),
+    }
+    if result["truncated"]:
+        result["next_start_line"] = through + 1
+    if note:
+        result["note"] = note
+    return result
+
+
+def edit_list(name: str, arguments: dict[str, Any]) -> Any:
+    """Normalize edit_file and legacy single/batch patch arguments to an edit list."""
+    if name == "apply_patch_batch":
+        return arguments.get("patches")
+    if name in {"apply_patch", "replace_text", "host_apply_patch"} or (
+        "edits" not in arguments and "old_text" in arguments
+    ):
+        return [{key: arguments[key] for key in ("old_text", "new_text", "replace_all") if key in arguments}]
+    return arguments.get("edits")
+
+
+def apply_text_edits(content: str, edits: Any) -> tuple[str, list[tuple[int, int]], list[dict[str, Any]]]:
+    """Apply several exact-snippet edits to one file atomically.
+
+    All snippets are located in the original content, must not overlap, and
+    are applied together; any failure leaves the file untouched. Returns the
+    updated content, the edited character regions in it, and per-edit details.
+    """
+    if not isinstance(edits, list) or not edits or len(edits) > 30:
+        raise WorkspaceError("edits 必须是包含 1 到 30 项的数组")
+    planned: list[tuple[int, int, str, int]] = []
+    details: list[dict[str, Any]] = []
+    for index, edit in enumerate(edits, 1):
+        if not isinstance(edit, dict):
+            raise WorkspaceError(f"第 {index} 处修改不是对象；整个批次未修改")
+        old = edit.get("old_text")
+        new = edit.get("new_text")
+        if not isinstance(old, str) or not old:
+            raise WorkspaceError(f"第 {index} 处修改的 old_text 不能为空；整个批次未修改")
+        if not isinstance(new, str):
+            raise WorkspaceError(f"第 {index} 处修改缺少 new_text；整个批次未修改")
+        try:
+            spans, replacement, mode = _find_spans(content, old, new)
+        except WorkspaceError as exc:
+            raise WorkspaceError(f"第 {index} 处修改：{exc}；整个批次未修改") from None
+        replace_all = bool(edit.get("replace_all", False))
+        if len(spans) > 1 and not replace_all:
+            starts = _line_starts(content)
+            where = "、".join(str(_line_of_offset(starts, start)) for start, _ in spans[:10])
+            raise WorkspaceError(
+                f"第 {index} 处修改的 old_text 出现 {len(spans)} 次（起始行：{where}）；"
+                "请加入更多上下文使其唯一，或设置 replace_all；整个批次未修改"
+            )
+        targets = spans if replace_all else spans[:1]
+        planned.extend((start, end, replacement, index) for start, end in targets)
+        details.append({"replacements": len(targets), "match": mode})
+    ordered = sorted(planned, key=lambda item: (item[0], item[1]))
+    for previous, current in zip(ordered, ordered[1:]):
+        if current[0] < previous[1]:
+            raise WorkspaceError(f"第 {previous[3]} 和第 {current[3]} 处修改的范围重叠；整个批次未修改")
+    updated = content
+    for start, end, replacement, _ in reversed(ordered):
+        updated = updated[:start] + replacement + updated[end:]
+    regions: list[tuple[int, int]] = []
+    shift = 0
+    for start, end, replacement, _ in ordered:
+        new_start = start + shift
+        regions.append((new_start, new_start + len(replacement)))
+        shift += len(replacement) - (end - start)
+    return updated, regions, details
+
+
+def _find_spans(content: str, old: str, new: str) -> tuple[list[tuple[int, int]], str, str]:
+    """Locate ``old`` with conservative recovery for common copy slips.
+
+    Recovery is attempted only when the exact text is absent: copied ``N|``
+    read_file prefixes are removed, then trailing whitespace and line endings
+    are ignored line by line. Returns (spans, replacement, match mode).
+    """
     attempts: list[tuple[str, str, str]] = [("exact", old, new)]
     old_lines = old.splitlines()
     if old_lines and all(_LINE_NUMBER_PREFIX.match(line) for line in old_lines):
@@ -281,7 +378,7 @@ def replace_text_in_content(content: str, old: str, new: str, replace_all: bool)
             starts.append(found)
             offset = found + len(needle)
         if starts:
-            return _apply_spans(content, [(start, start + len(needle)) for start in starts], replacement, replace_all, mode)
+            return [(start, start + len(needle)) for start in starts], replacement, mode
     # Line-wise match that ignores trailing whitespace and CR/LF differences.
     needle_lines = [line.rstrip() for line in attempts[-1][1].splitlines()]
     replacement = attempts[-1][2]
@@ -302,27 +399,12 @@ def replace_text_in_content(content: str, old: str, new: str, replace_all: bool)
             else:
                 index += 1
         if spans:
-            return _apply_spans(content, spans, replacement, replace_all, "whitespace_insensitive")
+            return spans, replacement, "whitespace_insensitive"
     hint = _closest_region_hint(content, attempts[-1][1])
-    raise WorkspaceError("old_text 与当前文件不匹配（已忽略行号前缀和行尾空白）。" + (f"\n{hint}" if hint else "请先读取相关片段后再修改。"))
-
-
-def _apply_spans(content: str, spans: list[tuple[int, int]], replacement: str, replace_all: bool, mode: str) -> tuple[str, int, list[tuple[int, int]], str]:
-    if len(spans) > 1 and not replace_all:
-        lines = _line_starts(content)
-        where = "、".join(str(_line_of_offset(lines, start)) for start, _ in spans[:10])
-        raise WorkspaceError(f"old_text 在文件中出现 {len(spans)} 次（起始行：{where}）；请加入更多上下文使其唯一，或启用 replace_all")
-    targets = spans if replace_all else spans[:1]
-    updated = content
-    for start, end in reversed(targets):
-        updated = updated[:start] + replacement + updated[end:]
-    regions: list[tuple[int, int]] = []
-    shift = 0
-    for start, end in targets:
-        new_start = start + shift
-        regions.append((new_start, new_start + len(replacement)))
-        shift += len(replacement) - (end - start)
-    return updated, len(targets), regions, mode
+    raise WorkspaceError(
+        "old_text 与当前文件不匹配（已忽略行号前缀和行尾空白）"
+        + (f"。{hint}" if hint else "；请确认片段与文件内容逐字一致")
+    )
 
 
 class ConversationWorkspace:
@@ -368,7 +450,7 @@ class ConversationWorkspace:
             for path in self._files()
         ]
 
-    def tool_definitions(self, access: str = "full", *, text_replace: bool = False) -> list[dict[str, Any]]:
+    def tool_definitions(self, access: str = "full") -> list[dict[str, Any]]:
         """Return a byte-stable schema so provider prefix caches stay reusable.
 
         Existing paths are runtime state, not part of a tool's contract.  Putting
@@ -377,8 +459,6 @@ class ConversationWorkspace:
         authoritative way for the model to discover paths.
         """
         tools = [*WORKSPACE_TOOLS, RUN_PYTHON_TOOL, CHECK_WEB_SYNTAX_TOOL]
-        if text_replace:
-            tools.insert(4, REPLACE_TEXT_TOOL)
         if access == "read_only":
             tools = [item for item in tools if item["function"]["name"] in READ_ONLY_WORKSPACE_TOOL_NAMES]
         elif access == "edit":
@@ -409,43 +489,9 @@ class ConversationWorkspace:
     def _revision(content: str) -> str:
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
-    def read_snapshot(self, path: Any, start_line: Any = 1, end_line: Any = None) -> dict[str, Any]:
+    def read_snapshot(self, path: Any, start_line: Any = None) -> dict[str, Any]:
         content, relative = self._read_text(path)
-        lines = content.splitlines()
-        try:
-            first = int(start_line if start_line is not None else 1)
-            last = len(lines) if end_line is None else int(end_line)
-        except (TypeError, ValueError) as exc:
-            raise WorkspaceError("读取行号无效") from exc
-        if not lines and first == 1 and (end_line is None or last == 1):
-            last = 0
-        elif first < 1 or last < first:
-            raise WorkspaceError("读取行号范围无效")
-        if lines and first > len(lines):
-            raise WorkspaceError(f"start_line 超出文件范围（共 {len(lines)} 行）")
-        last = min(last, len(lines))
-        rendered: list[str] = []
-        rendered_chars = 0
-        returned_through = 0
-        for number in range(first, last + 1):
-            line = lines[number - 1]
-            numbered = f"{number}|{line}"
-            added = len(numbered) + (1 if rendered else 0)
-            if rendered and rendered_chars + added > MAX_READ_CHARS:
-                break
-            rendered.append(numbered)
-            rendered_chars += added
-            returned_through = number
-        truncated = returned_through < last
-        return {
-            "path": relative,
-            "revision": self._revision(content),
-            "line_count": len(lines),
-            "returned_from_line": first if rendered else 0,
-            "returned_through_line": returned_through,
-            "truncated": truncated,
-            "numbered_content": "\n".join(rendered),
-        }
+        return {"path": relative, "revision": self._revision(content), **numbered_window(content, start_line)}
 
     def _validate_write(self, target: Path, content: str) -> bytes:
         encoded = content.encode("utf-8")
@@ -474,152 +520,22 @@ class ConversationWorkspace:
         target.chmod(0o600)
         return {"ok": True, "path": relative, "size": len(encoded)}
 
-    def apply_patch(self, path: Any, old_text: Any, new_text: Any, replace_all: Any = False) -> dict[str, Any]:
-        old = str(old_text or "")
-        if not old:
-            raise WorkspaceError("old_text 不能为空")
-        content, _ = self._read_text(path)
-        matches = content.count(old)
-        if not matches:
-            raise WorkspaceError("old_text 与当前文件不匹配；请重新读取文件后再修改")
-        if matches > 1 and not bool(replace_all):
-            raise WorkspaceError(f"old_text 在文件中出现 {matches} 次；请提供更精确的上下文或启用 replace_all")
-        updated = content.replace(old, str(new_text or ""), -1 if bool(replace_all) else 1)
-        result = self.write_file(path, updated)
-        result["replacements"] = matches if bool(replace_all) else 1
-        return result
-
-    def replace_text(self, path: Any, old_text: Any, new_text: Any, replace_all: Any = False) -> dict[str, Any]:
+    def edit_file(self, path: Any, edits: Any) -> dict[str, Any]:
         content, relative = self._read_text(path)
-        updated, count, regions, mode = replace_text_in_content(
-            content, str(old_text or ""), str(new_text or ""), bool(replace_all)
-        )
+        updated, regions, details = apply_text_edits(content, edits)
         result = self.write_file(relative, updated)
         result.update(
             {
-                "replacements": count,
-                "match": mode,
+                "edits": len(details),
+                "replacements": sum(item["replacements"] for item in details),
                 "revision": self._revision(updated),
                 "line_count": len(updated.splitlines()),
                 **edited_excerpt(updated, regions),
             }
         )
-        return result
-
-    def apply_patch_batch(self, path: Any, patches: Any) -> dict[str, Any]:
-        if not isinstance(patches, list) or not patches or len(patches) > 20:
-            raise WorkspaceError("patches 必须是包含 1 到 20 项的数组")
-        content, _ = self._read_text(path)
-        replacements: list[tuple[int, int, str, int]] = []
-        for patch_index, patch in enumerate(patches):
-            if not isinstance(patch, dict):
-                raise WorkspaceError(f"第 {patch_index + 1} 个补丁不是对象")
-            old = str(patch.get("old_text") or "")
-            if not old:
-                raise WorkspaceError(f"第 {patch_index + 1} 个补丁的 old_text 不能为空")
-            starts: list[int] = []
-            offset = 0
-            while True:
-                found = content.find(old, offset)
-                if found < 0:
-                    break
-                starts.append(found)
-                offset = found + len(old)
-            if not starts:
-                raise WorkspaceError(f"第 {patch_index + 1} 个补丁的 old_text 与当前文件不匹配；整个批次未修改")
-            replace_all = bool(patch.get("replace_all", False))
-            if len(starts) > 1 and not replace_all:
-                raise WorkspaceError(f"第 {patch_index + 1} 个补丁的 old_text 出现 {len(starts)} 次；请提供更精确上下文")
-            for start in starts if replace_all else starts[:1]:
-                replacements.append((start, start + len(old), str(patch.get("new_text") or ""), patch_index))
-        ordered = sorted(replacements, key=lambda item: (item[0], item[1]))
-        for previous, current in zip(ordered, ordered[1:]):
-            if current[0] < previous[1]:
-                raise WorkspaceError(f"第 {previous[3] + 1} 和第 {current[3] + 1} 个补丁范围重叠；整个批次未修改")
-        updated = content
-        for start, end, new_text, _ in reversed(ordered):
-            updated = updated[:start] + new_text + updated[end:]
-        result = self.write_file(path, updated)
-        result["changes"] = len(patches)
-        result["replacements"] = len(replacements)
-        return result
-
-    def apply_line_edits(self, path: Any, revision: Any, edits: Any) -> dict[str, Any]:
-        content, relative = self._read_text(path)
-        current_revision = self._revision(content)
-        supplied_revision = str(revision or "").strip()
-        if not supplied_revision:
-            raise WorkspaceError("revision 不能为空；请先调用 read_file")
-        if supplied_revision != current_revision:
-            raise WorkspaceError("文件版本已经变化；请重新读取文件并使用新的 revision")
-        if not isinstance(edits, list) or not edits or len(edits) > 20:
-            raise WorkspaceError("edits 必须是包含 1 到 20 项的数组")
-
-        lines = content.splitlines(keepends=True)
-        line_count = len(lines)
-        offsets = [0]
-        for line in lines:
-            offsets.append(offsets[-1] + len(line))
-
-        ranges: list[tuple[int, int, str, int]] = []
-        for edit_index, edit in enumerate(edits):
-            if not isinstance(edit, dict):
-                raise WorkspaceError(f"第 {edit_index + 1} 个行编辑不是对象")
-            try:
-                start_line = int(edit.get("start_line"))
-                end_line = int(edit.get("end_line"))
-            except (TypeError, ValueError) as exc:
-                raise WorkspaceError(f"第 {edit_index + 1} 个行编辑的行号无效") from exc
-            insertion = end_line == start_line - 1
-            if insertion:
-                if start_line < 1 or start_line > line_count + 1:
-                    raise WorkspaceError(f"第 {edit_index + 1} 个插入位置超出文件范围")
-                start_offset = end_offset = offsets[start_line - 1]
-            else:
-                if start_line < 1 or end_line < start_line or end_line > line_count:
-                    raise WorkspaceError(f"第 {edit_index + 1} 个替换范围超出文件范围")
-                start_offset = offsets[start_line - 1]
-                end_offset = offsets[end_line]
-            new_text = str(edit.get("new_text") or "")
-            replaced_had_line_ending = (
-                not insertion and bool(lines[end_line - 1]) and lines[end_line - 1].endswith(("\n", "\r"))
-            )
-            if (
-                new_text
-                and (end_offset < len(content) or replaced_had_line_ending)
-                and not new_text.endswith(("\n", "\r"))
-            ):
-                new_text += "\n"
-            ranges.append((start_offset, end_offset, new_text, edit_index))
-
-        ordered = sorted(ranges, key=lambda item: (item[0], item[1]))
-        for previous, current in zip(ordered, ordered[1:]):
-            if current[0] < previous[1] or (
-                current[0] == previous[0] and current[1] == previous[1]
-            ):
-                raise WorkspaceError(
-                    f"第 {previous[3] + 1} 和第 {current[3] + 1} 个行编辑范围重叠；整个批次未修改"
-                )
-
-        updated = content
-        for start_offset, end_offset, new_text, _ in reversed(ordered):
-            updated = updated[:start_offset] + new_text + updated[end_offset:]
-        regions: list[tuple[int, int]] = []
-        shift = 0
-        for start_offset, end_offset, new_text, _ in ordered:
-            new_start = start_offset + shift
-            regions.append((new_start, new_start + len(new_text)))
-            shift += len(new_text) - (end_offset - start_offset)
-        result = self.write_file(relative, updated)
-        result.update(
-            {
-                "changes": len(edits),
-                "previous_revision": current_revision,
-                "revision": self._revision(updated),
-                "line_count": len(updated.splitlines()),
-                **edited_excerpt(updated, regions),
-            }
-        )
+        recovered = sorted({item["match"] for item in details} - {"exact"})
+        if recovered:
+            result["match"] = recovered
         return result
 
     def run_python(self, path: Any, arguments: Any = None) -> dict[str, Any]:
@@ -673,21 +589,11 @@ class ConversationWorkspace:
         if name == "list_files":
             result: Any = {"files": self.list_files()}
         elif name == "read_file":
-            result = self.read_snapshot(
-                arguments.get("path"),
-                arguments.get("start_line", 1),
-                arguments.get("end_line"),
-            )
+            result = self.read_snapshot(arguments.get("path"), arguments.get("start_line"))
         elif name == "write_file":
             result = self.write_file(arguments.get("path"), arguments.get("content"))
-        elif name == "apply_line_edits":
-            result = self.apply_line_edits(arguments.get("path"), arguments.get("revision"), arguments.get("edits"))
-        elif name == "replace_text":
-            result = self.replace_text(arguments.get("path"), arguments.get("old_text"), arguments.get("new_text"), arguments.get("replace_all", False))
-        elif name == "apply_patch":
-            result = self.apply_patch(arguments.get("path"), arguments.get("old_text"), arguments.get("new_text"), arguments.get("replace_all", False))
-        elif name == "apply_patch_batch":
-            result = self.apply_patch_batch(arguments.get("path"), arguments.get("patches"))
+        elif name == "edit_file" or name in LEGACY_PATCH_TOOL_NAMES:
+            result = self.edit_file(arguments.get("path"), edit_list(name, arguments))
         elif name == "search_files":
             result = self.search_files(arguments.get("query"), arguments.get("path", ""))
         elif name == "delete_file":

@@ -49,7 +49,7 @@ class InklingToolCompatTests(unittest.TestCase):
 
     def test_patch_schemas_are_explicitly_bound_without_path_argument(self) -> None:
         tools, bindings = bind_patch_tools(WORKSPACE_TOOLS, ["chinese-chess.html"])
-        bound = [item for item in tools if item["function"]["name"].startswith("inkling_apply_line_edits_")]
+        bound = [item for item in tools if item["function"]["name"].startswith("inkling_edit_file_")]
         self.assertEqual(len(bound), 1)
         for tool in bound:
             function = tool["function"]

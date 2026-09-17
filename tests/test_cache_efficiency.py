@@ -12,7 +12,7 @@ from app import mimo_local
 from app.agent import AgentRuntime
 from app.db import Database
 from app.work_log import WORK_LOG_HEADER, build_work_log, with_work_log
-from app.workspace import ConversationWorkspace, WorkspaceError, replace_text_in_content
+from app.workspace import ConversationWorkspace, WorkspaceError, apply_text_edits, edited_excerpt
 
 
 def fake_client(rounds, requests):
@@ -85,94 +85,101 @@ async def run_stream(workspace, rounds, **kwargs):
     return result, requests
 
 
-class ReplaceTextTests(unittest.TestCase):
+def one_edit(content, old, new, replace_all=False):
+    return apply_text_edits(content, [{"old_text": old, "new_text": new, "replace_all": replace_all}])
+
+
+class EditEngineTests(unittest.TestCase):
     def test_exact_replacement_reports_new_line_numbers(self):
-        content = "a\nb\nc\nd\n"
-        updated, count, regions, mode = replace_text_in_content(content, "b\n", "b1\nb2\n", False)
-        self.assertEqual((updated, count, mode), ("a\nb1\nb2\nc\nd\n", 1, "exact"))
-        workspace_excerpt = __import__("app.workspace", fromlist=["edited_excerpt"]).edited_excerpt(updated, regions)
-        self.assertIn("2|b1", workspace_excerpt["updated_excerpt"])
-        self.assertIn("3|b2", workspace_excerpt["updated_excerpt"])
+        updated, regions, details = one_edit("a\nb\nc\nd\n", "b\n", "b1\nb2\n")
+        self.assertEqual((updated, details), ("a\nb1\nb2\nc\nd\n", [{"replacements": 1, "match": "exact"}]))
+        excerpt = edited_excerpt(updated, regions)["updated_excerpt"]
+        self.assertIn("2|b1", excerpt)
+        self.assertIn("3|b2", excerpt)
 
     def test_copied_line_number_prefixes_are_tolerated(self):
-        content = "def f():\n    return 1\n"
-        updated, _, _, mode = replace_text_in_content(content, "2|    return 1", "2|    return 2", False)
-        self.assertEqual(mode, "line_numbers_removed")
+        updated, _, details = one_edit("def f():\n    return 1\n", "2|    return 1", "2|    return 2")
+        self.assertEqual(details[0]["match"], "line_numbers_removed")
         self.assertEqual(updated, "def f():\n    return 2\n")
 
     def test_trailing_whitespace_is_tolerated(self):
-        content = "x = 1   \r\ny = 2\r\n"
-        updated, _, _, mode = replace_text_in_content(content, "x = 1\ny = 2", "x = 3\ny = 4", False)
-        self.assertEqual(mode, "whitespace_insensitive")
+        updated, _, details = one_edit("x = 1   \r\ny = 2\r\n", "x = 1\ny = 2", "x = 3\ny = 4")
+        self.assertEqual(details[0]["match"], "whitespace_insensitive")
         self.assertEqual(updated, "x = 3\ny = 4\r\n")
 
     def test_ambiguous_and_missing_text_fail_without_changes(self):
         with self.assertRaisesRegex(WorkspaceError, "出现 2 次.*1、3"):
-            replace_text_in_content("x\ny\nx\n", "x", "z", False)
-        updated, count, _, _ = replace_text_in_content("x\ny\nx\n", "x", "z", True)
-        self.assertEqual((updated, count), ("z\ny\nz\n", 2))
+            one_edit("x\ny\nx\n", "x", "z")
+        updated, _, details = one_edit("x\ny\nx\n", "x", "z", True)
+        self.assertEqual((updated, details[0]["replacements"]), ("z\ny\nz\n", 2))
         with self.assertRaisesRegex(WorkspaceError, "最接近的当前内容：\n2\\|    total = price \\* qty"):
-            replace_text_in_content("def f():\n    total = price * qty\n", "  total = price*qty", "x", False)
+            one_edit("def f():\n    total = price * qty\n", "  total = price*qty", "x")
 
-    def test_workspace_tool_is_opt_in_and_returns_excerpt(self):
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = ConversationWorkspace(1, "replace")
-            workspace.root = Path(directory)
-            names = {item["function"]["name"] for item in workspace.tool_definitions()}
-            self.assertNotIn("replace_text", names)
-            names = {item["function"]["name"] for item in workspace.tool_definitions("edit", text_replace=True)}
-            self.assertIn("replace_text", names)
-            workspace.write_file("app.js", "".join(f"line{n}\n" for n in range(1, 11)))
-            result = json.loads(workspace.execute("replace_text", {"path": "app.js", "old_text": "line5\n", "new_text": "five\n"}))
-            self.assertEqual(result["replacements"], 1)
-            self.assertIn("5|five", result["updated_excerpt"])
-            self.assertIn("3|line3", result["updated_excerpt"])
-            self.assertTrue(result["revision"])
+    def test_insert_and_delete_with_anchors(self):
+        content = "import a\n\ndef main():\n    run()\n    debug()\n"
+        updated, _, _ = apply_text_edits(content, [
+            {"old_text": "import a\n", "new_text": "import a\nimport b\n"},
+            {"old_text": "    debug()\n", "new_text": ""},
+        ])
+        self.assertEqual(updated, "import a\nimport b\n\ndef main():\n    run()\n")
 
-    def test_line_edits_return_shifted_excerpt(self):
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = ConversationWorkspace(1, "edits")
-            workspace.root = Path(directory)
-            workspace.write_file("a.txt", "".join(f"l{n}\n" for n in range(1, 21)))
-            revision = json.loads(workspace.execute("read_file", {"path": "a.txt"}))["revision"]
-            result = workspace.apply_line_edits("a.txt", revision, [
-                {"start_line": 2, "end_line": 1, "new_text": "new-a\nnew-b"},
-                {"start_line": 15, "end_line": 15, "new_text": "fifteen"},
-            ])
-            self.assertIn("2|new-a", result["updated_excerpt"])
-            self.assertIn("3|new-b", result["updated_excerpt"])
-            self.assertIn("17|fifteen", result["updated_excerpt"])
-            self.assertIn("...", result["updated_excerpt"])
-
-    def test_host_patch_uses_tolerant_matching_and_excerpt(self):
+    def test_host_edit_uses_tolerant_matching_and_excerpt(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mod.json"
             path.write_text('{\n  "spell": "old"  \n}\n')
-            result = json.loads(AgentRuntime(None, 1, "t").execute("host_apply_patch", {
-                "path": str(path), "old_text": '2|  "spell": "old"', "new_text": '2|  "spell": "new"'}))
+            result = json.loads(AgentRuntime(None, 1, "t").execute("host_edit_file", {
+                "path": str(path), "edits": [{"old_text": '2|  "spell": "old"', "new_text": '2|  "spell": "new"'}]}))
             self.assertTrue(result["ok"], result)
             self.assertIn('2|  "spell": "new"', result["updated_excerpt"])
-            self.assertEqual(result["match"], "line_numbers_removed")
+            self.assertEqual(result["match"], ["line_numbers_removed"])
             self.assertEqual(path.read_text(), '{\n  "spell": "new"  \n}\n')
-            failed = json.loads(AgentRuntime(None, 1, "t").execute("host_apply_patch", {
-                "path": str(path), "old_text": "missing", "new_text": "x"}))
-            self.assertFalse(failed["ok"])
 
 
 class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
-    async def test_text_replace_setting_controls_tool_and_prompt(self):
+    async def test_read_edit_read_does_not_resend_the_file(self):
         with tempfile.TemporaryDirectory() as directory:
-            workspace = ConversationWorkspace(1, "stream")
+            workspace = ConversationWorkspace(1, "edit-flow")
             workspace.root = Path(directory)
-            _, off = await run_stream(workspace, [answer_round("ok")])
-            _, on = await run_stream(workspace, [answer_round("ok")],
-                                     settings={"thinking": "disabled", "text_replace_tool": True})
-        names_off = {tool["function"]["name"] for tool in off[0]["tools"]}
-        names_on = {tool["function"]["name"] for tool in on[0]["tools"]}
-        self.assertNotIn("replace_text", names_off)
-        self.assertIn("replace_text", names_on)
-        self.assertIn("replace_text", on[0]["messages"][0]["content"])
-        self.assertNotIn("replace_text", off[0]["messages"][0]["content"])
+            workspace.write_file("game.js", "".join(f"step{n}();\n" for n in range(1, 301)))
+            result, requests = await run_stream(workspace, [
+                tool_round("r1", "read_file", {"path": "game.js"}),
+                tool_round("e1", "edit_file", {"path": "game.js", "edits": [
+                    {"old_text": "step10();\n", "new_text": "step10();\nextra();\n"}]}),
+                tool_round("r2", "read_file", {"path": "game.js", "start_line": 200}),
+                tool_round("r3", "read_file", {"path": "game.js"}),
+                answer_round("done"),
+            ])
+        self.assertEqual([(item["name"], item["status"]) for item in result["tool_trace"]], [
+            ("read_file", "completed"), ("edit_file", "completed"),
+            ("read_file", "skipped"), ("read_file", "completed"),
+        ])
+        tool_results = [message["content"] for message in requests[-1]["messages"] if message["role"] == "tool"]
+        self.assertIn("1|step1();", tool_results[0])
+        edit = json.loads(tool_results[1])
+        self.assertIn("11|extra();", edit["updated_excerpt"])
+        second = json.loads(tool_results[2])
+        self.assertTrue(second["unchanged"])
+        self.assertNotIn("content", second)
+        self.assertIn("updated_excerpt", second["message"])
+        # A second consecutive request is answered with the whole current file.
+        third = json.loads(tool_results[3])
+        self.assertEqual((third["from_line"], third["through_line"]), (1, 301))
+        self.assertIn("11|extra();", third["content"])
+        tool_names = {tool["function"]["name"] for tool in requests[0]["tools"]}
+        self.assertIn("edit_file", tool_names)
+        self.assertNotIn("apply_line_edits", tool_names)
+
+    async def test_file_written_by_the_model_is_not_read_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "write-flow")
+            workspace.root = Path(directory)
+            result, requests = await run_stream(workspace, [
+                tool_round("w1", "write_file", {"path": "a.html", "content": "<h1>x</h1>\n"}),
+                tool_round("r1", "read_file", {"path": "a.html"}),
+                answer_round("done"),
+            ])
+        self.assertEqual(result["tool_trace"][1]["status"], "skipped")
+        self.assertTrue(json.loads(requests[-1]["messages"][-1]["content"])["unchanged"])
 
     async def test_user_context_addendum_keeps_system_prompt_stable(self):
         _, plain = await run_stream(None, [answer_round("ok")])
