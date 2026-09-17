@@ -485,7 +485,8 @@ class ConversationWorkspace:
     @staticmethod
     def _clean_path(value: Any, *, allow_root: bool = False) -> PurePosixPath:
         raw = str(value or "").strip()
-        if allow_root and raw in {"", "."}:
+        # Models often name the workspace root as "/" when searching it.
+        if allow_root and raw in {"", ".", "/", "./"}:
             return PurePosixPath(".")
         if not raw or "\x00" in raw or "\\" in raw:
             raise WorkspaceError("文件路径无效")
@@ -691,7 +692,8 @@ class AgentSharedWorkspace:
     @staticmethod
     def _clean_path(value: Any, *, allow_root: bool = False) -> PurePosixPath:
         raw = str(value or "").strip()
-        if allow_root and raw in {"", "."}:
+        # Models often name the workspace root as "/" when searching it.
+        if allow_root and raw in {"", ".", "/", "./"}:
             return PurePosixPath(".")
         if not raw or "\x00" in raw or "\\" in raw:
             raise WorkspaceError("文件路径无效")

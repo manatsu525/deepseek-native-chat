@@ -228,6 +228,28 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("轮次额度已用完", refused[0]["error"])
         self.assertIn("web_search=0, fetch_webpage=0", json.dumps(requests[7], ensure_ascii=False))
 
+    async def test_spent_tool_budget_ends_as_incomplete_answer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "budget")
+            workspace.root = Path(directory)
+            workspace.write_file("a.js", "x();\n")
+            narrated = [
+                [{"choices": [{"delta": {"content": f"第{n}步。", "tool_calls": [{"index": 0, "id": f"c{n}", "type": "function",
+                    "function": {"name": "list_files", "arguments": "{}"}}]}}]}]
+                for n in range(mimo_local.MAX_AGENT_TOOL_ROUNDS)
+            ]
+            still_calling = [tool_round(f"f{n}", "list_files", {}) for n in range(mimo_local.FINAL_ANSWER_ATTEMPTS)]
+            result, requests = await run_stream(workspace, narrated + still_calling)
+        self.assertTrue(result["incomplete"])
+        self.assertEqual(result["tool_round_limit"], mimo_local.MAX_AGENT_TOOL_ROUNDS)
+        self.assertTrue(result["answer"].startswith("第0步。"))
+        self.assertEqual(len(result["round_stats"]), mimo_local.MAX_AGENT_TOOL_ROUNDS + mimo_local.FINAL_ANSWER_ATTEMPTS)
+        self.assertNotIn("tools", requests[-1])
+
+    async def test_empty_answer_without_tools_still_fails(self):
+        with self.assertRaisesRegex(RuntimeError, "空正文"):
+            await run_stream(None, [answer_round(""), answer_round("")])
+
     async def test_file_written_by_the_model_is_not_read_back(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = ConversationWorkspace(1, "write-flow")
@@ -272,6 +294,28 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HistoryAndLogTests(unittest.TestCase):
+    def test_incomplete_answer_notice_lists_completed_work(self):
+        from app.main import incomplete_answer
+
+        trace = [{"name": "edit_file", "path": "car.html", "status": "completed"},
+                 {"name": "search_files", "path": "", "status": "completed"}]
+        text = incomplete_answer("价格已改好。\n", trace, 12)
+        self.assertTrue(text.startswith("价格已改好。\n\n---\n"))
+        self.assertIn("最多 12 轮", text)
+        self.assertIn("发送“继续”", text)
+        self.assertIn("- 修改：car.html", text)
+        self.assertNotIn(WORK_LOG_HEADER, text)
+        self.assertTrue(incomplete_answer("", [], 12).startswith("**本轮工具调用次数已用完"))
+
+    def test_search_accepts_slash_as_workspace_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "slash")
+            workspace.root = Path(directory)
+            workspace.write_file("a.js", "needle();\n")
+            self.assertEqual(workspace.search_files("needle", "/")["matches"][0]["path"], "a.js")
+            with self.assertRaises(WorkspaceError):
+                workspace.read_snapshot("/")
+
     def test_history_window_moves_in_steps(self):
         from app.main import history_window_size
 

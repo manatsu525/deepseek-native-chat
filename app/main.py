@@ -540,6 +540,24 @@ RESPONSES_CAPABILITY_CACHED_REASON = "provider_rejects_response_state_cached"
 RESPONSES_UNSUPPORTED_REASONS = {"upstream_rejected_response_state", "upstream_missing_stored_response_id"}
 
 
+def incomplete_answer(answer: str, tool_trace: list[dict[str, Any]], tool_round_limit: int) -> str:
+    """Close an answer whose tool budget ran out before the task finished.
+
+    The notice and the completed operations are part of the stored answer, so
+    the user sees where things stand and the next turn ("继续") knows it too.
+    """
+    notice = (
+        f"**本轮工具调用次数已用完（最多 {tool_round_limit} 轮），任务可能还没有全部完成。**"
+        "已完成的文件修改都已保存，发送“继续”即可接着处理剩余部分。"
+    )
+    work_log = build_work_log(tool_trace)
+    if work_log:
+        completed = work_log.split("\n", 1)[1] if "\n" in work_log else ""
+        notice += f"\n\n本轮已完成的操作：\n{completed}"
+    body = answer.rstrip()
+    return f"{body}\n\n---\n{notice}" if body else notice
+
+
 def history_window_size(total: int) -> int:
     """Number of newest messages to replay: at least 20, fewer than 30.
 
@@ -629,7 +647,8 @@ async def _execute_job(job_id: str) -> None:
         if kind == "custom" and is_mimo_model(job.get("model")) and row["role"] == "assistant":
             if meta.get("reasoning") and not meta.get("invalid_answer"):
                 message["reasoning_content"] = meta.get("reasoning", "")
-        if row["role"] == "assistant" and meta.get("work_log"):
+        # An incomplete answer already lists its completed operations.
+        if row["role"] == "assistant" and meta.get("work_log") and not meta.get("incomplete"):
             message["content"] = with_work_log(message["content"], str(meta["work_log"]))
         history.append(message)
     prior_web_evidence = db.web_evidence_for_conversation(
@@ -773,6 +792,10 @@ async def _execute_job(job_id: str) -> None:
                 job_id,
                 result["web_evidence"],
             )
+        if result.get("incomplete"):
+            result["answer"] = incomplete_answer(
+                result.get("answer") or "", result.get("tool_trace") or [], int(result.get("tool_round_limit") or 0)
+            )
         display_files = agent_workspace.list_files() if agent_job else job_workspace.list_files()
         meta = {"job_id": job_id, "conversation_id": job["conversation_id"], "provider_id": job["provider_id"], "provider_type": kind, "model": job["model"], "chat_mode": job.get("chat_mode") or "standard", "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"], "agents": result.get("agents", []), "workspace_files": display_files}
         if result.get("tool_trace"):
@@ -782,6 +805,8 @@ async def _execute_job(job_id: str) -> None:
                 meta["work_log"] = work_log
         if result.get("round_stats"):
             meta["round_stats"] = result["round_stats"]
+        if result.get("incomplete"):
+            meta["incomplete"] = True
         if kind == "custom_response" and result.get("responses_state"):
             meta["responses_state"] = {**result["responses_state"], "scope": response_scope}
             record_responses_capability(capability_key, result["responses_state"])

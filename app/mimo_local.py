@@ -1047,6 +1047,7 @@ async def stream_response(
     tool_rounds_used = 0
     budget_noted_messages: set[int] = set()
     refused_web_calls = 0
+    tool_budget_exhausted = False
     responses_protocol_enabled = api_protocol == "responses"
     tool_results_start = len(messages) + 1
     round_stats: list[dict[str, Any]] = []
@@ -1580,10 +1581,18 @@ async def stream_response(
                         "searches": steps,
                         "usage": usage,
                         "sources": list(sources.values()),
+                        "tool_trace": tool_trace,
+                        "round_stats": round_stats,
                     }
                 )
                 if final_answer_attempts < FINAL_ANSWER_ATTEMPTS:
                     continue
+                if tool_trace and tool_rounds_used >= role_tool_round_limit:
+                    # The tool budget ran out mid-task and the model still
+                    # wants tools. Its file changes are already saved, so end
+                    # as an incomplete answer the user can continue, not an error.
+                    tool_budget_exhausted = True
+                    break
                 if failure_kind == "empty_answer":
                     raise RuntimeError("上游连续返回空正文，未生成最终答案")
                 raise RuntimeError("上游在最终回答阶段仍返回工具调用，未生成最终答案")
@@ -2189,6 +2198,8 @@ async def stream_response(
         "tool_trace": tool_trace,
         "round_stats": round_stats,
         "web_evidence": web_evidence,
+        "incomplete": tool_budget_exhausted,
+        "tool_round_limit": role_tool_round_limit,
         "agent_mode": bool(agent_mode),
         "response": {"tool_trace": tool_trace, "agent_mode": bool(agent_mode)},
         **({"responses_state": response_chain.export()} if api_protocol == "responses" else {}),
