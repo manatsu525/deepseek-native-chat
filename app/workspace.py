@@ -800,6 +800,53 @@ class AgentSharedWorkspace:
                     return sorted(result, key=lambda item: item["path"].casefold())
         return sorted(result, key=lambda item: item["path"].casefold())
 
+    @staticmethod
+    def _tree_totals(directory: Path) -> tuple[int, int]:
+        """(files, bytes) below ``directory``, symlinks excluded, bounded."""
+        files = 0
+        size = 0
+        for current, directories, names in os.walk(directory, followlinks=False):
+            current_path = Path(current)
+            directories[:] = [item for item in directories if not (current_path / item).is_symlink()]
+            for name in names:
+                path = current_path / name
+                if path.is_symlink() or not path.is_file():
+                    continue
+                files += 1
+                try:
+                    size += path.stat().st_size
+                except OSError:
+                    pass
+                if files >= AGENT_MAX_FILES:
+                    return files, size
+        return files, size
+
+    def list_directory(self, path: Any = "") -> dict[str, Any]:
+        """One level of the shared directory, directories first, for the UI browser."""
+        target, relative = self.resolve(path, allow_root=True)
+        if target.is_symlink() or not target.is_dir():
+            raise WorkspaceError("Agent 工作区目录不存在")
+        entries: list[dict[str, Any]] = []
+        try:
+            children = list(target.iterdir())
+        except OSError as exc:
+            raise WorkspaceError(f"读取 Agent 工作区目录失败：{exc}") from exc
+        for child in sorted(children, key=lambda item: (not item.is_dir(), item.name.casefold())):
+            if child.is_symlink():
+                continue
+            child_relative = f"{relative}/{child.name}" if relative else child.name
+            if child.is_dir():
+                files, size = self._tree_totals(child)
+                entries.append({"name": child.name, "path": child_relative, "type": "directory", "files": files, "size": size})
+            elif child.is_file():
+                try:
+                    size = child.stat().st_size
+                except OSError:
+                    continue
+                entries.append({"name": child.name, "path": child_relative, "type": "file", "size": size})
+        parent = None if not relative else (relative.rsplit("/", 1)[0] if "/" in relative else "")
+        return {"path": relative, "parent": parent, "entries": entries}
+
     def resolve_file(self, path: Any) -> tuple[Path, str]:
         target, relative = self.resolve(path)
         if not target.is_file() or target.is_symlink():
@@ -815,6 +862,26 @@ class AgentSharedWorkspace:
         except OSError as exc:
             raise WorkspaceError(f"删除 Agent 工作区文件失败：{exc}") from exc
         return {"ok": True, "path": relative}
+
+    def delete_path(self, path: Any) -> dict[str, Any]:
+        """Delete a file or a whole directory inside the shared workspace."""
+        target, relative = self.resolve(path)
+        if not relative:
+            raise WorkspaceError("不能删除 Agent 工作区根目录")
+        if target.is_symlink() or not target.exists():
+            raise WorkspaceError("Agent 工作区路径不存在")
+        if target.is_dir():
+            files, _ = self._tree_totals(target)
+            try:
+                shutil.rmtree(target)
+            except OSError as exc:
+                raise WorkspaceError(f"删除 Agent 工作区目录失败：{exc}") from exc
+            return {"ok": True, "path": relative, "type": "directory", "files": files}
+        try:
+            target.unlink()
+        except OSError as exc:
+            raise WorkspaceError(f"删除 Agent 工作区文件失败：{exc}") from exc
+        return {"ok": True, "path": relative, "type": "file", "files": 1}
 
 
 def delete_conversation_workspace(user_id: int, conversation_id: str) -> None:

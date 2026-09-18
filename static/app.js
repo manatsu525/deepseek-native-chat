@@ -1,6 +1,6 @@
 const $ = (s, root=document) => root.querySelector(s);
 const $$ = (s, root=document) => [...root.querySelectorAll(s)];
-const state = {me:null, providers:[], skills:[], skillDetailId:null, conversation:null, messages:[], job:null, page:1, pages:1, poll:null, latestConversationId:null, editingProviderId:null, pendingAttachments:[], attachmentDraftId:null, uploadingAttachments:false,retryingAnswer:false,workspaceFiles:[],chatMode:'standard'};
+const state = {me:null, providers:[], skills:[], skillDetailId:null, conversation:null, messages:[], job:null, page:1, pages:1, poll:null, latestConversationId:null, editingProviderId:null, pendingAttachments:[], attachmentDraftId:null, uploadingAttachments:false,retryingAnswer:false,workspaceFiles:[],agentDir:'',agentListing:null,chatMode:'standard'};
 const detailState = new Map();
 const nestedScrollState = new Map();
 const MAX_ATTACHMENT_FILES = 10;
@@ -65,48 +65,87 @@ function openWorkspaceDownload(event){
   if(opened)opened.opener=null;else window.location.assign(url);
 }
 function wireWorkspaceDownloads(root=document){$$('[data-workspace-download]',root).forEach(link=>link.onclick=openWorkspaceDownload)}
-async function deleteAgentWorkspaceFile(event){
+function agentPathUrl(path){return `/api/agent-workspace/paths/${String(path).split('/').map(encodeURIComponent).join('/')}`}
+async function deleteAgentWorkspacePath(event){
   const button=event.currentTarget;
   let path='';
   try{path=decodeURIComponent(button.dataset.agentWorkspaceDelete||'')}catch{return}
-  if(state.chatMode!=='agent'||!path||!window.confirm(`确定从 /home/share 删除“${path}”吗？此操作无法撤销。`))return;
+  const directory=button.dataset.agentWorkspaceType==='directory',files=Number(button.dataset.agentWorkspaceFiles)||0;
+  const question=directory?`确定删除整个目录 /home/share/${path}（含 ${files} 个文件）吗？此操作无法撤销。`:`确定从 /home/share 删除“${path}”吗？此操作无法撤销。`;
+  if(state.chatMode!=='agent'||!path||!window.confirm(question))return;
   if(workspaceDeletes.has(path))return;
   const context=workspaceContext();
   workspaceDeletes.add(path);
   ++workspaceRequestId;
   button.disabled=true;
   try{
-    await api(workspaceFileUrl('',{path,backend:'agent'}),{method:'DELETE'});
+    const data=await api(agentPathUrl(path),{method:'DELETE'});
     if(workspaceContext()===context){
-      state.workspaceFiles=state.workspaceFiles.filter(item=>item.path!==path);
-      renderWorkspaceState();
-      await loadWorkspaceFiles(true);
+      state.agentListing=data;state.agentDir=data.path||'';state.workspaceContext=context;
     }
-    toast(`已删除 ${path}`);
+    toast(directory?`已删除目录 ${path}`:`已删除 ${path}`);
   }catch(err){toast(err.message)}
   finally{workspaceDeletes.delete(path);renderWorkspaceState()}
 }
-function wireAgentWorkspaceDeletes(root=document){$$('[data-agent-workspace-delete]',root).forEach(button=>button.onclick=deleteAgentWorkspaceFile)}
+function wireAgentWorkspaceDeletes(root=document){$$('[data-agent-workspace-delete]',root).forEach(button=>button.onclick=deleteAgentWorkspacePath)}
+function openAgentDirectory(event){
+  event.preventDefault();
+  let path='';
+  try{path=decodeURIComponent(event.currentTarget.dataset.agentWorkspaceDir||'')}catch{return}
+  state.agentDir=path;
+  loadWorkspaceFiles(true);
+}
+function agentBreadcrumbHtml(path){
+  const parts=path?path.split('/'):[];
+  const crumbs=[`<a href="#" data-agent-workspace-dir="" class="workspace-crumb${parts.length?'':' current'}">/home/share</a>`];
+  parts.forEach((part,index)=>{const target=parts.slice(0,index+1).join('/');crumbs.push(`<span class="workspace-crumb-sep">/</span><a href="#" data-agent-workspace-dir="${encodeURIComponent(target)}" class="workspace-crumb${index===parts.length-1?' current':''}">${escapeHtml(part)}</a>`)});
+  return `<div class="workspace-crumbs">${crumbs.join('')}</div>`;
+}
+function agentEntryHtml(item){
+  const name=escapeHtml(item.name||item.path),deleteButton=`<button class="workspace-file-delete" type="button" data-agent-workspace-delete="${encodeURIComponent(item.path)}" data-agent-workspace-type="${item.type}" data-agent-workspace-files="${Number(item.files)||0}" aria-label="删除 ${escapeHtml(item.path)}">删除</button>`;
+  if(item.type==='directory')return `<div class="workspace-file workspace-dir"><a class="workspace-file-link" href="#" data-agent-workspace-dir="${encodeURIComponent(item.path)}"><span aria-hidden="true">▸</span><span class="workspace-file-name" title="${escapeHtml(item.path)}">${name}/</span><span class="workspace-file-size">${Number(item.files)||0} 个文件 · ${escapeHtml(formatBytes(item.size))}</span></a>${deleteButton}</div>`;
+  return `<div class="workspace-file"><a class="workspace-file-link" data-workspace-download href="${workspaceFileUrl('',{path:item.path,backend:'agent'})}" target="_blank" rel="noopener"><span aria-hidden="true">▤</span><span class="workspace-file-name" title="${escapeHtml(item.path)}">${name}</span><span class="workspace-file-size">${escapeHtml(formatBytes(item.size))}</span></a>${deleteButton}</div>`;
+}
 function renderWorkspaceState(){
-  const agent=state.chatMode==='agent',hasConversation=!!(state.conversation&&state.conversation.id),canShow=agent||hasConversation,files=state.workspaceContext===workspaceContext()?(state.workspaceFiles||[]):[];
-  $('#workspaceButton').classList.toggle('hidden',!canShow);$('#workspaceCount').textContent=files.length;
+  const agent=state.chatMode==='agent',hasConversation=!!(state.conversation&&state.conversation.id),canShow=agent||hasConversation,fresh=state.workspaceContext===workspaceContext();
+  $('#workspaceButton').classList.toggle('hidden',!canShow);
   $('#workspaceModalTitle').textContent=agent?'Agent 文件':'对话文件';
-  $('#workspaceModalDescription').textContent=agent?'Agent 模式统一使用 /home/share；普通模式工作区与它严格分开。':'模型创建和后续修改的文件会持续保存在当前对话中。';
-  $('#workspaceSummary').textContent=files.length?`${files.length} 个文件 · ${formatBytes(files.reduce((sum,item)=>sum+(Number(item.size)||0),0))}${agent?' · /home/share':''}`:agent?'/home/share 当前还没有文件。':'当前还没有文件。让模型编写项目时，它会把代码保存到这里。';
-  $('#workspaceFiles').innerHTML=files.length?files.map(item=>agent?`<div class="workspace-file"><a class="workspace-file-link" data-workspace-download href="${workspaceFileUrl('',item)}" target="_blank" rel="noopener"><span aria-hidden="true">▤</span><span class="workspace-file-name" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</span><span class="workspace-file-size">${escapeHtml(formatBytes(item.size))}</span></a><button class="workspace-file-delete" type="button" data-agent-workspace-delete="${encodeURIComponent(item.path)}" aria-label="删除 ${escapeHtml(item.path)}">删除</button></div>`:`<a class="workspace-file" data-workspace-download href="${workspaceFileUrl(state.conversation.id,item)}" target="_blank" rel="noopener"><span aria-hidden="true">▤</span><span class="workspace-file-name" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</span><span class="workspace-file-size">${escapeHtml(formatBytes(item.size))}</span></a>`).join(''):'<div class="workspace-empty">暂无工作区文件</div>';
-  $('#workspaceZip').classList.toggle('hidden',!files.length);$('#workspaceZip').href=agent?'/api/agent-workspace.zip':hasConversation?`/api/conversations/${encodeURIComponent(state.conversation.id)}/workspace.zip`:'#';wireWorkspaceDownloads($('#workspaceModal'));wireAgentWorkspaceDeletes($('#workspaceModal'));
-  $$('[data-agent-workspace-delete]',$('#workspaceModal')).forEach(button=>{button.disabled=workspaceDeletes.has(decodeURIComponent(button.dataset.agentWorkspaceDelete))});
+  $('#workspaceModalDescription').textContent=agent?'Agent 模式统一使用 /home/share；点目录进入，点文件下载；目录和文件都可以删除。':'模型创建和后续修改的文件会持续保存在当前对话中。';
+  if(agent){
+    const listing=fresh&&state.agentListing?state.agentListing:{path:state.agentDir||'',entries:[],total_files:0,total_size:0};
+    const entries=listing.entries||[],total=Number(listing.total_files)||0;
+    $('#workspaceCount').textContent=total;
+    $('#workspaceSummary').innerHTML=`${agentBreadcrumbHtml(listing.path||'')}<div>${total?`共 ${total} 个文件 · ${escapeHtml(formatBytes(listing.total_size))}`:'/home/share 当前还没有文件。'}${entries.length?` · 本级 ${entries.length} 项`:''}</div>`;
+    $('#workspaceFiles').innerHTML=entries.length?entries.map(agentEntryHtml).join(''):'<div class="workspace-empty">这个目录是空的</div>';
+    $('#workspaceZip').classList.toggle('hidden',!total);$('#workspaceZip').href='/api/agent-workspace.zip';
+    $$('[data-agent-workspace-dir]',$('#workspaceModal')).forEach(link=>link.onclick=openAgentDirectory);
+    wireWorkspaceDownloads($('#workspaceModal'));wireAgentWorkspaceDeletes($('#workspaceModal'));
+    $$('[data-agent-workspace-delete]',$('#workspaceModal')).forEach(button=>{button.disabled=workspaceDeletes.has(decodeURIComponent(button.dataset.agentWorkspaceDelete))});
+    return;
+  }
+  const files=fresh?(state.workspaceFiles||[]):[];
+  $('#workspaceCount').textContent=files.length;
+  $('#workspaceSummary').textContent=files.length?`${files.length} 个文件 · ${formatBytes(files.reduce((sum,item)=>sum+(Number(item.size)||0),0))}`:'当前还没有文件。让模型编写项目时，它会把代码保存到这里。';
+  $('#workspaceFiles').innerHTML=files.length?files.map(item=>`<a class="workspace-file" data-workspace-download href="${workspaceFileUrl(state.conversation.id,item)}" target="_blank" rel="noopener"><span aria-hidden="true">▤</span><span class="workspace-file-name" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</span><span class="workspace-file-size">${escapeHtml(formatBytes(item.size))}</span></a>`).join(''):'<div class="workspace-empty">暂无工作区文件</div>';
+  $('#workspaceZip').classList.toggle('hidden',!files.length);$('#workspaceZip').href=hasConversation?`/api/conversations/${encodeURIComponent(state.conversation.id)}/workspace.zip`:'#';wireWorkspaceDownloads($('#workspaceModal'));
 }
 async function loadWorkspaceFiles(showError=false){
   const context=workspaceContext(),requestId=++workspaceRequestId;
   const current=()=>requestId===workspaceRequestId&&context===workspaceContext();
-  const url=state.chatMode==='agent'?'/api/agent-workspace':state.conversation?`/api/conversations/${encodeURIComponent(state.conversation.id)}/workspace`:null;
-  if(!url){state.workspaceFiles=[];state.workspaceContext=context;renderWorkspaceState();return}
+  if(state.workspaceContext!==context){state.agentDir='';state.agentListing=null}
+  const url=state.chatMode==='agent'?`/api/agent-workspace/dir?path=${encodeURIComponent(state.agentDir||'')}`:state.conversation?`/api/conversations/${encodeURIComponent(state.conversation.id)}/workspace`:null;
+  if(!url){state.workspaceFiles=[];state.agentListing=null;state.workspaceContext=context;renderWorkspaceState();return}
   try{
     const data=await api(url);
     if(!current())return;
-    state.workspaceFiles=data.files||[];state.workspaceContext=context;renderWorkspaceState();
-  }catch(err){if(current()&&showError)toast(err.message)}
+    if(state.chatMode==='agent'){state.agentListing=data;state.agentDir=data.path||'';state.workspaceFiles=[]}
+    else state.workspaceFiles=data.files||[];
+    state.workspaceContext=context;renderWorkspaceState();
+  }catch(err){
+    if(!current())return;
+    if(state.chatMode==='agent'&&state.agentDir){state.agentDir='';loadWorkspaceFiles(showError);}
+    if(showError)toast(err.message);
+  }
 }
 
 async function api(path, options={}) {

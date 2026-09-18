@@ -26,10 +26,11 @@ from .file_knowledge import FileKnowledge
 DEFAULT_CONTEXT_BUDGET_CHARS = 240_000
 MIN_CONTEXT_BUDGET_CHARS = 40_000
 MAX_CONTEXT_BUDGET_CHARS = 2_000_000
-# Automatic sizing: this share of the model's window, capped in tokens so a
-# 1M-token model does not turn every round into a 600K-token request.
+# Automatic sizing: this share of the model's window, capped in tokens.
+# Compaction throws away work the model has done, so on large-window models
+# it starts only past 512K tokens; smaller windows stay bounded by the share.
 CONTEXT_WINDOW_SHARE = 0.6
-CONTEXT_TOKEN_CAP = 300_000
+CONTEXT_TOKEN_CAP = 512_000
 ASSUMED_WINDOW_TOKENS = 128_000
 # Snapshots in the checkpoint never take more than this many characters.
 SNAPSHOT_MAX_CHARS = 200_000

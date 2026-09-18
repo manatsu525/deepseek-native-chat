@@ -157,7 +157,7 @@ class TaskPlanTests(unittest.TestCase):
         self.assertEqual(effective_context_budget(100_000, window_tokens=1_000_000, request_chars=50_000, input_tokens=10_000), 100_000)
         self.assertEqual(effective_context_budget(DEFAULT_CONTEXT_BUDGET_CHARS, window_tokens=1_000_000, request_chars=0, input_tokens=0),
                          DEFAULT_CONTEXT_BUDGET_CHARS)
-        # 1M window: 60% share is capped at 300K tokens, times 4.6 chars/token.
+        # 1M window: 60% share is capped at 512K tokens, times 4.6 chars/token.
         budget = effective_context_budget(DEFAULT_CONTEXT_BUDGET_CHARS, window_tokens=1_048_576, request_chars=239_000, input_tokens=52_000)
         self.assertEqual(budget, int(CONTEXT_TOKEN_CAP * 239_000 / 52_000))
         # Unknown window: assume 128K tokens.

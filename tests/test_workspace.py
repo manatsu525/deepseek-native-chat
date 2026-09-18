@@ -218,6 +218,38 @@ class WorkspaceTests(unittest.TestCase):
             agent_workspace.delete_file("outside-link")
         self.assertEqual(outside.read_text(encoding="utf-8"), "secret")
 
+    def test_agent_workspace_browses_one_level_and_deletes_directories(self) -> None:
+        shared_root = Path(self.temp.name) / "share2"
+        (shared_root / "proj" / "src").mkdir(parents=True)
+        (shared_root / "proj" / "src" / "a.py").write_text("print(1)\n", encoding="utf-8")
+        (shared_root / "proj" / "README.md").write_text("hi", encoding="utf-8")
+        (shared_root / "notes.txt").write_text("n", encoding="utf-8")
+        (shared_root / "link").symlink_to(Path(self.temp.name))
+        workspace = AgentSharedWorkspace(shared_root)
+
+        root = workspace.list_directory("")
+        self.assertEqual((root["path"], root["parent"]), ("", None))
+        self.assertEqual([(e["name"], e["type"]) for e in root["entries"]], [("proj", "directory"), ("notes.txt", "file")])
+        self.assertEqual(root["entries"][0]["files"], 2)
+        self.assertEqual(root["entries"][0]["size"], 11)
+        nested = workspace.list_directory("proj/src")
+        self.assertEqual((nested["path"], nested["parent"]), ("proj/src", "proj"))
+        self.assertEqual(nested["entries"], [{"name": "a.py", "path": "proj/src/a.py", "type": "file", "size": 9}])
+        with self.assertRaises(WorkspaceError):
+            workspace.list_directory("../")
+        with self.assertRaises(WorkspaceError):
+            workspace.list_directory("link")
+
+        self.assertEqual(workspace.delete_path("proj/README.md"), {"ok": True, "path": "proj/README.md", "type": "file", "files": 1})
+        self.assertEqual(workspace.delete_path("proj"), {"ok": True, "path": "proj", "type": "directory", "files": 1})
+        self.assertFalse((shared_root / "proj").exists())
+        with self.assertRaises(WorkspaceError):
+            workspace.delete_path("")
+        with self.assertRaises(WorkspaceError):
+            workspace.delete_path("link")
+        self.assertTrue((shared_root / "link").exists())
+        self.assertEqual([e["name"] for e in workspace.list_directory("")["entries"]], ["notes.txt"])
+
 
 if __name__ == "__main__":
     unittest.main()

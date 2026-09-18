@@ -1555,6 +1555,33 @@ def agent_workspace_files(_: dict[str, Any] = Depends(current_user)) -> dict[str
     return {"root": str(AgentSharedWorkspace().root), "files": files, "total_size": sum(int(item["size"]) for item in files)}
 
 
+def agent_directory_payload(workspace: AgentSharedWorkspace, path: str) -> dict[str, Any]:
+    try:
+        listing = workspace.list_directory(path)
+    except WorkspaceError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    files = workspace.list_files()
+    return {"root": str(workspace.root), **listing, "total_files": len(files), "total_size": sum(int(item["size"]) for item in files)}
+
+
+@app.get("/api/agent-workspace/dir")
+def agent_workspace_directory(path: str = "", _: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    """One level of /home/share for the file browser: directories first, then files."""
+    return agent_directory_payload(AgentSharedWorkspace(), path)
+
+
+@app.delete("/api/agent-workspace/paths/{target_path:path}")
+def delete_agent_workspace_path(target_path: str, _: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    """Delete a file or a whole directory; returns the parent directory's listing."""
+    workspace = AgentSharedWorkspace()
+    try:
+        result = workspace.delete_path(target_path)
+    except WorkspaceError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    parent = result["path"].rsplit("/", 1)[0] if "/" in result["path"] else ""
+    return {**result, **agent_directory_payload(workspace, parent)}
+
+
 @app.get("/api/agent-workspace/files/{file_path:path}")
 def download_agent_workspace_file(file_path: str, _: dict[str, Any] = Depends(current_user)) -> FileResponse:
     workspace = AgentSharedWorkspace()
