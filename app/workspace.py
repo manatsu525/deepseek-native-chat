@@ -286,7 +286,8 @@ def expand_file_views(command: str, resolve: Any, max_bytes: int = FILE_VIEW_MAX
             return match.group(0)
         if b"\x00" in head:
             return match.group(0)
-        line_count = sum(1 for _ in path.open("rb"))
+        with path.open("rb") as handle:
+            line_count = sum(1 for _ in handle)
         original = f"{match.group('view')} {raw}"
         notes.append(f"已把 `{original}` 改为输出整个文件 {raw}（{line_count} 行，{size} 字节）；这个文件不必再分段读取。")
         return f"{match.group('lead')}{match.group('space')}cat -n {shlex.quote(raw)}{match.group('trail')}"

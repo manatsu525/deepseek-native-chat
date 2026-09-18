@@ -150,6 +150,23 @@ class TaskPlanTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             plan.apply({"steps": [{"id": 1}, ""]})
 
+    def test_budget_follows_the_model_window_and_measured_token_ratio(self):
+        from app.context import CONTEXT_TOKEN_CAP, effective_context_budget
+
+        # Explicit setting wins; default without usage stays as is.
+        self.assertEqual(effective_context_budget(100_000, window_tokens=1_000_000, request_chars=50_000, input_tokens=10_000), 100_000)
+        self.assertEqual(effective_context_budget(DEFAULT_CONTEXT_BUDGET_CHARS, window_tokens=1_000_000, request_chars=0, input_tokens=0),
+                         DEFAULT_CONTEXT_BUDGET_CHARS)
+        # 1M window: 60% share is capped at 300K tokens, times 4.6 chars/token.
+        budget = effective_context_budget(DEFAULT_CONTEXT_BUDGET_CHARS, window_tokens=1_048_576, request_chars=239_000, input_tokens=52_000)
+        self.assertEqual(budget, int(CONTEXT_TOKEN_CAP * 239_000 / 52_000))
+        # Unknown window: assume 128K tokens.
+        budget = effective_context_budget(DEFAULT_CONTEXT_BUDGET_CHARS, window_tokens=None, request_chars=40_000, input_tokens=10_000)
+        self.assertEqual(budget, int(128_000 * 0.6 * 4))
+        # A small window with CJK-heavy text (few chars per token) shrinks the budget.
+        budget = effective_context_budget(DEFAULT_CONTEXT_BUDGET_CHARS, window_tokens=32_000, request_chars=15_000, input_tokens=10_000)
+        self.assertEqual(budget, 40_000)
+
     def test_round_text_is_joined_as_paragraphs(self):
         from app.mimo_local import _join_round_text
 

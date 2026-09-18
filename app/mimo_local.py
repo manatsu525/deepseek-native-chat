@@ -29,6 +29,7 @@ from .context import (
     checkpoint_payload,
     checkpoint_present,
     compact_request,
+    effective_context_budget,
     normalize_budget,
     serialized_chars as _serialized_chars,
     with_message_block as _with_message_block,
@@ -844,6 +845,7 @@ async def stream_response(
     extra_tools: list[dict[str, Any]] | None = None,
     extra_tool_handler: Callable[[str, dict[str, Any]], str | Awaitable[str]] | None = None,
     user_context_addendum: str = "",
+    context_window_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Run a custom OpenAI-compatible model with local web tools.
 
@@ -925,6 +927,7 @@ async def stream_response(
     web_calls_since_progress = 0
     calls_since_mutation = 0
     stall_refusals = 0
+    files_changed = 0
     responses_protocol_enabled = api_protocol == "responses"
     tool_results_start = len(messages) + 1
     round_stats: list[dict[str, Any]] = []
@@ -934,7 +937,8 @@ async def stream_response(
     final_answer_attempts = 0
     force_final_answer = False
     plan = TaskPlan()
-    context_budget = normalize_budget(config.get("context_budget_chars", DEFAULT_CONTEXT_BUDGET_CHARS))
+    context_budget_setting = normalize_budget(config.get("context_budget_chars", DEFAULT_CONTEXT_BUDGET_CHARS))
+    context_budget = context_budget_setting
     # Host files can also change through shell commands, so their snapshots
     # are revalidated against disk before a checkpoint reuses them.
     knowledge = FileKnowledge(validate=_host_revision if agent_mode else None)
@@ -1638,11 +1642,19 @@ async def stream_response(
                         and _read_only_call(workspace_name if is_workspace else name, arguments)
                     ):
                         # Text nudges were ignored for 16 calls: stop the
-                        # exploration loop. Writing (or answering) reopens reads.
+                        # exploration loop.
+                        if files_changed:
+                            # The work exists; what follows is re-checking it
+                            # without end. Take the answer after this round.
+                            force_final_answer = True
+                            raise ToolQuotaExceeded(
+                                f"只读操作已结束：文件已经改好之后又连续 {calls_since_mutation} 次读取、搜索或只读命令。"
+                                "现在直接回答用户：列出改动的文件、已做的验证和仍然成立的假设。不要再发起工具调用。"
+                            )
                         stall_refusals += 1
                         raise ToolQuotaExceeded(
                             f"只读操作已暂停：已连续 {calls_since_mutation} 次读取、搜索或只读命令而没有修改任何文件。"
-                            "现在二选一：(1) 用 write_file / edit_file 把已经确定的内容写入文件（不确定之处写成明确假设），写入后可以继续读取；"
+                            "现在二选一：(1) 用 write_file / edit_file 把已经确定的内容写入文件（不确定之处写成明确假设）；"
                             "(2) 直接回答用户，说明已了解的情况、已做的判断和还缺什么。不要再发起只读调用。"
                         )
                     if is_extra:
@@ -2059,17 +2071,29 @@ async def stream_response(
                     or (is_extra and (name in HOST_FILE_MUTATION_TOOLS or name in HOST_VALIDATION_TOOLS))
                 )
                 calls_since_mutation = 0 if mutated else calls_since_mutation + 1
+                if mutated and (
+                    (is_workspace and workspace_name in WORKSPACE_MUTATION_TOOLS)
+                    or (is_extra and name in HOST_FILE_MUTATION_TOOLS)
+                ):
+                    files_changed += 1
                 if (
                     calls_since_mutation >= MUTATION_STALL_CALLS
                     and (calls_since_mutation - MUTATION_STALL_CALLS) % MUTATION_STALL_EVERY == 0
                     and (workspace_tools_expected or extra_tools_expected)
                 ):
                     step["mutation_stall_warning"] = calls_since_mutation
-                    result_text += (
-                        f"\n\n[Runtime note] 已经连续 {calls_since_mutation} 次工具调用（读取、命令、搜索）而没有修改任何文件。"
-                        "如果方案已经清楚，现在就写文件，不要再确认已经拿到的信息；"
-                        "如果确实还缺一个事实，一次性获取后立即动手，并把无法确认的地方写成明确假设。"
-                    )
+                    if files_changed:
+                        result_text += (
+                            f"\n\n[Runtime note] 文件已经改好之后又连续 {calls_since_mutation} 次工具调用（读取、命令、搜索）。"
+                            "如果你运行的检查已经通过，现在就直接回答用户：列出改动的文件、做过的验证和假设。"
+                            "不要再逐项核对已经确认过的内容。"
+                        )
+                    else:
+                        result_text += (
+                            f"\n\n[Runtime note] 已经连续 {calls_since_mutation} 次工具调用（读取、命令、搜索）而没有修改任何文件。"
+                            "如果方案已经清楚，现在就写文件，不要再确认已经拿到的信息；"
+                            "如果确实还缺一个事实，一次性获取后立即动手，并把无法确认的地方写成明确假设。"
+                        )
                     if plan.steps:
                         result_text += "\n当前计划：\n" + plan.render()
                 compacted_arguments = False
@@ -2124,6 +2148,14 @@ async def stream_response(
                 force_final_answer = True
             if responses_protocol:
                 response_chain.pending = _responses_input(conversation[tool_results_start:])
+            if round_stats:
+                context_budget = effective_context_budget(
+                    context_budget_setting,
+                    window_tokens=context_window_tokens,
+                    request_chars=int(round_stats[-1].get("request_chars") or 0),
+                    input_tokens=int(round_stats[-1].get("input_tokens") or 0),
+                )
+                round_stats[-1]["context_budget"] = context_budget
             compacted = compact_request(
                 conversation,
                 base_message_count=base_message_count,

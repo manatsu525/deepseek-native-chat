@@ -42,6 +42,7 @@ from .mimo import (
     list_models as custom_list_models,
 )
 from .mimo_local import stream_response as custom_stream_response, build_custom_request_parameters
+from .model_limits import context_window_tokens
 from .reasoning_effort import DEFAULT as DEFAULT_REASONING_EFFORT
 from .reasoning_effort import LEVELS as REASONING_EFFORT_LEVELS
 from .security import load_secret, make_token, password_hash, password_ok, read_token
@@ -613,6 +614,12 @@ async def _execute_job(job_id: str) -> None:
     )
     response_scope = ""
     response_options: dict[str, Any] = {}
+    if is_custom_provider(kind):
+        # Best-effort, cached per process: sizes the context budget to the
+        # model instead of a fixed character count.
+        response_options["context_window_tokens"] = await asyncio.to_thread(
+            context_window_tokens, provider["base_url"], provider["api_key"], job["model"]
+        )
     if kind == "custom_response":
         response_scope = state_scope(provider, job, custom_settings_for_model(provider, job["model"]))
         response_state = resume_state(history_rows, response_scope)

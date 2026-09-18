@@ -495,6 +495,27 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["round_stats"][-1]["final_only"])
         self.assertEqual(result["answer"], "gave up, here is what I know")
 
+    async def test_endless_rechecking_after_the_files_are_written_ends_with_the_answer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "recheck")
+            workspace.root = Path(directory)
+            limit = mimo_local.MUTATION_STALL_REFUSE_CALLS
+            rounds = [tool_round("w1", "write_file", {"path": "a.js", "content": "x();\n"})]
+            rounds += [tool_round(f"s{n}", "search_files", {"query": f"needle{n}"}) for n in range(limit + 1)]
+            rounds.append(answer_round("Changed a.js; assumptions: none."))
+            result, requests = await run_stream(workspace, rounds)
+            tool_results = [m["content"] for r in requests for m in r["messages"] if m["role"] == "tool"]
+        # The nudge after a write asks for the answer, not for more files.
+        self.assertTrue(any("文件已经改好之后又连续 10 次" in text for text in tool_results))
+        self.assertFalse(any("现在就写文件" in text for text in tool_results))
+        # The 17th read-only call is refused and the loop takes the answer:
+        # the work exists, so this is a complete answer, not a budget failure.
+        self.assertEqual(result["tool_trace"][limit + 1]["status"], "failed")
+        self.assertIn("只读操作已结束", result["tool_trace"][limit + 1]["error"])
+        self.assertTrue(result["round_stats"][-1]["final_only"])
+        self.assertEqual(result["answer"], "Changed a.js; assumptions: none.")
+        self.assertFalse(result["incomplete"])
+
     def test_read_only_command_heuristic(self):
         self.assertTrue(mimo_local._read_only_call("run_command", {"command": "grep -rn foo . | head"}))
         self.assertTrue(mimo_local._read_only_call("run_command", {"command": "sed -n '1,20p' a.json; cat b"}))

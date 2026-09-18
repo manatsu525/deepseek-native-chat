@@ -21,9 +21,18 @@ from typing import Any
 
 from .file_knowledge import FileKnowledge
 
+# The settings value. Left at the default it means "size the budget from the
+# model's context window"; any other value is an explicit character budget.
 DEFAULT_CONTEXT_BUDGET_CHARS = 240_000
 MIN_CONTEXT_BUDGET_CHARS = 40_000
 MAX_CONTEXT_BUDGET_CHARS = 2_000_000
+# Automatic sizing: this share of the model's window, capped in tokens so a
+# 1M-token model does not turn every round into a 600K-token request.
+CONTEXT_WINDOW_SHARE = 0.6
+CONTEXT_TOKEN_CAP = 300_000
+ASSUMED_WINDOW_TOKENS = 128_000
+# Snapshots in the checkpoint never take more than this many characters.
+SNAPSHOT_MAX_CHARS = 200_000
 LOW_WATER_RATIO = 0.6
 # The newest exchanges are never stubbed: the model is acting on them now.
 PROTECTED_RECENT_EXCHANGES = 2
@@ -66,6 +75,31 @@ def normalize_budget(value: Any) -> int:
     except (TypeError, ValueError):
         return DEFAULT_CONTEXT_BUDGET_CHARS
     return max(MIN_CONTEXT_BUDGET_CHARS, min(MAX_CONTEXT_BUDGET_CHARS, budget))
+
+
+def effective_context_budget(
+    setting: int,
+    *,
+    window_tokens: int | None,
+    request_chars: int,
+    input_tokens: int,
+) -> int:
+    """The character budget for the next request.
+
+    A character count is only a proxy for tokens, so the budget is derived from
+    the model's window using the ratio the provider itself reported for the
+    last request (characters sent versus input tokens billed). Before any
+    round has reported usage, or when the user set an explicit budget, the
+    settings value is used as is. A 50K-token budget on a 1M-token model was
+    dropping whole rounds of finished work mid-task.
+    """
+    if setting != DEFAULT_CONTEXT_BUDGET_CHARS:
+        return setting
+    if input_tokens <= 0 or request_chars <= 0:
+        return setting
+    ratio = request_chars / input_tokens
+    tokens = min(int((window_tokens or ASSUMED_WINDOW_TOKENS) * CONTEXT_WINDOW_SHARE), CONTEXT_TOKEN_CAP)
+    return int(max(MIN_CONTEXT_BUDGET_CHARS, min(MAX_CONTEXT_BUDGET_CHARS, tokens * ratio)))
 
 
 def with_message_block(message: dict[str, Any], marker: str, text: str) -> dict[str, Any]:
@@ -186,7 +220,7 @@ def compact_request(
     internal = [dict(message) for message in conversation[base_message_count:]]
     previous = checkpoint_payload(base)
 
-    snapshots = knowledge.snapshots(int(budget * SNAPSHOT_BUDGET_RATIO)) if knowledge is not None else []
+    snapshots = knowledge.snapshots(min(int(budget * SNAPSHOT_BUDGET_RATIO), SNAPSHOT_MAX_CHARS)) if knowledge is not None else []
     checkpoint: dict[str, Any] = {
         "context_checkpoint": True,
         "instruction": (
