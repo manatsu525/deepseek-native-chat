@@ -32,11 +32,11 @@ class AgentToolTests(unittest.TestCase):
 
     def test_host_file_and_command_tools_use_real_path(self) -> None:
         with patch("app.agent.AGENT_PROJECT_ROOT", self.root):
-            written = self.runtime.execute("host_write_file", {"path": "src/app.py", "content": "print('ok')\n"})
+            written = self.runtime.execute("write_file", {"path": "src/app.py", "content": "print('ok')\n"})
             self.assertIn('"ok": true', written)
-            read = self.runtime.execute("host_read_file", {"path": "src/app.py"})
+            read = self.runtime.execute("read_file", {"path": "src/app.py"})
             self.assertIn("1|print('ok')", read)
-            command = self.runtime.execute("host_run_command", {"command": "printf hello"})
+            command = self.runtime.execute("run_command", {"command": "printf hello"})
             self.assertIn('"stdout": "hello"', command)
 
     def test_conversation_management_is_scoped_to_current_user(self) -> None:
@@ -52,7 +52,8 @@ class AgentToolTests(unittest.TestCase):
         names = {item["function"]["name"] for item in self.runtime.tool_definitions}
         self.assertIn("skill_install", names)
         self.assertIn("conversation_create", names)
-        self.assertIn("frontend_validate_page", names)
+        self.assertIn("check_web_syntax", names)
+        self.assertNotIn("host_read_file", names)
 
     def test_non_admin_can_read_but_cannot_mutate_shared_skills(self) -> None:
         runtime = AgentRuntime(self.db, self.user_id, self.conversation_id, is_admin=False)

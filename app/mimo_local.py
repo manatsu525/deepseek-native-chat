@@ -20,7 +20,8 @@ from curl_cffi import requests as curl_requests
 from .custom_tool_normalization import normalize_tool_calls
 from .custom_request import apply_request_overrides, expand_advanced_request
 from .responses_state import ResponsesState
-from .agent import AGENT_SYSTEM_PROMPT, HOST_READ_MAX_CHARS, AgentRuntime
+from .agent import HOST_READ_MAX_CHARS, AgentRuntime
+from .prompts import build_system_prompt
 from .file_knowledge import FileKnowledge
 from .context import (
     CONTEXT_CHECKPOINT_MARKER,
@@ -32,9 +33,8 @@ from .context import (
     serialized_chars as _serialized_chars,
     with_message_block as _with_message_block,
 )
-from .plan import PLAN_PROMPT, UPDATE_PLAN_TOOL, TaskPlan
+from .plan import UPDATE_PLAN_TOOL, TaskPlan
 from .keyless_web import (
-    KEYLESS_CUSTOM_SYSTEM_PROMPT,
     KEYLESS_FETCH_WEBPAGE_TOOL,
     KEYLESS_SEARCH_WEB_TOOL,
     PROVIDERS as KEYLESS_PROVIDERS,
@@ -50,8 +50,6 @@ from .mimo import (
     MIMO_MAX_SEARCHES,
     MIMO_MAX_SEARCH_RESULTS,
     MIMO_MAX_TOOL_ROUNDS,
-    LEGACY_CUSTOM_SYSTEM_PROMPT,
-    PARALLEL_CUSTOM_SYSTEM_PROMPT,
     PARALLEL_FETCH_WEBPAGE_TOOL,
     PARALLEL_SEARCH_WEB_TOOL,
     SEARCH_WEB_TOOL,
@@ -85,11 +83,8 @@ from .inkling_tool_compat import (
 )
 from .reasoning_effort import normalize as normalize_reasoning_effort
 from .workspace import (
-    EDIT_WORKSPACE_SYSTEM_PROMPT,
     EDIT_WORKSPACE_TOOL_NAMES,
-    READ_ONLY_WORKSPACE_SYSTEM_PROMPT,
     READ_ONLY_WORKSPACE_TOOL_NAMES,
-    WORKSPACE_SYSTEM_PROMPT,
     WORKSPACE_TOOL_NAMES,
     ConversationWorkspace,
     normalize_file_tool_arguments,
@@ -113,11 +108,19 @@ WORKSPACE_ARGUMENT_COMPACT_THRESHOLD = 4096
 FRESH_WRITE_CONTEXT_THRESHOLD = 60_000
 WORKSPACE_MUTATION_TOOLS = {"write_file", "edit_file", "apply_patch", "apply_patch_batch", "replace_text", "delete_file"}
 WORKSPACE_EDIT_TOOLS = {"edit_file", "apply_patch", "apply_patch_batch", "replace_text"}
-HOST_READ_TOOLS = {"host_read_file", "frontend_read_page"}
-HOST_FILE_MUTATION_TOOLS = {"host_write_file", "host_edit_file", "host_apply_patch", "host_delete_path", "frontend_write_page"}
-HOST_WRITE_TOOLS = {"host_write_file", "frontend_write_page"}
+HOST_READ_TOOLS = {"read_file", "host_read_file", "frontend_read_page"}
+HOST_WRITE_TOOLS = {"write_file", "host_write_file", "frontend_write_page"}
+HOST_DELETE_TOOLS = {"delete_file", "host_delete_path"}
+HOST_COMMAND_TOOLS = {"run_command", "host_run_command"}
+HOST_VALIDATION_TOOLS = {"check_web_syntax", "frontend_validate_page"}
+HOST_FILE_MUTATION_TOOLS = HOST_WRITE_TOOLS | HOST_DELETE_TOOLS | {"edit_file", "host_edit_file", "host_apply_patch"}
 # Unadvertised older host tool names that are still executed when emitted.
-HOST_LEGACY_TOOL_ALIASES = {"host_apply_patch": "host_edit_file"}
+HOST_LEGACY_TOOL_ALIASES = {
+    "host_list_files": "list_files", "host_read_file": "read_file", "host_write_file": "write_file",
+    "host_edit_file": "edit_file", "host_apply_patch": "edit_file", "host_search_files": "search_files",
+    "host_run_command": "run_command", "host_delete_path": "delete_file", "frontend_list_pages": "list_files",
+    "frontend_read_page": "read_file", "frontend_write_page": "write_file", "frontend_validate_page": "check_web_syntax",
+}
 # A repeated search that shares this share of its terms with an earlier one is
 # answered from the earlier results instead of being sent upstream again.
 SIMILAR_SEARCH_JACCARD = 0.6
@@ -214,19 +217,7 @@ NEMOTRON_LANGUAGE_PROMPT = (
     "Code, commands, URLs, quotations, and technical names may remain in their original language. "
     "This requirement applies to the final answer even when web sources or tool results are in English."
 )
-ENTITY_FIDELITY_PROMPT = (
-    "ENTITY FIDELITY AND UNCERTAINTY REQUIREMENT: Treat names, model IDs, product names, versions, numbers, "
-    "acronyms, and other possibly unfamiliar terms in the user's message as exact identifiers. Do not silently "
-    "correct, rename, downgrade, reinterpret, or replace them with a more familiar nearby concept. When research "
-    "is needed, the first search must include the user's exact identifying terms; reasonable spacing, punctuation, "
-    "language, or case variants are allowed only if every distinguishing token is preserved. You may broaden the "
-    "search afterward, but label related entities as related rather than treating them as identical. If an exact "
-    "term is unfamiliar, surprising, newer than your prior knowledge, or weakly documented, investigate it before "
-    "forming a conclusion. Absence from one search, memory, or a familiar catalog is not proof that it does not "
-    "exist. Claims that the user's term is a typo, alias, fake, unreleased, or actually means something else require "
-    "direct supporting evidence. When the available evidence remains insufficient or conflicting, preserve the "
-    "original term and explicitly say that it could not be verified instead of inventing a correction or a confident conclusion."
-)
+
 
 
 def _tool_quota_message(
@@ -370,7 +361,7 @@ def _similar_search(terms: set[str], previous: list[tuple[int, set[str], str]]) 
 def _web_stall_hint(agent_mode: bool) -> str:
     if agent_mode:
         return (
-            "开源项目的源文件（配置、JSON、代码）应该用 host_run_command 直接获取"
+            "开源项目的源文件（配置、JSON、代码）应该用 run_command 直接获取"
             "（git clone --depth 1 或 curl -L 原始文件），再在本地读取；网页搜索只返回摘录，拿不到完整文件。"
         )
     return "网页搜索只返回摘录；资料仍不足时，请说明缺少哪个具体事实并基于合理假设继续。"
@@ -438,25 +429,6 @@ def _append_runtime_note(conversation: list[dict[str, Any]], note: str) -> bool:
     else:
         last["content"] = f"{content or ''}{RUNTIME_NOTE_MARKER}{note}"
     return True
-
-
-def _dated_system_prompt(base_prompt: str, user_timezone: str) -> str:
-    try:
-        timezone = ZoneInfo(user_timezone)
-        timezone_name = user_timezone
-    except (ZoneInfoNotFoundError, ValueError):
-        timezone = ZoneInfo("UTC")
-        timezone_name = "UTC"
-    local_date = datetime.now(timezone).date().isoformat()
-    return (
-        f"{base_prompt}\n\n"
-        f"{ENTITY_FIDELITY_PROMPT}\n\n"
-        "Runtime date context (authoritative): "
-        f"The user's current local date is {local_date}, in IANA timezone {timezone_name}. "
-        "Resolve words such as today, yesterday, tomorrow, currently, latest, and recently against this date. "
-        "For time-sensitive web searches, include the relevant absolute date in the objective or queries and compare source publication/event dates before answering. "
-        "Never assume that the newest result returned by a search is from today. If evidence for the requested date is unavailable, say so explicitly instead of presenting older information as current."
-    )
 
 
 def _is_nvidia_deepseek_v4(base_url: str, model: str) -> bool:
@@ -873,31 +845,17 @@ async def stream_response(
     if api_protocol == "messages":
         headers["x-api-key"] = api_key
         headers["anthropic-version"] = "2023-06-01"
-    if not web_enabled:
-        base_prompt = "You are an AI assistant. No web-search or webpage-reading tool is available in this role."
-    elif parallel_mode:
-        base_prompt = PARALLEL_CUSTOM_SYSTEM_PROMPT
-    elif legacy_mode:
-        base_prompt = LEGACY_CUSTOM_SYSTEM_PROMPT
-    else:
-        base_prompt = KEYLESS_CUSTOM_SYSTEM_PROMPT
-    if agent_mode:
-        base_prompt = f"{base_prompt}\n\n{AGENT_SYSTEM_PROMPT}\n\n{PLAN_PROMPT}"
     system_prompt = _apply_model_system_prompt(
-        _dated_system_prompt(base_prompt, user_timezone),
+        build_system_prompt(
+            agent_mode=agent_mode,
+            web_enabled=web_enabled,
+            web_backend=web_tool_backend,
+            workspace_access=workspace_access if workspace is not None else None,
+            user_timezone=user_timezone,
+            skills_prompt=system_addendum,
+        ),
         model,
     )
-    if workspace is not None and workspace_access != "none":
-        workspace_prompt = (
-            READ_ONLY_WORKSPACE_SYSTEM_PROMPT
-            if workspace_access == "read_only"
-            else EDIT_WORKSPACE_SYSTEM_PROMPT
-            if workspace_access == "edit"
-            else WORKSPACE_SYSTEM_PROMPT
-        )
-        system_prompt = f"{system_prompt}\n\n{workspace_prompt}\n\n{PLAN_PROMPT}"
-    if system_addendum.strip():
-        system_prompt = f"{system_prompt}\n\n{system_addendum.strip()}"
     # URLs the user actually wrote gate the reader; application context must not.
     known_urls = _user_urls(messages)
     messages = [dict(message) for message in messages]
@@ -1538,8 +1496,10 @@ async def stream_response(
                 name = str(function.get("name") or "")
                 workspace_name, bound_path = inkling_patch_bindings.get(name, (name, ""))
                 is_search = name == "web_search"
-                is_workspace = workspace_name in WORKSPACE_TOOL_NAMES
-                is_extra = name in extra_tool_names or HOST_LEGACY_TOOL_ALIASES.get(name) in extra_tool_names
+                is_extra = extra_tools_expected and (
+                    name in extra_tool_names or HOST_LEGACY_TOOL_ALIASES.get(name) in extra_tool_names
+                )
+                is_workspace = workspace_tools_expected and not is_extra and workspace_name in WORKSPACE_TOOL_NAMES
                 is_plan = name == "update_plan" and plan_tool_expected
                 step: dict[str, Any] = {
                     "id": call_id,
@@ -1638,7 +1598,7 @@ async def stream_response(
                         # Keep the live trace useful for host operations without
                         # copying complete file contents or command arguments.
                         hint = (
-                            (arguments.get("command") if name == "host_run_command" else None)
+                            (arguments.get("command") if name in HOST_COMMAND_TOOLS else None)
                             or arguments.get("path")
                             or arguments.get("cwd")
                             or arguments.get("skill_id")
@@ -1667,9 +1627,10 @@ async def stream_response(
                             "search_files": ("query",),
                             "delete_file": ("path",),
                             "run_python": ("path",),
+                            "run_command": ("command",),
                             "check_web_syntax": ("path",),
                         }.get(workspace_name, ())
-                        non_empty_arguments = {"path", "query", "old_text"}
+                        non_empty_arguments = {"path", "query", "old_text", "command"}
                         missing = [
                             key
                             for key in required_arguments
@@ -1701,7 +1662,7 @@ async def stream_response(
                             step["requested_start_line"] = arguments.get("start_line")
                         workspace_call_skipped = False
                         validation_key = json.dumps(
-                            [workspace_name, normalized_path, arguments.get("arguments") or []],
+                            [workspace_name, normalized_path, arguments.get("arguments") or [], arguments.get("command") or ""],
                             ensure_ascii=False,
                             separators=(",", ":"),
                         )
@@ -1735,7 +1696,7 @@ async def stream_response(
                                 workspace_searches.add(search_key)
                                 result_text = await asyncio.to_thread(workspace.execute, workspace_name, arguments)
                         elif (
-                            workspace_name in {"run_python", "check_web_syntax"}
+                            workspace_name in {"run_python", "run_command", "check_web_syntax"}
                             and (workspace_generation, validation_key) in workspace_validations
                         ):
                             workspace_call_skipped = True
@@ -1760,7 +1721,7 @@ async def stream_response(
                                 if replacement is not None:
                                     workspace_call_skipped = True
                                     result_text = replacement
-                            elif workspace_name in {"run_python", "check_web_syntax"}:
+                            elif workspace_name in {"run_python", "run_command", "check_web_syntax"}:
                                 workspace_validations.add((workspace_generation, validation_key))
                             elif workspace_name in WORKSPACE_MUTATION_TOOLS:
                                 workspace_generation += 1
@@ -1995,7 +1956,7 @@ async def stream_response(
                         elif name in HOST_FILE_MUTATION_TOOLS and not failure:
                             workspace_generation += 1
                             changed_path = str(_json_object(result_text).get("path") or "")
-                            if changed_path and name == "host_delete_path":
+                            if changed_path and name in HOST_DELETE_TOOLS:
                                 knowledge.forget(changed_path)
                             elif changed_path:
                                 knowledge.record_own_change(
@@ -2037,14 +1998,14 @@ async def stream_response(
                     result_text += _web_stall_note(web_calls_since_progress, agent_mode)
                     step["web_stall_warning"] = web_calls_since_progress
                 progressed = step["status"] == "completed" and (
-                    (is_workspace and workspace_name in WORKSPACE_MUTATION_TOOLS | {"run_python", "check_web_syntax"})
-                    or (is_extra and (name in HOST_FILE_MUTATION_TOOLS or name in {"host_run_command", "frontend_validate_page"}))
+                    (is_workspace and workspace_name in WORKSPACE_MUTATION_TOOLS | {"run_python", "run_command", "check_web_syntax"})
+                    or (is_extra and (name in HOST_FILE_MUTATION_TOOLS or name in HOST_COMMAND_TOOLS | HOST_VALIDATION_TOOLS))
                 )
                 if progressed:
                     web_calls_since_progress = 0
                 mutated = step["status"] == "completed" and (
-                    (is_workspace and workspace_name in WORKSPACE_MUTATION_TOOLS | {"run_python", "check_web_syntax"})
-                    or (is_extra and (name in HOST_FILE_MUTATION_TOOLS or name == "frontend_validate_page"))
+                    (is_workspace and workspace_name in WORKSPACE_MUTATION_TOOLS | {"run_python", "run_command", "check_web_syntax"})
+                    or (is_extra and (name in HOST_FILE_MUTATION_TOOLS or name in HOST_VALIDATION_TOOLS))
                 )
                 calls_since_mutation = 0 if mutated else calls_since_mutation + 1
                 if (

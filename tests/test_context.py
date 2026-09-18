@@ -97,6 +97,15 @@ class CompactRequestTests(unittest.TestCase):
         self.assertFalse(knowledge.known("huge.py"))
         self.assertEqual(checkpoint_payload(conversation)["file_snapshots"], [])
 
+    def test_encrypted_reasoning_is_discounted_in_the_measure(self):
+        blob = "A" * 80_000
+        with_reasoning = [{"role": "assistant", "content": "x", "responses_output_items": [
+            {"type": "reasoning", "id": "r", "encrypted_content": blob}]}]
+        self.assertLess(serialized_chars(with_reasoning), 12_000)
+        self.assertGreater(serialized_chars(with_reasoning), 10_000)
+        conversation = BASE + with_reasoning + [{"role": "tool", "tool_call_id": "c", "content": "ok"}]
+        self.assertIsNone(compact_request(conversation, base_message_count=2, budget=40_000))
+
     def test_budget_normalization(self):
         self.assertEqual(normalize_budget(None), DEFAULT_CONTEXT_BUDGET_CHARS)
         self.assertEqual(normalize_budget("abc"), DEFAULT_CONTEXT_BUDGET_CHARS)

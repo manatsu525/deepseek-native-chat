@@ -20,7 +20,7 @@ EDIT_TOOLS = {"edit_file", "host_edit_file", "apply_line_edits", "apply_patch", 
 DELETE_TOOLS = {"delete_file", "host_delete_path"}
 READ_TOOLS = {"read_file", "host_read_file", "frontend_read_page"}
 VALIDATION_TOOLS = {"run_python", "check_web_syntax", "frontend_validate_page"}
-COMMAND_TOOLS = {"host_run_command"}
+COMMAND_TOOLS = {"run_command", "host_run_command"}
 
 
 def _unique(values: list[str]) -> list[str]:

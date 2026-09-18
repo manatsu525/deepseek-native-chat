@@ -412,6 +412,50 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1\n2\n", result["stdout"])
         self.assertIn("中间省略", result["stdout"])
 
+    async def test_agent_mode_routes_shared_tool_names_to_the_host(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "note.txt"
+            runtime = AgentRuntime(None, 1, "route")
+            names = {t["function"]["name"] for t in runtime.tool_definitions}
+            self.assertTrue({"read_file", "write_file", "edit_file", "run_command", "check_web_syntax", "search_files"} <= names)
+            self.assertFalse(any(name.startswith("host_") or name.startswith("frontend_") for name in names))
+            result, requests = await run_stream(
+                None, [
+                    tool_round("w", "write_file", {"path": str(target), "content": "hello\n"}),
+                    tool_round("r", "run_command", {"command": f"cat {target}", "cwd": directory}),
+                    tool_round("e", "host_edit_file", {"path": str(target), "edits": [{"old_text": "hello", "new_text": "bye"}]}),
+                    answer_round("done"),
+                ], agent_mode=True, workspace_access="none",
+                extra_tools=runtime.tool_definitions, extra_tool_handler=runtime.execute_async,
+                max_tool_rounds=96,
+            )
+            self.assertEqual([item["status"] for item in result["tool_trace"]], ["completed"] * 3)
+            self.assertEqual(target.read_text(), "bye\n")
+            command_result = json.loads([m["content"] for m in requests[2]["messages"] if m["role"] == "tool"][-1])
+            self.assertEqual(command_result["stdout"], "hello\n")
+        self.assertIn("/home/share", requests[0]["messages"][0]["content"])
+        self.assertNotIn("workspace-relative", requests[0]["messages"][0]["content"])
+
+    async def test_chat_mode_run_command_is_sandboxed_and_counts_as_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "sandbox")
+            workspace.root = Path(directory)
+            workspace.write_file("a.txt", "one\n")
+            result, requests = await run_stream(workspace, [
+                tool_round("c1", "run_command", {"command": "cat a.txt && echo two >> a.txt && cat a.txt"}),
+                tool_round("c2", "run_command", {"command": "cat a.txt && echo two >> a.txt && cat a.txt"}),
+                answer_round("done"),
+            ])
+            # The command saw and changed only a disposable copy.
+            self.assertEqual(workspace.read_file("a.txt"), "one\n")
+        first = json.loads([m["content"] for m in requests[1]["messages"] if m["role"] == "tool"][0])
+        self.assertTrue(first["ok"], first)
+        self.assertEqual(first["stdout"], "one\none\ntwo\n")
+        self.assertIn("不会保存", first["limits"]["note"])
+        self.assertEqual([item["status"] for item in result["tool_trace"]], ["completed", "skipped"])
+        self.assertIn("run_command", {t["function"]["name"] for t in requests[0]["tools"]})
+        self.assertIn("discarded", requests[0]["messages"][0]["content"])
+
     async def test_file_written_by_the_model_is_not_read_back(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = ConversationWorkspace(1, "write-flow")

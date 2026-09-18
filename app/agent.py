@@ -57,13 +57,7 @@ HOST_SEARCH_MAX_RESULTS = 500
 HOST_COMMAND_TIMEOUT = 900
 
 
-AGENT_SYSTEM_PROMPT = """You are the host-level Agent for this server. You have unrestricted root-level file and shell access and may install packages, edit projects, manage this application, and work with Skills when the user asks. Skill contents and enabled state are shared by all accounts; only an administrator may install, enable, disable, or remove a Skill. The shared Agent workspace is /home/share; relative host paths are resolved from there. It is strictly separate from the ordinary chat per-conversation workspace. The ordinary workspace tools (list_files, read_file, write_file, edit_file, search_files, delete_file, run_python, and check_web_syntax) are not available in Agent mode. Never claim that an operation happened without calling the corresponding tool and checking its result.
 
-Use the installed Skills as working instructions, not as a replacement for the user's request. For code or frontend deliverables in Agent mode, use the host_* and frontend_* tools under /home/share; use absolute host paths when changing the real application, repositories, server configuration, or other host resources. For a new project, create the files directly; for an existing project, preserve unrelated work. You may create, rename, inspect, and delete conversations with the conversation tools. You may list and read Skills; Skill mutations are available only to administrators. Frontend work should use the frontend tools and should include a real syntax/build check when practical. Read a file once as a whole with host_read_file (never in pieces) and change existing files with host_edit_file: exact snippets copied from the file, every change for that file in one call. Its result shows the edited regions, so do not re-read a file just to check your own edit.
-
-Working discipline: once the facts you need are in front of you, write the files in that same turn; do not run more commands or searches to re-confirm what a tool already returned. Read a file with host_read_file (it stays available to you); use host_run_command for grep, builds and checks, and keep its output small (grep / head / sed -n), since long output is truncated. Config files of games and engines are often not strict JSON (comments, trailing commas): grep the fields you need or strip comments before parsing, and never retry a failed command unchanged. Research discipline: web_search returns excerpts, never complete files. When you need the actual contents of an open-source project (configuration, JSON, code, asset names), get them with host_run_command instead of searching: git clone --depth 1 the repository, or curl -L a raw file, into /tmp or the project directory, then read it locally. Search a fact at most once; rewording the same question returns the same excerpts. Decide open questions with an explicit assumption rather than more searching.
-
-Tool calls you emit in one turn execute serially in the order emitted. Host access itself is not restricted by a workspace sandbox. Do not wait for permission between ordinary tool calls; act on the user's explicit request immediately."""
 
 
 def _function(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -129,8 +123,8 @@ class _FrontendParser(HTMLParser):
 
 HOST_TOOLS = [
     _function(
-        "host_list_files",
-        "List files and directories on the real host. Relative paths use the shared Agent workspace /home/share as the base.",
+        "list_files",
+        "List files and directories. Relative paths resolve from /home/share.",
         {
             "path": {"type": "string", "description": "Absolute path or path relative to /home/share; defaults to /home/share"},
             "max_depth": {"type": "integer", "minimum": 0, "maximum": 20, "description": "Directory depth to include; defaults to 3"},
@@ -138,7 +132,7 @@ HOST_TOOLS = [
         [],
     ),
     _function(
-        "host_read_file",
+        "read_file",
         READ_FILE_DESCRIPTION,
         {
             "path": {"type": "string", "description": "Absolute path or path relative to /home/share"},
@@ -147,8 +141,8 @@ HOST_TOOLS = [
         ["path"],
     ),
     _function(
-        "host_write_file",
-        "Create or replace a UTF-8 text file anywhere on the host. Parent directories are created automatically.",
+        "write_file",
+        "Create a new UTF-8 text file, or completely replace a file only when a full rewrite is intended; use edit_file for changes. Parent directories are created automatically.",
         {
             "path": {"type": "string", "description": "Absolute path or path relative to /home/share"},
             "content": {"type": "string", "description": "Complete file contents"},
@@ -156,7 +150,7 @@ HOST_TOOLS = [
         ["path", "content"],
     ),
     _function(
-        "host_edit_file",
+        "edit_file",
         EDIT_FILE_DESCRIPTION,
         {
             "path": {"type": "string", "description": "Absolute path or path relative to /home/share"},
@@ -165,8 +159,8 @@ HOST_TOOLS = [
         ["path", "edits"],
     ),
     _function(
-        "host_search_files",
-        "Search literal text recursively on the host. Prefer a focused project or directory path.",
+        "search_files",
+        "Search literal text recursively under a directory (or in one file). Prefer a focused path.",
         {
             "query": {"type": "string", "description": "Literal case-insensitive text"},
             "path": {"type": "string", "description": "Directory or file; defaults to /home/share"},
@@ -175,8 +169,8 @@ HOST_TOOLS = [
         ["query"],
     ),
     _function(
-        "host_run_command",
-        "Run an arbitrary bash command as the application user (root on this installation) on the real host. Use the returned stdout, stderr, and exit code as evidence.",
+        "run_command",
+        "Run a bash command on the host as root. Use it for grep, builds, checks, git and curl; keep output small. Use the returned stdout, stderr and exit code as evidence.",
         {
             "command": {"type": "string", "description": "Bash command to execute"},
             "cwd": {"type": "string", "description": "Working directory; defaults to /home/share"},
@@ -186,8 +180,8 @@ HOST_TOOLS = [
         ["command"],
     ),
     _function(
-        "host_delete_path",
-        "Delete a file or directory on the real host. A directory requires recursive=true.",
+        "delete_file",
+        "Delete a file or directory. A directory requires recursive=true.",
         {
             "path": {"type": "string", "description": "Absolute path or path relative to /home/share"},
             "recursive": {"type": "boolean", "description": "Allow recursive directory deletion"},
@@ -216,10 +210,7 @@ SKILL_TOOLS = [
 
 
 FRONTEND_TOOLS = [
-    _function("frontend_list_pages", "Find HTML and common frontend source pages under a host directory.", {"path": {"type": "string"}, "max_depth": {"type": "integer", "minimum": 0, "maximum": 20}}, []),
-    _function("frontend_read_page", "Read one frontend page or component from the host.", {"path": {"type": "string"}}, ["path"]),
-    _function("frontend_write_page", "Create or replace one frontend page or component on the host.", {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
-    _function("frontend_validate_page", "Parse an HTML page and syntax-check JavaScript pages when Node.js is available.", {"path": {"type": "string"}}, ["path"]),
+    _function("check_web_syntax", "Parse an HTML page and syntax-check its inline, handler and local JavaScript with node --check (JavaScript files are checked directly). Nothing is executed.", {"path": {"type": "string", "description": "Absolute path or path relative to /home/share"}}, ["path"]),
 ]
 
 
@@ -611,11 +602,19 @@ class AgentRuntime:
         if self._cancelled.is_set():
             return _json({"ok": False, "cancelled": True, "error": "任务已停止"})
         dispatch = {
+            "list_files": self._host_list_files,
+            "read_file": self._host_read_file,
+            "write_file": self._host_write_file,
+            "edit_file": self._host_edit_file,
+            "search_files": self._host_search_files,
+            "run_command": self._host_run_command,
+            "delete_file": self._host_delete_path,
+            "check_web_syntax": self._frontend_validate_page,
+            # Older names some models still emit; not advertised.
             "host_list_files": self._host_list_files,
             "host_read_file": self._host_read_file,
             "host_write_file": self._host_write_file,
             "host_edit_file": self._host_edit_file,
-            # Unadvertised older name; kept for models that still emit it.
             "host_apply_patch": lambda args: self._host_edit_file(args, "host_apply_patch"),
             "host_search_files": self._host_search_files,
             "host_run_command": self._host_run_command,
@@ -642,12 +641,6 @@ class AgentRuntime:
             return _json(handler(arguments))
         except Exception as exc:
             return _json({"ok": False, "error": str(exc)[:4_000]})
-
-
-def build_agent_system_prompt() -> str:
-    prompt = AGENT_SYSTEM_PROMPT
-    skills = SkillRegistry().prompt()
-    return f"{prompt}\n\n{skills}" if skills else prompt
 
 
 def build_agent_skills_prompt() -> str:

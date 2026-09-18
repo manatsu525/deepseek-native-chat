@@ -36,11 +36,28 @@ PROGRESS_NOTE_CHARS = 400
 CONTEXT_CHECKPOINT_MARKER = "\n\nCONTEXT CHECKPOINT:\n"
 STUB_PREFIX = "[已省略的工具结果] "
 READ_TOOLS = {"read_file", "host_read_file", "frontend_read_page"}
-COMMAND_TOOLS = {"host_run_command"}
+COMMAND_TOOLS = {"run_command", "host_run_command"}
+
+
+ENCRYPTED_REASONING_WEIGHT = 8
 
 
 def serialized_chars(messages: list[dict[str, Any]]) -> int:
-    return sum(len(json.dumps(message, ensure_ascii=False, separators=(",", ":"))) for message in messages)
+    """Request size in characters, with opaque reasoning blobs discounted.
+
+    Providers replay ``encrypted_content`` without charging it as input, and
+    it is base64 (about 8 chars per token), so counting it at face value made
+    a 25K-token request look like 150K characters and forced needless
+    compaction.
+    """
+    total = 0
+    for message in messages:
+        total += len(json.dumps(message, ensure_ascii=False, separators=(",", ":")))
+        for item in message.get("responses_output_items") or []:
+            blob = item.get("encrypted_content") if isinstance(item, dict) else None
+            if isinstance(blob, str):
+                total -= len(blob) - len(blob) // ENCRYPTED_REASONING_WEIGHT
+    return total
 
 
 def normalize_budget(value: Any) -> int:

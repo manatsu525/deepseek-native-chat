@@ -40,7 +40,7 @@ class HostReadTests(unittest.TestCase):
             self.assertEqual(result['next_start_line'], result['through_line'] + 1)
             self.assertEqual(result['line_count'], 2000)
             self.assertTrue(result['revision'])
-            schema = next(item for item in runtime.tool_definitions if item['function']['name'] == 'host_read_file')
+            schema = next(item for item in runtime.tool_definitions if item['function']['name'] == 'read_file')
             self.assertEqual(set(schema['function']['parameters']['properties']), {'path', 'start_line'})
 
     def test_unchanged_host_reads_are_short_until_the_file_changes(self):
@@ -159,12 +159,12 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                          '<html><script src="app.js"></script></html>'):
                 page.write_text(html)
                 (root / 'app.js').write_text('const broken = ;')
-                result = json.loads(await runtime.execute_async('frontend_validate_page', {'path': str(page)}))
+                result = json.loads(await runtime.execute_async('check_web_syntax', {'path': str(page)}))
                 self.assertFalse(result['ok'], result)
                 self.assertTrue(result['errors'])
             page.write_text('<html><button onclick="return false">x</button><script type="module">export const x = 1;</script><script src="app.js?v=1"></script></html>')
             (root / 'app.js').write_text('const x = 1;')
-            result = json.loads(await runtime.execute_async('frontend_validate_page', {'path': str(page)}))
+            result = json.loads(await runtime.execute_async('check_web_syntax', {'path': str(page)}))
             self.assertTrue(result['ok'], result)
             self.assertEqual(len(result['checked_scripts']), 3)
 

@@ -24,11 +24,7 @@ MAX_READ_CHARS = 100_000
 MAX_SEARCH_RESULTS = 20
 AGENT_MAX_FILES = 4_000
 
-WORKSPACE_SYSTEM_PROMPT = """A persistent, isolated coding workspace is available for this conversation. When the user asks you to create code or a multi-file project, use the workspace tools to save the actual files instead of only printing complete files in chat. Keep planning proportional to the next concrete action: once you know the next useful workspace operation, call the tool immediately. For an implementation request, start with the smallest useful workspace operation—list_files or read_file—and make the first concrete edit as soon as its target is known. When several workspace operations are needed, emit calls with known arguments in dependency order; the server executes workspace calls serially in this turn. Never respond with a promise such as "I will create the file" or "the file is being created"; perform the operation in the current turn. On later requests, inspect the existing workspace files and modify only what needs to change. Do not recreate or overwrite unrelated files. Every workspace tool call must include every field marked required in its JSON schema. File tools must include a non-empty workspace-relative path exactly as listed by list_files (or the intended new relative path for write_file), except when a tool's own description explicitly says its path is already bound; a pre-bound tool must not receive path. read_file returns the whole file as numbered lines in one call; only a file too large for one response is truncated, and then you continue from next_start_line. Never read a file in pieces. To change an existing file, make one edit_file call containing every change for that file: each old_text is an exact snippet copied from the file without the N| prefixes and long enough to be unique. Do not use write_file to replace a whole file for a local change. edit_file shows the edited regions and you already know the rest of the file, so do not re-read a file just to check your own edit. Saved Python programs can be verified with run_python. Saved HTML and JavaScript must be checked with check_web_syntax when that tool is available; it parses HTML and runs Node.js syntax checks on inline, event-handler, and local JavaScript without executing it. These tools run without network in disposable resource-limited copies. Treat a nonzero exit or ok=false as a real failure and fix it before claiming success. After a successful validation, answer the user. Repeat a read, search, or validation only when a new edit or new evidence requires it. A failed validation may justify inspection and an edit, but rerunning it without changing the workspace is not progress. Syntax success does not prove browser behavior is correct, so state that limitation. After editing, briefly summarize changed files; the UI supplies download links automatically."""
 
-READ_ONLY_WORKSPACE_SYSTEM_PROMPT = """A persistent coding workspace is available in read-only review mode. You may list, read, and search files and run the supplied validation tools, but you must not create, edit, replace, or delete files. Report concrete findings with file paths and test evidence. You may emit multiple read, search, or validation calls in one turn when their arguments are known; they execute serially. If a change is needed, describe it for the programmer instead of attempting the mutation yourself."""
-
-EDIT_WORKSPACE_SYSTEM_PROMPT = """A persistent coding workspace is available in implementation-only mode. You may list, read, search, create, edit, and delete workspace files as needed to implement the requested change. Keep planning proportional to the next concrete action: once you know the next useful workspace operation, call the tool immediately. For an implementation request, start with the smallest useful workspace operation—list_files or read_file—and make the first concrete edit as soon as its target is known. When several workspace operations are needed, emit calls with known arguments in dependency order; the server executes workspace calls serially in this turn. Never respond with a promise such as "I will create the file" or "the file is being created"; perform the operation in the current turn. Read each file once as a whole and change existing files with edit_file using exact snippets. Runtime execution and syntax-validation tools are intentionally unavailable because a separate reviewer is responsible for verification. Read only what is needed, make the actual edits, and then report the changed files; verification is handled by a separate reviewer."""
 
 
 READ_FILE_DESCRIPTION = (
@@ -137,6 +133,17 @@ RUN_PYTHON_TOOL = _function(
     ["path"],
 )
 
+RUN_COMMAND_TOOL = _function(
+    "run_command",
+    "Run one bash command in a disposable, network-less copy of the workspace (time and memory limited). Use it to grep, list, "
+    "build or test. Output is real, but files the command creates or changes are discarded; change files with write_file and edit_file.",
+    {
+        "command": {"type": "string", "description": "Bash command, run from the workspace root"},
+        "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 60, "description": "Optional timeout; defaults to 12"},
+    },
+    ["command"],
+)
+
 CHECK_WEB_SYNTAX_TOOL = _function(
     "check_web_syntax",
     "Check one saved HTML or JavaScript file in an isolated disposable copy. HTML parsing includes inline scripts, inline event handlers, and referenced local JS files. JavaScript is checked with node --check but not executed. Fix every reported syntax error before claiming success.",
@@ -147,17 +154,12 @@ CHECK_WEB_SYNTAX_TOOL = _function(
 # Older single/batch patch names that some models or text-markup fallbacks
 # still emit. They are not advertised and are executed as edit_file.
 LEGACY_PATCH_TOOL_NAMES = {"apply_patch", "apply_patch_batch", "replace_text"}
+VALIDATION_TOOL_NAMES = {"run_python", "run_command", "check_web_syntax"}
 WORKSPACE_TOOL_NAMES = {
-    item["function"]["name"] for item in [*WORKSPACE_TOOLS, RUN_PYTHON_TOOL, CHECK_WEB_SYNTAX_TOOL]
+    item["function"]["name"] for item in [*WORKSPACE_TOOLS, RUN_PYTHON_TOOL, RUN_COMMAND_TOOL, CHECK_WEB_SYNTAX_TOOL]
 } | LEGACY_PATCH_TOOL_NAMES
-READ_ONLY_WORKSPACE_TOOL_NAMES = {
-    "list_files",
-    "read_file",
-    "search_files",
-    "run_python",
-    "check_web_syntax",
-}
-EDIT_WORKSPACE_TOOL_NAMES = WORKSPACE_TOOL_NAMES - {"run_python", "check_web_syntax"}
+READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search_files"} | VALIDATION_TOOL_NAMES
+EDIT_WORKSPACE_TOOL_NAMES = WORKSPACE_TOOL_NAMES - VALIDATION_TOOL_NAMES
 
 
 class WorkspaceError(ValueError):
@@ -528,7 +530,7 @@ class ConversationWorkspace:
         write, invalidating provider prompt caches.  ``list_files`` remains the
         authoritative way for the model to discover paths.
         """
-        tools = [*WORKSPACE_TOOLS, RUN_PYTHON_TOOL, CHECK_WEB_SYNTAX_TOOL]
+        tools = [*WORKSPACE_TOOLS, RUN_COMMAND_TOOL, RUN_PYTHON_TOOL, CHECK_WEB_SYNTAX_TOOL]
         if access == "read_only":
             tools = [item for item in tools if item["function"]["name"] in READ_ONLY_WORKSPACE_TOOL_NAMES]
         elif access == "edit":
@@ -608,6 +610,12 @@ class ConversationWorkspace:
             result["match"] = recovered
         return result
 
+    def run_command(self, command: Any, timeout_seconds: Any = None) -> dict[str, Any]:
+        from .code_runner import run_command
+
+        self.root.mkdir(parents=True, exist_ok=True)
+        return run_command(self.root, command, timeout_seconds)
+
     def run_python(self, path: Any, arguments: Any = None) -> dict[str, Any]:
         from .code_runner import run_python
 
@@ -668,6 +676,8 @@ class ConversationWorkspace:
             result = self.search_files(arguments.get("query"), arguments.get("path", ""))
         elif name == "delete_file":
             result = self.delete_file(arguments.get("path"))
+        elif name == "run_command":
+            result = self.run_command(arguments.get("command"), arguments.get("timeout_seconds"))
         elif name == "run_python":
             result = self.run_python(arguments.get("path"), arguments.get("arguments", []))
         elif name == "check_web_syntax":

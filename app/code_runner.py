@@ -82,7 +82,7 @@ def _prepare_copy(source_root: Path) -> Path:
     return target_root
 
 
-def _isolated_command(run_root: Path, executable: str, args: list[str]) -> list[str]:
+def _isolated_command(run_root: Path, executable: str, args: list[str], timeout: int = RUN_TIMEOUT_SECONDS) -> list[str]:
     return [
         "systemd-run",
         "--quiet",
@@ -104,7 +104,7 @@ def _isolated_command(run_root: Path, executable: str, args: list[str]) -> list[
         "-p", "MemoryMax=128M",
         "-p", "CPUQuota=50%",
         "-p", "TasksMax=32",
-        "-p", f"RuntimeMaxSec={RUN_TIMEOUT_SECONDS}",
+        "-p", f"RuntimeMaxSec={timeout}",
         "-p", f"WorkingDirectory={run_root}",
         "-p", f"ReadWritePaths={run_root}",
         "-E", "PYTHONDONTWRITEBYTECODE=1",
@@ -114,14 +114,14 @@ def _isolated_command(run_root: Path, executable: str, args: list[str]) -> list[
     ]
 
 
-def _run_isolated(run_root: Path, executable: str, args: list[str]) -> dict[str, Any]:
+def _run_isolated(run_root: Path, executable: str, args: list[str], timeout: int = RUN_TIMEOUT_SECONDS) -> dict[str, Any]:
     try:
         completed = subprocess.run(
-            _isolated_command(run_root, executable, args),
+            _isolated_command(run_root, executable, args, timeout),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=RUN_TIMEOUT_SECONDS + 8,
+            timeout=timeout + 8,
             check=False,
             env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
         )
@@ -166,6 +166,42 @@ def run_python(source_root: Path, relative_path: str, arguments: Any = None) -> 
             "stdout": result["stdout"],
             "stderr": result["stderr"],
             "limits": {"network": False, "timeout_seconds": RUN_TIMEOUT_SECONDS, "memory_mb": 128},
+        }
+    finally:
+        shutil.rmtree(run_root, ignore_errors=True)
+
+
+COMMAND_TIMEOUT_MAX = 60
+MAX_COMMAND_CHARS = 4_000
+
+
+def run_command(source_root: Path, command: Any, timeout_seconds: Any = None) -> dict[str, Any]:
+    """Run one bash command in a disposable, network-less copy of the workspace.
+
+    Files the command creates or changes live only in the copy; the workspace
+    itself is never modified by a command.
+    """
+    text = str(command or "").strip()
+    if not text:
+        raise CodeRunnerError("command 不能为空")
+    if len(text) > MAX_COMMAND_CHARS or "\x00" in text:
+        raise CodeRunnerError("命令过长或无效")
+    try:
+        timeout = int(timeout_seconds) if timeout_seconds not in (None, "") else RUN_TIMEOUT_SECONDS
+    except (TypeError, ValueError) as exc:
+        raise CodeRunnerError("timeout_seconds 无效") from exc
+    timeout = max(1, min(COMMAND_TIMEOUT_MAX, timeout))
+    run_root = _prepare_copy(source_root)
+    try:
+        result = _run_isolated(run_root, "/bin/bash", ["-c", text], timeout)
+        return {
+            "ok": result["ok"],
+            "command": text,
+            "exit_code": result["exit_code"],
+            "stdout": result["stdout"],
+            "stderr": result["stderr"],
+            "limits": {"network": False, "timeout_seconds": timeout, "memory_mb": 128,
+                       "note": "命令在工作区的一次性副本中执行，副本里的文件改动不会保存"},
         }
     finally:
         shutil.rmtree(run_root, ignore_errors=True)
