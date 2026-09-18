@@ -354,6 +354,59 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(item["status"] == "completed" for item in result["tool_trace"]))
         self.assertNotIn("web_stall_warning", result["tool_trace"][-1])
 
+    async def test_calls_without_any_mutation_get_a_periodic_nudge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "nudge")
+            workspace.root = Path(directory)
+            workspace.write_file("a.js", "x();\n")
+            # Standard mode allows 12 tool rounds; the nudge starts at the 10th
+            # call without a file change and repeats every 4 calls.
+            rounds = [tool_round(f"l{n}", "search_files", {"query": f"needle{n}"}) for n in range(12)]
+            rounds.append(answer_round("done"))
+            result, requests = await run_stream(workspace, rounds)
+        trace = result["tool_trace"]
+        warned = [item.get("mutation_stall_warning") for item in trace]
+        self.assertEqual(warned, [None] * 9 + [10, None, None])
+        tool_results = [m["content"] for m in requests[-1]["messages"] if m["role"] == "tool"]
+        self.assertIn("没有修改任何文件", tool_results[9])
+        self.assertNotIn("没有修改任何文件", tool_results[8])
+
+    def test_checkpoint_keeps_the_models_own_progress_notes(self):
+        AGENT_CONTEXT_COMPACT_THRESHOLD = mimo_local.AGENT_CONTEXT_COMPACT_THRESHOLD
+        base = [{"role": "system", "content": "system"}, {"role": "user", "content": "fix"}]
+        old = []
+        for n in range(3):
+            old += [{"role": "assistant", "content": f"计划第{n}步：新建独立兵种。", "tool_calls": [{"id": f"c{n}"}]},
+                    {"role": "tool", "tool_call_id": f"c{n}", "content": "x" * (AGENT_CONTEXT_COMPACT_THRESHOLD // 2)}]
+        latest = [{"role": "assistant", "content": "最后一步", "tool_calls": [{"id": "l"}]},
+                  {"role": "tool", "tool_call_id": "l", "content": "latest"}]
+        history = base + old + latest
+        self.assertTrue(mimo_local._maybe_compact_agent_context(history, base_message_count=2, workspace=None, sources={}, tool_trace=[]))
+        notes = mimo_local.checkpoint_payload(history)["progress_notes"]
+        self.assertEqual(notes, ["计划第0步：新建独立兵种。", "计划第1步：新建独立兵种。", "计划第2步：新建独立兵种。"])
+        # A later checkpoint keeps accumulating instead of starting over.
+        history += [{"role": "assistant", "content": "又一步", "tool_calls": [{"id": "m"}]},
+                    {"role": "tool", "tool_call_id": "m", "content": "y" * (AGENT_CONTEXT_COMPACT_THRESHOLD + 1)}]
+        self.assertTrue(mimo_local._maybe_compact_agent_context(history, base_message_count=2, workspace=None, sources={}, tool_trace=[]))
+        self.assertEqual(mimo_local.checkpoint_payload(history)["progress_notes"][-2:], ["计划第2步：新建独立兵种。", "最后一步"])
+
+    def test_long_command_output_keeps_head_and_tail(self):
+        from app.agent import bounded_output
+
+        text = "H" * 10_000 + "M" * 50_000 + "T" * 10_000
+        out = bounded_output(text, 12_000)
+        self.assertTrue(out.startswith("H" * 100))
+        self.assertTrue(out.endswith("T" * 100))
+        self.assertIn("中间省略", out)
+        self.assertLess(len(out), 12_400)
+        self.assertEqual(bounded_output("short", 12_000), "short")
+        runtime = AgentRuntime(None, 1, "t")
+        result = json.loads(runtime.execute("host_run_command", {"command": "seq 1 20000", "cwd": "/tmp"}))
+        self.assertTrue(result["ok"])
+        self.assertIn("\n20000", result["stdout"])
+        self.assertIn("1\n2\n", result["stdout"])
+        self.assertIn("中间省略", result["stdout"])
+
     async def test_file_written_by_the_model_is_not_read_back(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = ConversationWorkspace(1, "write-flow")

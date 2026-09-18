@@ -124,6 +124,12 @@ SIMILAR_SEARCH_JACCARD = 0.6
 # in the tool result, then refuse further web calls until real progress.
 WEB_STALL_WARN_CALLS = 4
 WEB_STALL_REFUSE_CALLS = 8
+# Tool calls of any kind (reads, commands, searches) without a file change or
+# validation: nag in every result from here on, every few calls.
+MUTATION_STALL_CALLS = 10
+MUTATION_STALL_EVERY = 4
+PROGRESS_NOTE_COUNT = 12
+PROGRESS_NOTE_CHARS = 400
 CONTEXT_CHECKPOINT_MARKER = "\n\nCONTEXT CHECKPOINT:\n"
 RUNTIME_NOTE_MARKER = "\n\n[Runtime note] "
 USER_CONTEXT_MARKER = "\n\n---\n[Context supplied by the application, not written by the user]\n"
@@ -493,6 +499,15 @@ def _maybe_compact_agent_context(
                     break
                 keep_from = start
             keep = internal[keep_from:]
+    # What the model said it was doing in the rounds being dropped. Without
+    # this, every checkpoint erased its own plan and it re-derived it from
+    # scratch, round after round.
+    dropped = internal[: len(internal) - len(keep)]
+    progress_notes = [
+        " ".join(str(message.get("content") or "").split())[:PROGRESS_NOTE_CHARS]
+        for message in dropped
+        if message.get("role") == "assistant" and str(message.get("content") or "").strip()
+    ][-PROGRESS_NOTE_COUNT:]
     files = workspace.list_files() if workspace is not None else []
     source_state = [
         {
@@ -527,6 +542,14 @@ def _maybe_compact_agent_context(
         "sources": source_state,
         "recent_operations": operations,
     }
+    if existing_notes := checkpoint_payload(conversation[:base_message_count]).get("progress_notes"):
+        progress_notes = (list(existing_notes) + progress_notes)[-PROGRESS_NOTE_COUNT:]
+    if progress_notes:
+        checkpoint["progress_notes"] = progress_notes
+        checkpoint["instruction"] += (
+            " progress_notes are your own earlier statements in this task, oldest first: the plan and decisions "
+            "already made. Continue from them instead of re-deriving the plan or repeating completed steps."
+        )
     if host_evidence is not None:
         checkpoint["host_operation_evidence"] = host_evidence
         checkpoint["instruction"] += (
@@ -1100,6 +1123,7 @@ async def stream_response(
     tool_budget_exhausted = False
     searched_terms: list[tuple[int, set[str], str]] = []
     web_calls_since_progress = 0
+    calls_since_mutation = 0
     responses_protocol_enabled = api_protocol == "responses"
     tool_results_start = len(messages) + 1
     round_stats: list[dict[str, Any]] = []
@@ -2207,6 +2231,22 @@ async def stream_response(
                 )
                 if progressed:
                     web_calls_since_progress = 0
+                mutated = step["status"] == "completed" and (
+                    (is_workspace and workspace_name in WORKSPACE_MUTATION_TOOLS | {"run_python", "check_web_syntax"})
+                    or (is_extra and (name in HOST_FILE_MUTATION_TOOLS or name == "frontend_validate_page"))
+                )
+                calls_since_mutation = 0 if mutated else calls_since_mutation + 1
+                if (
+                    calls_since_mutation >= MUTATION_STALL_CALLS
+                    and (calls_since_mutation - MUTATION_STALL_CALLS) % MUTATION_STALL_EVERY == 0
+                    and (workspace_tools_expected or extra_tools_expected)
+                ):
+                    step["mutation_stall_warning"] = calls_since_mutation
+                    result_text += (
+                        f"\n\n[Runtime note] 已经连续 {calls_since_mutation} 次工具调用（读取、命令、搜索）而没有修改任何文件。"
+                        "如果方案已经清楚，现在就写文件，不要再确认已经拿到的信息；"
+                        "如果确实还缺一个事实，一次性获取后立即动手，并把无法确认的地方写成明确假设。"
+                    )
                 compacted_arguments = False
                 if is_workspace:
                     compacted_arguments = _compact_workspace_call_arguments(
@@ -2226,7 +2266,7 @@ async def stream_response(
                     "status": step["status"],
                     "error": step["error"],
                 }
-                for field in ("cached", "quota_counted", "received_argument_keys", "received_argument_chars", "similar_to_search", "web_stall_warning"):
+                for field in ("cached", "quota_counted", "received_argument_keys", "received_argument_chars", "similar_to_search", "web_stall_warning", "mutation_stall_warning"):
                     if field in step:
                         trace_item[field] = step[field]
                 if is_workspace and workspace_name == "read_file":

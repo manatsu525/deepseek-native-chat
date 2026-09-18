@@ -47,7 +47,11 @@ AGENT_PROJECT_ROOT = Path(os.getenv("AGENT_WORKSPACE_ROOT", os.getenv("AGENT_PRO
 HOST_READ_MAX_BYTES = 8 * 1024 * 1024
 HOST_READ_MAX_CHARS = 100_000
 HOST_WRITE_MAX_BYTES = 32 * 1024 * 1024
-HOST_OUTPUT_MAX_CHARS = 100_000
+# Command output the model sees. 100K-character outputs pushed every agent
+# history over the checkpoint mark within a few rounds, so the model kept
+# losing what it had just found. Long output keeps its head and tail.
+HOST_OUTPUT_MAX_CHARS = 12_000
+HOST_OUTPUT_READ_CHARS = 400_000
 HOST_LIST_MAX_ENTRIES = 4_000
 HOST_SEARCH_MAX_RESULTS = 500
 HOST_COMMAND_TIMEOUT = 900
@@ -57,7 +61,7 @@ AGENT_SYSTEM_PROMPT = """You are the host-level Agent for this server. You have 
 
 Use the installed Skills as working instructions, not as a replacement for the user's request. For code or frontend deliverables in Agent mode, use the host_* and frontend_* tools under /home/share; use absolute host paths when changing the real application, repositories, server configuration, or other host resources. For a new project, create the files directly; for an existing project, preserve unrelated work. You may create, rename, inspect, and delete conversations with the conversation tools. You may list and read Skills; Skill mutations are available only to administrators. Frontend work should use the frontend tools and should include a real syntax/build check when practical. Read a file once as a whole with host_read_file (never in pieces) and change existing files with host_edit_file: exact snippets copied from the file, every change for that file in one call. Its result shows the edited regions, so do not re-read a file just to check your own edit.
 
-Research discipline: web_search returns excerpts, never complete files. When you need the actual contents of an open-source project (configuration, JSON, code, asset names), get them with host_run_command instead of searching: git clone --depth 1 the repository, or curl -L a raw file, into /tmp or the project directory, then read it locally. Search a fact at most once; rewording the same question returns the same excerpts. For a change that touches several files, first write the concrete plan (which files, which edits, which facts are still unknown) to PLAN.md in the project directory, then execute it step by step and update the file as you go; decide open questions with an explicit assumption rather than more searching.
+Working discipline: once the facts you need are in front of you, write the files in that same turn; do not run more commands or searches to re-confirm what a tool already returned. Read a file with host_read_file (it stays available to you); use host_run_command for grep, builds and checks, and keep its output small (grep / head / sed -n), since long output is truncated. Config files of games and engines are often not strict JSON (comments, trailing commas): grep the fields you need or strip comments before parsing, and never retry a failed command unchanged. Research discipline: web_search returns excerpts, never complete files. When you need the actual contents of an open-source project (configuration, JSON, code, asset names), get them with host_run_command instead of searching: git clone --depth 1 the repository, or curl -L a raw file, into /tmp or the project directory, then read it locally. Search a fact at most once; rewording the same question returns the same excerpts. For a change that touches several files, first write the concrete plan (which files, which edits, which facts are still unknown) to PLAN.md in the project directory, then execute it step by step and update the file as you go; decide open questions with an explicit assumption rather than more searching.
 
 There are exactly two Agent scheduling rules: (1) at most one web_search or fetch_webpage call is executed in each model turn; (2) all non-web tool calls emitted in a turn execute serially in the order emitted. Host access itself is not restricted by a workspace sandbox. Do not wait for permission between ordinary tool calls; act on the user's explicit request immediately."""
 
@@ -80,6 +84,21 @@ def _function(name: str, description: str, properties: dict[str, Any], required:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+def bounded_output(text: str, limit: int = HOST_OUTPUT_MAX_CHARS) -> str:
+    """Keep the head and tail of long command output with an explicit gap."""
+    if len(text) <= limit:
+        return text
+    head = limit * 2 // 5
+    tail = limit - head
+    omitted = len(text) - head - tail
+    return (
+        text[:head]
+        + f"\n\n[... 输出过长，中间省略 {omitted} 字符（共 {len(text)} 字符）。"
+        "请用 grep / head / sed -n 缩小范围，或把输出写入文件后用 host_read_file 读取 ...]\n\n"
+        + text[-tail:]
+    )
 
 
 class _FrontendParser(HTMLParser):
@@ -407,8 +426,12 @@ class AgentRuntime:
                     process.wait()
             def tail(stream: Any) -> str:
                 stream.seek(0, os.SEEK_END)
-                stream.seek(max(0, stream.tell() - HOST_OUTPUT_MAX_CHARS * 4))
-                return stream.read().decode("utf-8", errors="replace")[-HOST_OUTPUT_MAX_CHARS:]
+                total = stream.tell()
+                stream.seek(max(0, total - HOST_OUTPUT_READ_CHARS))
+                text = stream.read().decode("utf-8", errors="replace")
+                if total > HOST_OUTPUT_READ_CHARS:
+                    text = "[...]" + text
+                return bounded_output(text)
             return {
                 "ok": process.returncode == 0 and not cancelled and not timed_out,
                 "exit_code": int(process.returncode),
