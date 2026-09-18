@@ -110,7 +110,7 @@ class CompactRequestTests(unittest.TestCase):
         self.assertEqual(normalize_budget(None), DEFAULT_CONTEXT_BUDGET_CHARS)
         self.assertEqual(normalize_budget("abc"), DEFAULT_CONTEXT_BUDGET_CHARS)
         self.assertEqual(normalize_budget(1), 40_000)
-        self.assertEqual(normalize_budget(10**9), 2_000_000)
+        self.assertEqual(normalize_budget(10**9), 4_000_000)
 
 
 class TaskPlanTests(unittest.TestCase):
