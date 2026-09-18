@@ -125,6 +125,10 @@ class TaskPlanTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             plan.apply({"steps": []})
         self.assertEqual(plan.updates, 1)
+        # Other todo-tool conventions are accepted.
+        result = json.loads(plan.apply({"todos": [{"title": "解压", "status": "completed"}, {"description": "改 mod.json", "state": "todo"}]}))
+        self.assertEqual(result["done"], 1)
+        self.assertEqual(plan.export()["steps"], [{"step": "解压", "status": "done"}, {"step": "改 mod.json", "status": "pending"}])
 
 
 if __name__ == "__main__":

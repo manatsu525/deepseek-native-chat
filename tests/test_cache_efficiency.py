@@ -233,9 +233,11 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
             workspace = ConversationWorkspace(1, "budget")
             workspace.root = Path(directory)
             workspace.write_file("a.js", "x();\n")
+            # Every round writes a file, so this is real progress that runs
+            # the round budget out (not an exploration stall).
             narrated = [
                 [{"choices": [{"delta": {"content": f"第{n}步。", "tool_calls": [{"index": 0, "id": f"c{n}", "type": "function",
-                    "function": {"name": "list_files", "arguments": "{}"}}]}}]}]
+                    "function": {"name": "write_file", "arguments": json.dumps({"path": f"f{n}.txt", "content": "x\n"})}}]}}]}]
                 for n in range(mimo_local.MAX_AGENT_TOOL_ROUNDS)
             ]
             still_calling = [tool_round(f"f{n}", "list_files", {}) for n in range(mimo_local.FINAL_ANSWER_ATTEMPTS)]
@@ -455,6 +457,50 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["status"] for item in result["tool_trace"]], ["completed", "skipped"])
         self.assertIn("run_command", {t["function"]["name"] for t in requests[0]["tools"]})
         self.assertIn("discarded", requests[0]["messages"][0]["content"])
+
+    async def test_endless_exploration_is_paused_until_something_is_written(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "explore")
+            workspace.root = Path(directory)
+            workspace.write_file("a.js", "x();\n")
+            limit = mimo_local.MUTATION_STALL_REFUSE_CALLS
+            rounds = [tool_round(f"s{n}", "search_files", {"query": f"needle{n}"}) for n in range(limit)]
+            rounds += [
+                tool_round("r1", "read_file", {"path": "a.js"}),          # refused
+                tool_round("c1", "run_command", {"command": "grep x a.js"}),  # refused (read-only command)
+                tool_round("w1", "write_file", {"path": "b.js", "content": "y();\n"}),  # allowed, resets
+                tool_round("r2", "read_file", {"path": "a.js"}),          # allowed again
+                answer_round("done"),
+            ]
+            result, requests = await run_stream(workspace, rounds)
+            self.assertTrue((Path(directory) / "b.js").exists())
+        statuses = [(item["name"], item["status"]) for item in result["tool_trace"][limit:]]
+        self.assertEqual(statuses, [("read_file", "failed"), ("run_command", "failed"), ("write_file", "completed"), ("read_file", "completed")])
+        self.assertIn("只读操作已暂停", result["tool_trace"][limit]["error"])
+        self.assertEqual(result["answer"], "done")
+
+    async def test_three_stall_refusals_force_the_final_answer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "explore2")
+            workspace.root = Path(directory)
+            workspace.write_file("a.js", "x();\n")
+            limit = mimo_local.MUTATION_STALL_REFUSE_CALLS
+            rounds = [tool_round(f"s{n}", "search_files", {"query": f"needle{n}"}) for n in range(limit + 3)]
+            rounds.append(answer_round("gave up, here is what I know"))
+            result, requests = await run_stream(workspace, rounds)
+        self.assertEqual([item["status"] for item in result["tool_trace"][limit:]], ["failed"] * 3)
+        self.assertTrue(result["round_stats"][-1]["final_only"])
+        self.assertEqual(result["answer"], "gave up, here is what I know")
+
+    def test_read_only_command_heuristic(self):
+        self.assertTrue(mimo_local._read_only_call("run_command", {"command": "grep -rn foo . | head"}))
+        self.assertTrue(mimo_local._read_only_call("run_command", {"command": "sed -n '1,20p' a.json; cat b"}))
+        self.assertTrue(mimo_local._read_only_call("run_command", {"command": "python3 -c 'import json; print(1)'"}))
+        for command in ("git clone --depth 1 https://x/y", "unzip a.zip -d /tmp/m", "sed -i 's/a/b/' f", "cat a > b",
+                        "mkdir -p out && cp a out/", "python3 build.py", "curl -L https://x -o f"):
+            self.assertFalse(mimo_local._read_only_call("run_command", {"command": command}), command)
+        self.assertFalse(mimo_local._read_only_call("write_file", {}))
+        self.assertTrue(mimo_local._read_only_call("web_search", {}))
 
     async def test_file_written_by_the_model_is_not_read_back(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -132,6 +132,27 @@ WEB_STALL_REFUSE_CALLS = 8
 # validation: nag in every result from here on, every few calls.
 MUTATION_STALL_CALLS = 10
 MUTATION_STALL_EVERY = 4
+# From here on, read-only calls are refused until something is written.
+MUTATION_STALL_REFUSE_CALLS = 16
+STALL_REFUSALS_BEFORE_ANSWER = 3
+READ_ONLY_TOOL_NAMES = {
+    "read_file", "list_files", "search_files", "web_search", "fetch_webpage",
+    "host_read_file", "host_list_files", "host_search_files", "frontend_read_page", "frontend_list_pages",
+}
+_WRITING_COMMAND_RE = re.compile(
+    r"(>|\btee\b|\bcp\b|\bmv\b|\bmkdir\b|\brm\b|\bsed\s+-i|\bgit\s+(clone|checkout|apply|pull|init)\b|\bunzip\b|\btar\b|"
+    r"\bcurl\b|\bwget\b|\bpip3?\b|\bapt(-get)?\b|\bnpm\b|\bnpx\b|\bmake\b|\bcmake\b|\binstall\b|\bchmod\b|\bchown\b|"
+    r"\bln\b|\btouch\b|\bpatch\b|\bsystemctl\b|\bpython3?\s+[^-\s]|\bnode\s+[^-\s]|\bbash\s+[^-\s]|\bsh\s+[^-\s])"
+)
+
+
+def _read_only_call(name: str, arguments: dict[str, Any]) -> bool:
+    """Whether a call can only look around; such calls are paused during a stall."""
+    if name in READ_ONLY_TOOL_NAMES:
+        return True
+    if name in HOST_COMMAND_TOOLS:
+        return not _WRITING_COMMAND_RE.search(str(arguments.get("command") or ""))
+    return False
 RUNTIME_NOTE_MARKER = "\n\n[Runtime note] "
 USER_CONTEXT_MARKER = "\n\n---\n[Context supplied by the application, not written by the user]\n"
 FINAL_ANSWER_PROMPT = (
@@ -887,6 +908,7 @@ async def stream_response(
     searched_terms: list[tuple[int, set[str], str]] = []
     web_calls_since_progress = 0
     calls_since_mutation = 0
+    stall_refusals = 0
     responses_protocol_enabled = api_protocol == "responses"
     tool_results_start = len(messages) + 1
     round_stats: list[dict[str, Any]] = []
@@ -1431,7 +1453,7 @@ async def stream_response(
                 )
                 if final_answer_attempts < FINAL_ANSWER_ATTEMPTS:
                     continue
-                if tool_trace and tool_rounds_used >= role_tool_round_limit:
+                if tool_trace and (tool_rounds_used >= role_tool_round_limit or stall_refusals >= STALL_REFUSALS_BEFORE_ANSWER):
                     # The tool budget ran out mid-task and the model still
                     # wants tools. Its file changes are already saved, so end
                     # as an incomplete answer the user can continue, not an error.
@@ -1594,6 +1616,19 @@ async def stream_response(
                         raise ValueError("工具参数必须是 JSON 对象")
                     received_keys = sorted(arguments)
                     arguments = normalize_file_tool_arguments(workspace_name if is_workspace else name, arguments)
+                    if (
+                        calls_since_mutation >= MUTATION_STALL_REFUSE_CALLS
+                        and (workspace_tools_expected or extra_tools_expected)
+                        and _read_only_call(workspace_name if is_workspace else name, arguments)
+                    ):
+                        # Text nudges were ignored for 16 calls: stop the
+                        # exploration loop. Writing (or answering) reopens reads.
+                        stall_refusals += 1
+                        raise ToolQuotaExceeded(
+                            f"只读操作已暂停：已连续 {calls_since_mutation} 次读取、搜索或只读命令而没有修改任何文件。"
+                            "现在二选一：(1) 用 write_file / edit_file 把已经确定的内容写入文件（不确定之处写成明确假设），写入后可以继续读取；"
+                            "(2) 直接回答用户，说明已了解的情况、已做的判断和还缺什么。不要再发起只读调用。"
+                        )
                     if is_extra:
                         # Keep the live trace useful for host operations without
                         # copying complete file contents or command arguments.
@@ -2065,6 +2100,10 @@ async def stream_response(
                         "round_stats": round_stats,
                     }
                 )
+            if stall_refusals >= STALL_REFUSALS_BEFORE_ANSWER:
+                # It keeps asking to look around after being told to write or
+                # answer: end the tool loop and take the answer it can give.
+                force_final_answer = True
             if responses_protocol:
                 response_chain.pending = _responses_input(conversation[tool_results_start:])
             compacted = compact_request(

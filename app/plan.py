@@ -14,6 +14,10 @@ from typing import Any
 MAX_PLAN_ITEMS = 20
 MAX_ITEM_CHARS = 200
 STATUSES = ("pending", "in_progress", "done")
+STEP_ALIASES = ("step", "title", "description", "task", "content", "text", "name", "item")
+STATUS_ALIASES = {"todo": "pending", "not_started": "pending", "open": "pending", "doing": "in_progress",
+                  "active": "in_progress", "wip": "in_progress", "completed": "done", "complete": "done",
+                  "finished": "done", "closed": "done"}
 
 UPDATE_PLAN_TOOL = {
     "type": "function",
@@ -63,7 +67,7 @@ class TaskPlan:
         self.updates = 0
 
     def apply(self, arguments: dict[str, Any]) -> str:
-        raw = arguments.get("steps")
+        raw = next((arguments[key] for key in ("steps", "plan", "items", "todos", "tasks") if key in arguments), None)
         if isinstance(raw, str):
             try:
                 raw = json.loads(raw)
@@ -75,12 +79,17 @@ class TaskPlan:
         for item in raw[:MAX_PLAN_ITEMS]:
             if isinstance(item, str):
                 item = {"step": item, "status": "pending"}
-            if not isinstance(item, dict) or not str(item.get("step") or "").strip():
-                raise ValueError("每个步骤需要非空的 step")
-            status = str(item.get("status") or "pending").strip().lower()
+            if not isinstance(item, dict):
+                raise ValueError("每个步骤需要是对象或字符串")
+            # Models trained on other todo tools send title/description/task/content.
+            text = next((str(item[key]) for key in STEP_ALIASES if str(item.get(key) or "").strip()), "")
+            if not text.strip():
+                raise ValueError("每个步骤需要非空的 step 文本")
+            status = str(item.get("status") or item.get("state") or "pending").strip().lower()
+            status = STATUS_ALIASES.get(status, status)
             if status not in STATUSES:
                 status = "pending"
-            steps.append({"step": " ".join(str(item["step"]).split())[:MAX_ITEM_CHARS], "status": status})
+            steps.append({"step": " ".join(text.split())[:MAX_ITEM_CHARS], "status": status})
         self.steps = steps
         self.note = " ".join(str(arguments.get("note") or "").split())[:1000]
         self.updates += 1
