@@ -25,7 +25,7 @@ from .file_knowledge import FileKnowledge
 # model's context window"; any other value is an explicit character budget.
 DEFAULT_CONTEXT_BUDGET_CHARS = 240_000
 MIN_CONTEXT_BUDGET_CHARS = 40_000
-MAX_CONTEXT_BUDGET_CHARS = 2_000_000
+MAX_CONTEXT_BUDGET_CHARS = 4_000_000
 # Automatic sizing: this share of the model's window, capped in tokens.
 # Compaction throws away work the model has done, so on large-window models
 # it starts only past 512K tokens; smaller windows stay bounded by the share.

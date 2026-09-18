@@ -1579,7 +1579,7 @@ def delete_agent_workspace_path(target_path: str, _: dict[str, Any] = Depends(cu
     except WorkspaceError as exc:
         raise HTTPException(400, str(exc)) from exc
     parent = result["path"].rsplit("/", 1)[0] if "/" in result["path"] else ""
-    return {**result, **agent_directory_payload(workspace, parent)}
+    return {"ok": True, "deleted": result, **agent_directory_payload(workspace, parent)}
 
 
 @app.get("/api/agent-workspace/files/{file_path:path}")
