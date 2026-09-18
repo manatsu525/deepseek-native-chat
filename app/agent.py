@@ -49,8 +49,10 @@ HOST_READ_MAX_CHARS = 100_000
 HOST_WRITE_MAX_BYTES = 32 * 1024 * 1024
 # Command output the model sees. 100K-character outputs pushed every agent
 # history over the checkpoint mark within a few rounds, so the model kept
-# losing what it had just found. Long output keeps its head and tail.
-HOST_OUTPUT_MAX_CHARS = 12_000
+# losing what it had just found; 12K made it page through files with
+# sed -n instead. Long output keeps its head and tail; context aging in
+# app/context.py retires old results when the request grows.
+HOST_OUTPUT_MAX_CHARS = 40_000
 HOST_OUTPUT_READ_CHARS = 400_000
 HOST_LIST_MAX_ENTRIES = 4_000
 HOST_SEARCH_MAX_RESULTS = 500
@@ -90,7 +92,8 @@ def bounded_output(text: str, limit: int = HOST_OUTPUT_MAX_CHARS) -> str:
     return (
         text[:head]
         + f"\n\n[... 输出过长，中间省略 {omitted} 字符（共 {len(text)} 字符）。"
-        "请用 grep / head / sed -n 缩小范围，或把输出写入文件后用 host_read_file 读取 ...]\n\n"
+        "要看一个文件的全文请用 read_file(path)，它一次返回整个文件；要定位内容请用 search_files 或 grep -n。"
+        "不要用 sed -n / head / tail 分段查看 ...]\n\n"
         + text[-tail:]
     )
 

@@ -128,7 +128,8 @@ class ResponsesReasoningReplayTests(unittest.IsolatedAsyncioTestCase):
                     web_enabled=False,
                 )
 
-        self.assertEqual(result["answer"], "我来修改。完成。")
+        # Text from separate model rounds is joined as paragraphs.
+        self.assertEqual(result["answer"], "我来修改。\n\n完成。")
         self.assertEqual(payloads[0]["include"], ["reasoning.encrypted_content"])
         second_input = payloads[1]["input"]
         self.assertIn(reasoning_item, second_input)

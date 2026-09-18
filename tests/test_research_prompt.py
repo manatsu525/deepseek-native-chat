@@ -14,6 +14,12 @@ class SystemPromptTests(unittest.TestCase):
         self.assertIn("update_plan", prompt)
         self.assertIn("discarded", prompt)
         self.assertNotIn("/home/share", prompt)
+        # Rules that came out of the VCMI benchmark: no paging through files
+        # with shell tools, visible progress text, and no proof-hunting in
+        # engine source when the documentation already answers the question.
+        self.assertIn("never with cat, sed -n, head or tail", prompt)
+        self.assertIn("Work visibly", prompt)
+        self.assertIn("do not read an engine's or framework's source code", prompt)
 
     def test_agent_prompt_describes_host_and_skills(self) -> None:
         prompt = build_system_prompt(agent_mode=True, web_enabled=True, web_backend="parallel",

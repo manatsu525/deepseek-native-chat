@@ -130,6 +130,34 @@ class TaskPlanTests(unittest.TestCase):
         self.assertEqual(result["done"], 1)
         self.assertEqual(plan.export()["steps"], [{"step": "解压", "status": "done"}, {"step": "改 mod.json", "status": "pending"}])
 
+    def test_plan_accepts_loose_shapes_instead_of_failing(self):
+        plan = TaskPlan()
+        # Free text, one step per line, with checkbox marks.
+        result = json.loads(plan.apply({"plan": "1. [x] unzip mods\n2. [~] read vanilla stats\n- write creature file\n"}))
+        self.assertEqual(result["done"], 1)
+        self.assertEqual([s["status"] for s in plan.export()["steps"]], ["done", "in_progress", "pending"])
+        self.assertEqual(plan.export()["steps"][2]["step"], "write creature file")
+        # Unknown field names: the longest text wins; numeric step ids are not text.
+        result = json.loads(plan.apply({"steps": [{"id": 1, "action": "inspect both mods", "done": True},
+                                                  {"step": 2, "summary": "add new creature", "completed": False}]}))
+        self.assertEqual(plan.export()["steps"], [{"step": "inspect both mods", "status": "done"},
+                                                  {"step": "add new creature", "status": "pending"}])
+        # A dict keyed by step number, and a single step given at the top level.
+        plan.apply({"steps": {"1": "a", "2": {"task": "b", "status": "in_progress"}}})
+        self.assertEqual([s["step"] for s in plan.export()["steps"]], ["a", "b"])
+        plan.apply({"step": "only one", "status": "done"})
+        self.assertEqual(plan.export()["steps"], [{"step": "only one", "status": "done"}])
+        with self.assertRaises(ValueError):
+            plan.apply({"steps": [{"id": 1}, ""]})
+
+    def test_round_text_is_joined_as_paragraphs(self):
+        from app.mimo_local import _join_round_text
+
+        self.assertEqual(_join_round_text("", "first"), "first")
+        self.assertEqual(_join_round_text("first", ""), "first")
+        self.assertEqual(_join_round_text("first", "second"), "first\n\nsecond")
+        self.assertEqual(_join_round_text("first\n", "second"), "first\nsecond")
+
 
 if __name__ == "__main__":
     unittest.main()

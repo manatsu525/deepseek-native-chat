@@ -146,6 +146,17 @@ _WRITING_COMMAND_RE = re.compile(
 )
 
 
+def _join_round_text(answer: str, text: str) -> str:
+    """Append one model round's visible text as its own paragraph.
+
+    The progress sentences a model writes between tool calls used to be glued
+    to each other and to the final answer without any separator.
+    """
+    if answer and text and not answer.endswith("\n") and not text.startswith("\n"):
+        return answer + "\n\n" + text
+    return answer + text
+
+
 def _read_only_call(name: str, arguments: dict[str, Any]) -> bool:
     """Whether a call can only look around; such calls are paused during a stall."""
     if name in READ_ONLY_TOOL_NAMES:
@@ -1299,7 +1310,7 @@ async def stream_response(
                     preview_usage = _merge_usage(usage, round_usage)
                     await update(
                         {
-                            "answer": answer + (round_preview if markup_stream is not None else round_answer),
+                            "answer": _join_round_text(answer, round_preview if markup_stream is not None else round_answer),
                             "reasoning": reasoning + round_reasoning,
                             "searches": steps,
                             "usage": preview_usage,
@@ -1463,7 +1474,7 @@ async def stream_response(
                     raise RuntimeError("上游连续返回空正文，未生成最终答案")
                 raise RuntimeError("上游在最终回答阶段仍返回工具调用，未生成最终答案")
 
-            answer += round_answer
+            answer = _join_round_text(answer, round_answer)
             reasoning += round_reasoning
             if responses_protocol:
                 response_chain.accept()
@@ -2054,6 +2065,8 @@ async def stream_response(
                         "如果方案已经清楚，现在就写文件，不要再确认已经拿到的信息；"
                         "如果确实还缺一个事实，一次性获取后立即动手，并把无法确认的地方写成明确假设。"
                     )
+                    if plan.steps:
+                        result_text += "\n当前计划：\n" + plan.render()
                 compacted_arguments = False
                 if is_workspace:
                     compacted_arguments = _compact_workspace_call_arguments(

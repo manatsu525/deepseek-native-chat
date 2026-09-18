@@ -9,6 +9,7 @@ compaction, instead of re-deriving the approach every round.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 MAX_PLAN_ITEMS = 20
@@ -60,6 +61,51 @@ PLAN_PROMPT = (
 )
 
 
+_STATUS_KEYS = ("status", "state", "done", "completed", "complete", "finished")
+_NON_TEXT_KEYS = set(_STATUS_KEYS) | {"id", "index", "order", "priority", "number", "no", "n"}
+_LINE_PREFIX_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)]|\(\d+\)|#+)?\s*(\[(?P<mark>[ xX~])\])?\s*")
+
+
+def _split_plan_text(text: str) -> list[dict[str, str]]:
+    """Turn a plan written as free text (one step per line) into items."""
+    items: list[dict[str, str]] = []
+    for line in text.splitlines():
+        match = _LINE_PREFIX_RE.match(line)
+        body = line[match.end():].strip() if match else line.strip()
+        if not body:
+            continue
+        mark = (match.group("mark") if match else None) or " "
+        status = {"x": "done", "X": "done", "~": "in_progress"}.get(mark, "pending")
+        items.append({"step": body, "status": status})
+    return items
+
+
+def _parse_step(item: Any) -> tuple[str, str]:
+    """Extract (text, status) from one step in any common convention."""
+    if isinstance(item, (str, int, float)):
+        parsed = _split_plan_text(str(item))
+        return (parsed[0]["step"][:MAX_ITEM_CHARS], parsed[0]["status"]) if parsed else ("", "pending")
+    if not isinstance(item, dict):
+        return "", "pending"
+    # Models trained on other todo tools send title/description/task/content.
+    text = next((str(item[key]) for key in STEP_ALIASES if isinstance(item.get(key), str) and item[key].strip()), "")
+    if not text:
+        candidates = [
+            str(value) for key, value in item.items()
+            if str(key).lower() not in _NON_TEXT_KEYS and isinstance(value, (str, int, float)) and str(value).strip()
+        ]
+        text = max(candidates, key=len) if candidates else ""
+    status_value: Any = next((item[key] for key in _STATUS_KEYS if key in item), "pending")
+    if isinstance(status_value, bool):
+        status = "done" if status_value else "pending"
+    else:
+        status = str(status_value or "pending").strip().lower()
+        status = STATUS_ALIASES.get(status, status)
+    if status not in STATUSES:
+        status = "pending"
+    return " ".join(text.split())[:MAX_ITEM_CHARS], status
+
+
 class TaskPlan:
     def __init__(self) -> None:
         self.steps: list[dict[str, str]] = []
@@ -67,29 +113,34 @@ class TaskPlan:
         self.updates = 0
 
     def apply(self, arguments: dict[str, Any]) -> str:
-        raw = next((arguments[key] for key in ("steps", "plan", "items", "todos", "tasks") if key in arguments), None)
+        """Accept whatever shape the model used for its plan.
+
+        A rejected plan call is worse than a loosely parsed one: the model
+        rarely retries, and then works the whole task without the anchor.
+        """
+        raw = next((arguments[key] for key in ("steps", "plan", "items", "todos", "tasks", "checklist") if key in arguments), None)
+        if raw is None and any(key in arguments for key in STEP_ALIASES):
+            raw = [arguments]
         if isinstance(raw, str):
             try:
-                raw = json.loads(raw)
+                parsed = json.loads(raw)
             except ValueError:
-                raw = None
+                parsed = None
+            raw = parsed if isinstance(parsed, (list, dict)) else _split_plan_text(raw)
+        if isinstance(raw, dict):
+            raw = [
+                value if isinstance(value, (dict, str)) else str(value)
+                for value in raw.values()
+            ]
         if not isinstance(raw, list) or not raw:
             raise ValueError("steps 必须是非空数组，每项包含 step 和 status")
         steps: list[dict[str, str]] = []
         for item in raw[:MAX_PLAN_ITEMS]:
-            if isinstance(item, str):
-                item = {"step": item, "status": "pending"}
-            if not isinstance(item, dict):
-                raise ValueError("每个步骤需要是对象或字符串")
-            # Models trained on other todo tools send title/description/task/content.
-            text = next((str(item[key]) for key in STEP_ALIASES if str(item.get(key) or "").strip()), "")
-            if not text.strip():
-                raise ValueError("每个步骤需要非空的 step 文本")
-            status = str(item.get("status") or item.get("state") or "pending").strip().lower()
-            status = STATUS_ALIASES.get(status, status)
-            if status not in STATUSES:
-                status = "pending"
-            steps.append({"step": " ".join(text.split())[:MAX_ITEM_CHARS], "status": status})
+            text, status = _parse_step(item)
+            if text:
+                steps.append({"step": text, "status": status})
+        if not steps:
+            raise ValueError("每个步骤需要非空的 step 文本")
         self.steps = steps
         self.note = " ".join(str(arguments.get("note") or "").split())[:1000]
         self.updates += 1
