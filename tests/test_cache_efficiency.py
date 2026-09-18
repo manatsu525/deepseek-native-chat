@@ -250,6 +250,110 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "空正文"):
             await run_stream(None, [answer_round(""), answer_round("")])
 
+    async def test_reworded_search_is_answered_from_earlier_results(self):
+        upstream = []
+
+        class Web:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            async def call_tool(self, name, args):
+                upstream.append(args["search_queries"])
+                return {"results": [{"url": "https://vcmi.eu/x", "title": "x", "excerpts": ["CSTORM.DEF"]}]}
+
+        def search(call_id, objective, queries):
+            return tool_round(call_id, "web_search", {"objective": objective, "search_queries": queries})
+
+        with patch.object(mimo_local, "ParallelMCPClient", Web):
+            result, requests = await run_stream(None, [
+                search("s1", "storm elemental def file", ["vcmi storm elemental DEF name"]),
+                search("s2", "storm elemental def file name", ["storm elemental DEF name vcmi sprites"]),
+                search("s3", "unrelated", ["python asyncio cancel task"]),
+                answer_round("done"),
+            ], web_enabled=True, settings={"thinking": "disabled", "web_tool_backend": "parallel"})
+        self.assertEqual(len(upstream), 2)
+        statuses = [(item["status"], item.get("similar_to_search")) for item in result["tool_trace"]]
+        self.assertEqual(statuses, [("completed", None), ("skipped", 1), ("completed", None)])
+        skipped = [m["content"] for m in requests[-1]["messages"] if m["role"] == "tool"][1]
+        self.assertIn("高度相似", skipped)
+        self.assertIn("第 1 次搜索", skipped)
+
+    def test_query_similarity_handles_chinese_and_distinct_topics(self):
+        a = mimo_local._query_terms("VCMI 风暴元素 DEF 文件名")
+        b = mimo_local._query_terms("风暴元素的 DEF 文件名 VCMI")
+        self.assertIsNotNone(mimo_local._similar_search(b, [(1, a, "first")]))
+        c = mimo_local._query_terms("比亚迪 元UP 电机功率")
+        self.assertIsNone(mimo_local._similar_search(c, [(1, a, "first")]))
+
+    async def test_web_calls_without_progress_are_warned_then_refused(self):
+        class Web:
+            calls = 0
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            async def call_tool(self, name, args):
+                type(self).calls += 1
+                return {"results": [{"url": f"https://example.test/{type(self).calls}", "title": "t", "excerpts": ["e"]}]}
+
+        runtime = AgentRuntime(None, 1, "stall")
+        topics = ["python asyncio", "rust borrow checker", "kubernetes ingress", "postgres vacuum", "redis streams",
+                  "nginx caching", "sqlite wal mode", "docker networking", "git rebase", "bash arrays"]
+        rounds = [tool_round(f"s{n}", "web_search", {"objective": t, "search_queries": [t]}) for n, t in enumerate(topics)]
+        rounds.append(answer_round("done"))
+        with patch.object(mimo_local, "ParallelMCPClient", Web):
+            result, requests = await run_stream(
+                None, rounds, web_enabled=True, agent_mode=True,
+                settings={"thinking": "disabled", "web_tool_backend": "parallel"},
+                extra_tools=runtime.tool_definitions, extra_tool_handler=runtime.execute_async,
+                max_tool_rounds=96, web_search_limit=96, web_fetch_limit=96, web_tool_round_limit=96,
+            )
+        trace = result["tool_trace"]
+        self.assertEqual(Web.calls, mimo_local.WEB_STALL_REFUSE_CALLS)
+        self.assertEqual([item["status"] for item in trace[:8]], ["completed"] * 8)
+        self.assertEqual([item["status"] for item in trace[8:]], ["failed", "failed"])
+        self.assertIn("联网查询已暂停", trace[8]["error"])
+        self.assertIn("git clone", trace[8]["error"])
+        self.assertEqual(trace[3]["web_stall_warning"], mimo_local.WEB_STALL_WARN_CALLS)
+        self.assertNotIn("web_stall_warning", trace[2])
+        tool_results = [m["content"] for m in requests[-1]["messages"] if m["role"] == "tool"]
+        self.assertIn("[Runtime note] 已经连续 4 次联网", tool_results[3])
+        # After two refusals the web tools are dropped so the answer finalizes.
+        self.assertNotIn("web_search", {t["function"]["name"] for t in requests[-1].get("tools", [])})
+
+    async def test_progress_resets_the_web_stall_counter(self):
+        class Web:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            async def call_tool(self, name, args):
+                return {"results": [{"url": "https://example.test/a", "title": "t", "excerpts": ["e"]}]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "progress")
+            workspace.root = Path(directory)
+            # Standard mode allows 3 searches per answer; the counter itself is
+            # exercised in agent mode above. Here two searches, progress, one more.
+            rounds = [tool_round(f"s{n}", "web_search", {"objective": f"topic {n} {'ab'[n % 2]}", "search_queries": [f"query {n} {'xyz'[n % 3]} distinct{n}"]}) for n in range(2)]
+            rounds.append(tool_round("w", "write_file", {"path": "notes.md", "content": "plan\n"}))
+            rounds.append(tool_round("s9", "web_search", {"objective": "another thing", "search_queries": ["something else entirely"]}))
+            rounds.append(answer_round("done"))
+            with patch.object(mimo_local, "ParallelMCPClient", Web):
+                result, _ = await run_stream(workspace, rounds, web_enabled=True,
+                                             settings={"thinking": "disabled", "web_tool_backend": "parallel"},
+                                             web_search_limit=10, web_tool_round_limit=10)
+        self.assertTrue(all(item["status"] == "completed" for item in result["tool_trace"]))
+        self.assertNotIn("web_stall_warning", result["tool_trace"][-1])
+
     async def test_file_written_by_the_model_is_not_read_back(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = ConversationWorkspace(1, "write-flow")

@@ -828,7 +828,10 @@ async def _execute_job(job_id: str) -> None:
     except asyncio.CancelledError:
         partial = db.one("SELECT answer, reasoning, searches_json, sources_json, usage_json, agents_json FROM jobs WHERE id=?", (job_id,)) or {}
         partial_agents = db.decode(partial.get("agents_json", "[]"), [])
-        if partial.get("answer") or partial_agents:
+        # Tool activity is worth keeping even without answer text: the next
+        # turn sees what was done, and the run can be diagnosed afterwards.
+        if partial.get("answer") or partial_agents or live_diagnostics.get("tool_trace"):
+            work_log = build_work_log(live_diagnostics.get("tool_trace") or [])
             meta = {
                 "job_id": job_id,
                 "stopped": True,
@@ -843,6 +846,7 @@ async def _execute_job(job_id: str) -> None:
                 "agents": partial_agents,
                 "workspace_files": agent_workspace.list_files() if agent_job else job_workspace.list_files(),
                 **diagnostics_meta(),
+                **({"work_log": work_log} if work_log else {}),
             }
             db.run(
                 "INSERT INTO messages(conversation_id, role, content, meta_json, created_at) VALUES(?,?,?,?,?)",

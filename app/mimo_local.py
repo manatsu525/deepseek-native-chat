@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import json
 import logging
+import re
 import uuid
 from pathlib import Path
 from collections.abc import Awaitable, Callable
@@ -116,6 +117,13 @@ HOST_FILE_MUTATION_TOOLS = {"host_write_file", "host_edit_file", "host_apply_pat
 HOST_WRITE_TOOLS = {"host_write_file", "frontend_write_page"}
 # Unadvertised older host tool names that are still executed when emitted.
 HOST_LEGACY_TOOL_ALIASES = {"host_apply_patch": "host_edit_file"}
+# A repeated search that shares this share of its terms with an earlier one is
+# answered from the earlier results instead of being sent upstream again.
+SIMILAR_SEARCH_JACCARD = 0.6
+# Consecutive web calls without any file change, command or validation: warn
+# in the tool result, then refuse further web calls until real progress.
+WEB_STALL_WARN_CALLS = 4
+WEB_STALL_REFUSE_CALLS = 8
 CONTEXT_CHECKPOINT_MARKER = "\n\nCONTEXT CHECKPOINT:\n"
 RUNTIME_NOTE_MARKER = "\n\n[Runtime note] "
 USER_CONTEXT_MARKER = "\n\n---\n[Context supplied by the application, not written by the user]\n"
@@ -358,6 +366,48 @@ def _remember_host_evidence(evidence: list[dict[str, Any]], name: str, arguments
     evidence.append(item)
     while len(evidence) > 30 or len(json.dumps(evidence, ensure_ascii=False)) > HOST_OPERATION_EVIDENCE_CHARS:
         evidence.pop(0)
+
+
+_QUERY_TOKEN_RE = re.compile(r"[a-z0-9]+|[一-鿿]+")
+
+
+def _query_terms(*parts: str) -> set[str]:
+    """Word set of a search request; CJK runs contribute character bigrams."""
+    terms: set[str] = set()
+    for part in parts:
+        for token in _QUERY_TOKEN_RE.findall(str(part or "").casefold()):
+            if "一" <= token[0] <= "鿿":
+                terms.update(token[i:i + 2] for i in range(len(token) - 1)) if len(token) > 1 else terms.add(token)
+            else:
+                terms.add(token)
+    return terms
+
+
+def _similar_search(terms: set[str], previous: list[tuple[int, set[str], str]]) -> tuple[int, str] | None:
+    """Return (index, label) of an earlier search that asked nearly the same thing."""
+    if not terms:
+        return None
+    for index, old_terms, label in previous:
+        union = len(terms | old_terms)
+        if union and len(terms & old_terms) / union >= SIMILAR_SEARCH_JACCARD:
+            return index, label
+    return None
+
+
+def _web_stall_hint(agent_mode: bool) -> str:
+    if agent_mode:
+        return (
+            "开源项目的源文件（配置、JSON、代码）应该用 host_run_command 直接获取"
+            "（git clone --depth 1 或 curl -L 原始文件），再在本地读取；网页搜索只返回摘录，拿不到完整文件。"
+        )
+    return "网页搜索只返回摘录；资料仍不足时，请说明缺少哪个具体事实并基于合理假设继续。"
+
+
+def _web_stall_note(count: int, agent_mode: bool) -> str:
+    return (
+        f"\n\n[Runtime note] 已经连续 {count} 次联网查询而没有任何文件修改、命令执行或验证。"
+        "请停止重复研究：用已有资料开始动手，把尚不确定的地方写成明确假设。" + _web_stall_hint(agent_mode)
+    )
 
 
 def _short_hash(value: Any) -> str:
@@ -1048,6 +1098,8 @@ async def stream_response(
     budget_noted_messages: set[int] = set()
     refused_web_calls = 0
     tool_budget_exhausted = False
+    searched_terms: list[tuple[int, set[str], str]] = []
+    web_calls_since_progress = 0
     responses_protocol_enabled = api_protocol == "responses"
     tool_results_start = len(messages) + 1
     round_stats: list[dict[str, Any]] = []
@@ -1687,6 +1739,14 @@ async def stream_response(
                     # the model calls an exhausted tool with malformed arguments,
                     # tell it to stop using that tool instead of inviting a retry.
                     # tool_rounds_used already counts this round.
+                    if is_search or name == "fetch_webpage":
+                        web_calls_since_progress += 1
+                        if web_calls_since_progress > WEB_STALL_REFUSE_CALLS:
+                            raise ToolQuotaExceeded(
+                                f"联网查询已暂停：连续 {web_calls_since_progress - 1} 次联网而没有任何文件修改、命令执行或验证。"
+                                "先根据已有资料动手（修改文件、运行命令或验证），之后才能继续联网。"
+                                + _web_stall_hint(agent_mode)
+                            )
                     if (is_search or name == "fetch_webpage") and tool_rounds_used > web_round_limit:
                         raise ToolQuotaExceeded(
                             f"联网工具（web_search / fetch_webpage）的轮次额度已用完（最多 {web_round_limit} 轮），"
@@ -1910,11 +1970,24 @@ async def stream_response(
                             query_key = query.casefold()
                             if not query:
                                 raise ValueError("搜索词不能为空")
+                        terms = _query_terms(objective, *queries) if parallel_mode else _query_terms(query)
+                        similar = None if query_key in searched_queries else _similar_search(terms, searched_terms)
                         if query_key in searched_queries:
                             step["status"] = "skipped"
                             result_text = "该查询已经搜索过，不重复请求。请改写查询或根据已有结果回答。"
+                        elif similar is not None:
+                            # Rewording the same question is the most common
+                            # research loop; point back at the earlier results.
+                            step["status"] = "skipped"
+                            step["similar_to_search"] = similar[0]
+                            result_text = (
+                                f"这次搜索与之前的第 {similar[0]} 次搜索（{similar[1][:120]}）高度相似，结果已在上方，不再重复请求。"
+                                "换个措辞不会得到新资料；如果确实还缺某个具体事实，请换一个完全不同的角度，"
+                                "或改用其他方式获取，否则请基于已有资料继续。"
+                            )
                         else:
                             searched_queries.add(query_key)
+                            searched_terms.append((len(searched_terms) + 1, terms, " / ".join(queries) if parallel_mode else query))
                             search_count += 1
                             step["quota_counted"] = True
                             if parallel_mode:
@@ -2125,6 +2198,15 @@ async def stream_response(
                         result_text = f"Agent 工具操作失败：{str(exc)[:1000]}。请根据错误结果修正参数后重试。"
                     else:
                         result_text = f"读取网页失败：{str(exc)[:1000]}。请根据已有搜索结果继续回答，必要时选择其他来源。"
+                if (is_search or name == "fetch_webpage") and WEB_STALL_WARN_CALLS <= web_calls_since_progress <= WEB_STALL_REFUSE_CALLS:
+                    result_text += _web_stall_note(web_calls_since_progress, agent_mode)
+                    step["web_stall_warning"] = web_calls_since_progress
+                progressed = step["status"] == "completed" and (
+                    (is_workspace and workspace_name in WORKSPACE_MUTATION_TOOLS | {"run_python", "check_web_syntax"})
+                    or (is_extra and (name in HOST_FILE_MUTATION_TOOLS or name in {"host_run_command", "frontend_validate_page"}))
+                )
+                if progressed:
+                    web_calls_since_progress = 0
                 compacted_arguments = False
                 if is_workspace:
                     compacted_arguments = _compact_workspace_call_arguments(
@@ -2144,7 +2226,7 @@ async def stream_response(
                     "status": step["status"],
                     "error": step["error"],
                 }
-                for field in ("cached", "quota_counted", "received_argument_keys", "received_argument_chars"):
+                for field in ("cached", "quota_counted", "received_argument_keys", "received_argument_chars", "similar_to_search", "web_stall_warning"):
                     if field in step:
                         trace_item[field] = step[field]
                 if is_workspace and workspace_name == "read_file":
