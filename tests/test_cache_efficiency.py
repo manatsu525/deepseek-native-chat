@@ -499,6 +499,8 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(mimo_local._read_only_call("run_command", {"command": "grep -rn foo . | head"}))
         self.assertTrue(mimo_local._read_only_call("run_command", {"command": "sed -n '1,20p' a.json; cat b"}))
         self.assertTrue(mimo_local._read_only_call("run_command", {"command": "python3 -c 'import json; print(1)'"}))
+        self.assertTrue(mimo_local._read_only_call("run_command", {"command": "grep -rn depends docs/*.md 2>/dev/null | head; ls x 2>&1"}))
+        self.assertFalse(mimo_local._read_only_call("run_command", {"command": "grep x f 2>/dev/null > out.txt"}))
         for command in ("git clone --depth 1 https://x/y", "unzip a.zip -d /tmp/m", "sed -i 's/a/b/' f", "cat a > b",
                         "mkdir -p out && cp a out/", "python3 build.py", "curl -L https://x -o f"):
             self.assertFalse(mimo_local._read_only_call("run_command", {"command": command}), command)

@@ -191,10 +191,17 @@ def run_command(source_root: Path, command: Any, timeout_seconds: Any = None) ->
     except (TypeError, ValueError) as exc:
         raise CodeRunnerError("timeout_seconds 无效") from exc
     timeout = max(1, min(COMMAND_TIMEOUT_MAX, timeout))
+    from .workspace import expand_file_views
+
+    def resolve(raw: str) -> Path | None:
+        candidate = (source_root / raw).resolve()
+        return candidate if str(candidate).startswith(str(source_root.resolve()) + os.sep) else None
+
+    text, view_notes = expand_file_views(text, resolve)
     run_root = _prepare_copy(source_root)
     try:
         result = _run_isolated(run_root, "/bin/bash", ["-c", text], timeout)
-        return {
+        response = {
             "ok": result["ok"],
             "command": text,
             "exit_code": result["exit_code"],
@@ -203,6 +210,9 @@ def run_command(source_root: Path, command: Any, timeout_seconds: Any = None) ->
             "limits": {"network": False, "timeout_seconds": timeout, "memory_mb": 128,
                        "note": "命令在工作区的一次性副本中执行，副本里的文件改动不会保存"},
         }
+        if view_notes:
+            response["notes"] = view_notes
+        return response
     finally:
         shutil.rmtree(run_root, ignore_errors=True)
 

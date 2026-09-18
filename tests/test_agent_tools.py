@@ -66,6 +66,48 @@ class AgentToolTests(unittest.TestCase):
         denied = runtime.execute("skill_enable", {"skill_id": "writing-plans", "enabled": False})
         self.assertIn("仅管理员", denied)
 
+    def test_large_listing_collapses_to_one_level_with_counts(self) -> None:
+        import json
+
+        with patch("app.agent.AGENT_PROJECT_ROOT", self.root):
+            for index in range(40):
+                (self.root / "big" / f"sub{index}").mkdir(parents=True)
+                for name in range(10):
+                    (self.root / "big" / f"sub{index}" / f"f{name}.txt").write_text("x")
+            (self.root / "big" / ".git").mkdir()
+            (self.root / "big" / ".git" / "HEAD").write_text("ref")
+            (self.root / "big" / "README.md").write_text("hello")
+            listed = json.loads(self.runtime.execute("list_files", {"path": "big"}))
+            self.assertTrue(listed["truncated"])
+            self.assertIn("只列出第一层", listed["note"])
+            self.assertLessEqual(len(listed["entries"]), 42)
+            by_path = {Path(item["path"]).name: item for item in listed["entries"]}
+            self.assertEqual(by_path["sub3"]["files_below"], 10)
+            self.assertEqual(by_path["README.md"]["size"], 5)
+            self.assertNotIn(".git", by_path)
+            small = json.loads(self.runtime.execute("list_files", {"path": "big/sub3"}))
+            self.assertFalse(small["truncated"])
+            self.assertEqual(len(small["entries"]), 10)
+
+    def test_partial_file_views_in_commands_show_the_whole_file(self) -> None:
+        import json
+
+        with patch("app.agent.AGENT_PROJECT_ROOT", self.root):
+            (self.root / "conf.json").write_text("\n".join(f"line {n}" for n in range(1, 41)) + "\n")
+            result = json.loads(self.runtime.execute("run_command", {"command": "sed -n '10,12p' conf.json; echo ===; head -3 conf.json | wc -l"}))
+            self.assertTrue(result["ok"])
+            self.assertIn("     1\tline 1", result["stdout"])
+            self.assertIn("    40\tline 40", result["stdout"])
+            self.assertEqual(result["stdout"].count("line 40"), 1)  # the piped head is untouched
+            self.assertEqual(len(result["notes"]), 1)
+            self.assertIn("sed -n '10,12p' conf.json", result["notes"][0])
+            self.assertIn("40 行", result["notes"][0])
+            # Big or missing files are left to the command as written.
+            (self.root / "huge.txt").write_text("y" * 40_000)
+            result = json.loads(self.runtime.execute("run_command", {"command": "head -c 5 huge.txt; tail -n 1 missing.txt"}))
+            self.assertNotIn("notes", result)
+            self.assertEqual(result["stdout"], "yyyyy")
+
 
 if __name__ == "__main__":
     unittest.main()

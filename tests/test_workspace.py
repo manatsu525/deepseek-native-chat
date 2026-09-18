@@ -9,6 +9,32 @@ from app import workspace
 from app.workspace import AgentSharedWorkspace, ConversationWorkspace, WorkspaceError
 
 
+class FileViewRewriteTests(unittest.TestCase):
+    def test_partial_views_become_whole_numbered_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "a.json").write_text("1\n2\n3\n")
+            (root / "big.md").write_text("x" * 40_000)
+            (root / "bin.dat").write_bytes(b"\x00\x01")
+            resolve = lambda raw: root / raw  # noqa: E731
+            command, notes = workspace.expand_file_views(
+                "sed -n '2,3p' a.json; echo ===; head -n 1 a.json && tail -1 a.json || tail a.json\nhead -5 big.md; sed -n 1,2p bin.dat; "
+                "cat a.json | head -2; grep -n x a.json | sed -n '1,2p'",
+                resolve,
+            )
+            self.assertEqual(
+                command,
+                "cat -n a.json; echo ===; cat -n a.json && cat -n a.json || cat -n a.json\nhead -5 big.md; sed -n 1,2p bin.dat; "
+                "cat a.json | head -2; grep -n x a.json | sed -n '1,2p'",
+            )
+            self.assertEqual(len(notes), 4)
+            self.assertIn("sed -n '2,3p' a.json", notes[0])
+            self.assertIn("3 行", notes[0])
+            unchanged, none = workspace.expand_file_views("ls -la; grep -rn foo . | head -20; sed -n '1,5p' missing.txt", resolve)
+            self.assertEqual(none, [])
+            self.assertEqual(unchanged, "ls -la; grep -rn foo . | head -20; sed -n '1,5p' missing.txt")
+
+
 class WorkspaceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()

@@ -6,6 +6,7 @@ import json
 import hashlib
 import os
 import re
+import shlex
 import shutil
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
@@ -240,6 +241,57 @@ def _closest_region_hint(content: str, old: str) -> str:
         return ""
     shown = [f"{number + 1}|{lines[number][:100]}" for number in range(best_start, min(len(lines), best_start + min(window, 8)))]
     return "最接近的当前内容：\n" + "\n".join(shown)
+
+
+# A partial file view written as a shell command: sed -n 'A,Bp' FILE, head -n N
+# FILE, tail FILE. Models trained on shell-heavy harnesses page through files
+# this way even when told to use read_file, and every extra slice is another
+# model round. Such a segment is replaced by the whole numbered file when the
+# file is small enough to show at once.
+FILE_VIEW_MAX_BYTES = 30_000
+_FILE_VIEW_RE = re.compile(
+    r"(?P<lead>^|;|&&|\|\||\n)(?P<space>\s*)"
+    r"(?P<view>sed\s+-n\s+['\"]?\d+\s*,\s*\$?\d*\s*p['\"]?"
+    r"|head(?:\s+-n\s*\d+|\s+-\d+)?"
+    r"|tail(?:\s+-n\s*[-+]?\d+|\s+-\d+)?)"
+    r"\s+(?P<file>[^\s;&|<>'\"`$()]+)"
+    r"(?P<trail>\s*)(?=$|;|&&|\|\||\n)",
+    re.MULTILINE,
+)
+
+
+def expand_file_views(command: str, resolve: Any, max_bytes: int = FILE_VIEW_MAX_BYTES) -> tuple[str, list[str]]:
+    """Rewrite partial file views in ``command`` to show the whole file.
+
+    ``resolve`` maps the path the model wrote to a Path (or None when it must
+    not be touched). Only a plain text file up to ``max_bytes`` is expanded;
+    anything piped or otherwise composed is left alone.
+    """
+    notes: list[str] = []
+
+    def replace(match: re.Match[str]) -> str:
+        raw = match.group("file")
+        try:
+            path = resolve(raw)
+        except Exception:
+            path = None
+        if path is None or not path.is_file() or path.is_symlink():
+            return match.group(0)
+        try:
+            size = path.stat().st_size
+            if size > max_bytes:
+                return match.group(0)
+            head = path.read_bytes()[:4096]
+        except OSError:
+            return match.group(0)
+        if b"\x00" in head:
+            return match.group(0)
+        line_count = sum(1 for _ in path.open("rb"))
+        original = f"{match.group('view')} {raw}"
+        notes.append(f"已把 `{original}` 改为输出整个文件 {raw}（{line_count} 行，{size} 字节）；这个文件不必再分段读取。")
+        return f"{match.group('lead')}{match.group('space')}cat -n {shlex.quote(raw)}{match.group('trail')}"
+
+    return _FILE_VIEW_RE.sub(replace, command), notes
 
 
 def numbered_window(content: str, start_line: Any = None, max_chars: int = MAX_READ_CHARS) -> dict[str, Any]:

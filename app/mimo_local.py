@@ -157,12 +157,17 @@ def _join_round_text(answer: str, text: str) -> str:
     return answer + text
 
 
+_DISCARD_REDIRECT_RE = re.compile(r"\d?&?>\s*/dev/null|2>&1|&>\s*/dev/null")
+
+
 def _read_only_call(name: str, arguments: dict[str, Any]) -> bool:
     """Whether a call can only look around; such calls are paused during a stall."""
     if name in READ_ONLY_TOOL_NAMES:
         return True
     if name in HOST_COMMAND_TOOLS:
-        return not _WRITING_COMMAND_RE.search(str(arguments.get("command") or ""))
+        # Silencing stderr is not writing anything.
+        command = _DISCARD_REDIRECT_RE.sub(" ", str(arguments.get("command") or ""))
+        return not _WRITING_COMMAND_RE.search(command)
     return False
 RUNTIME_NOTE_MARKER = "\n\n[Runtime note] "
 USER_CONTEXT_MARKER = "\n\n---\n[Context supplied by the application, not written by the user]\n"

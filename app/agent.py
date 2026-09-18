@@ -36,6 +36,7 @@ from .workspace import (
     delete_conversation_workspace,
     edit_list,
     edited_excerpt,
+    expand_file_views,
     numbered_window,
 )
 from .code_runner import _HtmlScripts
@@ -54,7 +55,10 @@ HOST_WRITE_MAX_BYTES = 32 * 1024 * 1024
 # app/context.py retires old results when the request grows.
 HOST_OUTPUT_MAX_CHARS = 40_000
 HOST_OUTPUT_READ_CHARS = 400_000
-HOST_LIST_MAX_ENTRIES = 4_000
+# A listing larger than this (one call on a cloned repository produced 300K
+# characters) collapses to the first level with per-directory counts.
+HOST_LIST_MAX_ENTRIES = 300
+HOST_LIST_SKIP_DIRS = {".git", "node_modules", ".venv", "__pycache__", ".mypy_cache", ".pytest_cache"}
 HOST_SEARCH_MAX_RESULTS = 500
 HOST_COMMAND_TIMEOUT = 900
 
@@ -272,11 +276,11 @@ class AgentRuntime:
         if root.is_file():
             return {"root": str(root), "entries": [{"path": str(root), "type": "file", "size": root.stat().st_size}]}
         entries: list[dict[str, Any]] = []
+        overflow = False
         for current, directories, files in os.walk(root, followlinks=False):
             current_path = Path(current)
             depth = len(current_path.relative_to(root).parts)
-            if depth >= max_depth:
-                directories[:] = []
+            directories[:] = [] if depth >= max_depth else [item for item in directories if item not in HOST_LIST_SKIP_DIRS]
             for directory in sorted(directories, key=str.casefold):
                 entries.append({"path": str(current_path / directory), "type": "directory"})
             for filename in sorted(files, key=str.casefold):
@@ -286,9 +290,43 @@ class AgentRuntime:
                 except OSError:
                     size = 0
                 entries.append({"path": str(path), "type": "file", "size": size})
-            if len(entries) >= HOST_LIST_MAX_ENTRIES:
+            if len(entries) > HOST_LIST_MAX_ENTRIES:
+                overflow = True
                 break
-        return {"root": str(root), "entries": entries[:HOST_LIST_MAX_ENTRIES], "truncated": len(entries) > HOST_LIST_MAX_ENTRIES}
+        if not overflow:
+            return {"root": str(root), "entries": entries, "truncated": False}
+        # Too much to show: one level, with what each directory holds.
+        summary: list[dict[str, Any]] = []
+        try:
+            children = sorted(root.iterdir(), key=lambda item: str(item.name).casefold())
+        except OSError:
+            children = []
+        for child in children:
+            if child.name in HOST_LIST_SKIP_DIRS:
+                continue
+            if child.is_dir() and not child.is_symlink():
+                files_below = 0
+                for _, sub_directories, sub_files in os.walk(child, followlinks=False):
+                    sub_directories[:] = [item for item in sub_directories if item not in HOST_LIST_SKIP_DIRS]
+                    files_below += len(sub_files)
+                    if files_below > 20_000:
+                        break
+                summary.append({"path": str(child), "type": "directory", "files_below": files_below})
+            else:
+                try:
+                    size = child.stat().st_size
+                except OSError:
+                    size = 0
+                summary.append({"path": str(child), "type": "file", "size": size})
+        return {
+            "root": str(root),
+            "entries": summary[:HOST_LIST_MAX_ENTRIES],
+            "truncated": True,
+            "note": (
+                f"该目录下的条目超过 {HOST_LIST_MAX_ENTRIES} 个，只列出第一层（目录附其下文件数）。"
+                "用 path 指定子目录、减小 max_depth，或用 search_files / grep -rl 定位文件。"
+            ),
+        }
 
     def _host_read_file(self, arguments: dict[str, Any]) -> dict[str, Any]:
         path = self._path(arguments.get("path"))
@@ -381,6 +419,9 @@ class AgentRuntime:
         if not cwd.is_dir():
             raise ValueError(f"工作目录不存在：{cwd}")
         timeout = max(1, min(3600, int(arguments.get("timeout_seconds", HOST_COMMAND_TIMEOUT) or HOST_COMMAND_TIMEOUT)))
+        command, view_notes = expand_file_views(
+            command, lambda raw: Path(raw).expanduser() if Path(raw).expanduser().is_absolute() else cwd / raw
+        )
         environment = os.environ.copy()
         supplied_env = arguments.get("env")
         if isinstance(supplied_env, dict):
@@ -426,7 +467,7 @@ class AgentRuntime:
                 if total > HOST_OUTPUT_READ_CHARS:
                     text = "[...]" + text
                 return bounded_output(text)
-            return {
+            result = {
                 "ok": process.returncode == 0 and not cancelled and not timed_out,
                 "exit_code": int(process.returncode),
                 "cwd": str(cwd),
@@ -434,6 +475,9 @@ class AgentRuntime:
                 "timeout": timed_out, "cancelled": cancelled,
                 "error": "任务已停止" if cancelled else "命令执行超时" if timed_out else "",
             }
+            if view_notes:
+                result["notes"] = view_notes
+            return result
 
     def _host_delete_path(self, arguments: dict[str, Any]) -> dict[str, Any]:
         path = self._path(arguments.get("path"))
