@@ -22,6 +22,17 @@ from .custom_request import apply_request_overrides, expand_advanced_request
 from .responses_state import ResponsesState
 from .agent import AGENT_SYSTEM_PROMPT, HOST_READ_MAX_CHARS, AgentRuntime
 from .file_knowledge import FileKnowledge
+from .context import (
+    CONTEXT_CHECKPOINT_MARKER,
+    DEFAULT_CONTEXT_BUDGET_CHARS,
+    checkpoint_payload,
+    checkpoint_present,
+    compact_request,
+    normalize_budget,
+    serialized_chars as _serialized_chars,
+    with_message_block as _with_message_block,
+)
+from .plan import PLAN_PROMPT, UPDATE_PLAN_TOOL, TaskPlan
 from .keyless_web import (
     KEYLESS_CUSTOM_SYSTEM_PROMPT,
     KEYLESS_FETCH_WEBPAGE_TOOL,
@@ -91,7 +102,7 @@ class ToolQuotaExceeded(RuntimeError):
 
 
 FINAL_ANSWER_ATTEMPTS = 2
-MAX_AGENT_TOOL_ROUNDS = 12
+MAX_AGENT_TOOL_ROUNDS = 40
 AGENT_HOST_TOOL_ROUNDS = 96
 PARALLEL_MAX_SEARCH_EXCERPT_CHARS = 1200
 WORKSPACE_ARGUMENT_COMPACT_THRESHOLD = 4096
@@ -100,16 +111,6 @@ WORKSPACE_ARGUMENT_COMPACT_THRESHOLD = 4096
 # large writes are still compacted, and the high-water checkpoint remains a
 # second safety valve for oversized agent histories.
 FRESH_WRITE_CONTEXT_THRESHOLD = 60_000
-# A single large file read is up to ~100K characters, so the high-water mark must
-# leave room for a full read plus web evidence; otherwise every round
-# checkpoints and the model loses what it just read.
-AGENT_CONTEXT_COMPACT_THRESHOLD = 160_000
-# Read snapshots (workspace and host) share this budget. It must exceed one
-# maximal read plus JSON overhead or a full read can never survive a checkpoint.
-CHECKPOINT_READ_EVIDENCE_CHARS = 110_000
-HOST_OPERATION_EVIDENCE_CHARS = 60_000
-# Besides the newest exchange, keep recent complete exchanges up to this size.
-CHECKPOINT_RECENT_EXCHANGE_CHARS = 40_000
 WORKSPACE_MUTATION_TOOLS = {"write_file", "edit_file", "apply_patch", "apply_patch_batch", "replace_text", "delete_file"}
 WORKSPACE_EDIT_TOOLS = {"edit_file", "apply_patch", "apply_patch_batch", "replace_text"}
 HOST_READ_TOOLS = {"host_read_file", "frontend_read_page"}
@@ -128,9 +129,6 @@ WEB_STALL_REFUSE_CALLS = 8
 # validation: nag in every result from here on, every few calls.
 MUTATION_STALL_CALLS = 10
 MUTATION_STALL_EVERY = 4
-PROGRESS_NOTE_COUNT = 12
-PROGRESS_NOTE_CHARS = 400
-CONTEXT_CHECKPOINT_MARKER = "\n\nCONTEXT CHECKPOINT:\n"
 RUNTIME_NOTE_MARKER = "\n\n[Runtime note] "
 USER_CONTEXT_MARKER = "\n\n---\n[Context supplied by the application, not written by the user]\n"
 FINAL_ANSWER_PROMPT = (
@@ -181,22 +179,8 @@ def _select_round_tool_calls(
     calls: list[dict[str, Any]],
     bindings: dict[str, tuple[str, str]],
 ) -> list[dict[str, Any]]:
-    """Keep every workspace call while limiting web calls to one per model round."""
-    selected: list[dict[str, Any]] = []
-    web_call_seen = False
-    for call in calls:
-        function = call.get("function") or {}
-        name = str(function.get("name") or "")
-        workspace_name, _ = bindings.get(name, (name, ""))
-        if workspace_name in WORKSPACE_TOOL_NAMES:
-            selected.append(call)
-            continue
-        if name in {"web_search", "fetch_webpage"}:
-            if web_call_seen:
-                continue
-            web_call_seen = True
-        selected.append(call)
-    return selected
+    """Every call the model emitted runs, serially, in the order emitted."""
+    return list(calls)
 
 
 def _round_tool_names(tools: list[dict[str, Any]]) -> set[str]:
@@ -320,10 +304,6 @@ def _looks_like_text_tool_call(value: str) -> bool:
     return "fetch_webpage" in head or "web_search" in head
 
 
-def _serialized_chars(messages: list[dict[str, Any]]) -> int:
-    return sum(len(json.dumps(message, ensure_ascii=False, separators=(",", ":"))) for message in messages)
-
-
 def _compact_workspace_call_arguments(
     function: dict[str, Any],
     *,
@@ -359,19 +339,6 @@ def _compact_workspace_call_arguments(
         compact["edits"] = [{"old_text": "[omitted]", "new_text": "[omitted]"}]
     function["arguments"] = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
     return True
-
-
-def _remember_host_evidence(evidence: list[dict[str, Any]], name: str, arguments: dict[str, Any], result: str, status: str) -> None:
-    """Keep bounded, chronological evidence, not claims about current disk state."""
-    item = {"name": name, "arguments": dict(arguments), "result": result, "status": status}
-    if len(json.dumps(item, ensure_ascii=False)) > HOST_OPERATION_EVIDENCE_CHARS:
-        item = {"name": name, "path": str(arguments.get("path") or arguments.get("cwd") or ""),
-                "status": status, "evidence_omitted": (
-                    "The operation completed with the recorded status, but its full record exceeded checkpoint capacity. "
-                    "Do not repeat it only to recover this record; inspect just the specific range you still need.")}
-    evidence.append(item)
-    while len(evidence) > 30 or len(json.dumps(evidence, ensure_ascii=False)) > HOST_OPERATION_EVIDENCE_CHARS:
-        evidence.pop(0)
 
 
 _QUERY_TOKEN_RE = re.compile(r"[a-z0-9]+|[一-鿿]+")
@@ -447,12 +414,6 @@ def _host_revision(path: str) -> str | None:
     return str(snapshot["revision"]) if snapshot else None
 
 
-def _read_record(data: dict[str, Any]) -> str:
-    """Operation-log entry for a read; the content itself lives in file_snapshots."""
-    fields = ("path", "revision", "line_count", "from_line", "through_line", "truncated", "unchanged")
-    return json.dumps({key: data[key] for key in fields if key in data}, ensure_ascii=False)
-
-
 def _tool_result_failure(result: str) -> str:
     try:
         data = json.loads(result)
@@ -461,162 +422,6 @@ def _tool_result_failure(result: str) -> str:
     if isinstance(data, dict) and (data.get("ok") is False or data.get("timeout") or data.get("cancelled")):
         return str(data.get("error") or data.get("stderr") or data.get("errors") or "工具执行失败")[:1000]
     return ""
-
-
-def _maybe_compact_agent_context(
-    conversation: list[dict[str, Any]],
-    *,
-    base_message_count: int,
-    workspace: ConversationWorkspace | None,
-    sources: dict[str, dict[str, str]],
-    tool_trace: list[dict[str, Any]],
-    knowledge: FileKnowledge | None = None,
-    refresh_existing: bool = False,
-    host_evidence: list[dict[str, Any]] | None = None,
-) -> bool:
-    """Checkpoint oversized internal tool history without another model call.
-
-    This deliberately triggers only at a high-water mark.  Between checkpoints
-    history is append-only for prompt-cache hits.  At a checkpoint the durable
-    workspace and compact source metadata replace verbose stale tool traffic,
-    while the newest complete assistant/tool exchanges are kept verbatim.
-    """
-    internal = conversation[base_message_count:]
-    existing_checkpoint = checkpoint_present(conversation[:base_message_count])
-    over_high_water = _serialized_chars(internal) > AGENT_CONTEXT_COMPACT_THRESHOLD
-    if not over_high_water and not (refresh_existing and existing_checkpoint):
-        return False
-    keep = internal
-    if over_high_water:
-        # One assistant message can own many tool results. Keep entire
-        # exchanges, including provider-specific Responses reasoning items:
-        # always the newest one, plus earlier ones while they stay small.
-        starts = [index for index, message in enumerate(internal) if message.get("role") == "assistant"]
-        if starts:
-            keep_from = starts[-1]
-            for start in reversed(starts[:-1]):
-                if _serialized_chars(internal[start:]) > CHECKPOINT_RECENT_EXCHANGE_CHARS:
-                    break
-                keep_from = start
-            keep = internal[keep_from:]
-    # What the model said it was doing in the rounds being dropped. Without
-    # this, every checkpoint erased its own plan and it re-derived it from
-    # scratch, round after round.
-    dropped = internal[: len(internal) - len(keep)]
-    progress_notes = [
-        " ".join(str(message.get("content") or "").split())[:PROGRESS_NOTE_CHARS]
-        for message in dropped
-        if message.get("role") == "assistant" and str(message.get("content") or "").strip()
-    ][-PROGRESS_NOTE_COUNT:]
-    files = workspace.list_files() if workspace is not None else []
-    source_state = [
-        {
-            "url": item.get("url", ""),
-            "title": item.get("title", ""),
-            "summary": str(item.get("summary") or "")[:240],
-        }
-        for item in list(sources.values())[:30]
-    ]
-    operations = [
-        {
-            "name": item.get("name", ""),
-            "path": item.get("path", ""),
-            "url": item.get("url", ""),
-            "status": item.get("status", ""),
-            "error": str(item.get("error") or "")[:240],
-        }
-        for item in tool_trace[-30:]
-    ]
-    # The tracker drops whatever does not fit, so a later read of it returns
-    # real content instead of an "unchanged" pointer to text that is gone.
-    file_snapshots = knowledge.snapshots(CHECKPOINT_READ_EVIDENCE_CHARS) if knowledge is not None else []
-    checkpoint = {
-        "context_checkpoint": True,
-        "instruction": (
-            "Verbose older tool traffic was compacted. file_snapshots below contain the exact current content of "
-            "those files (numbered lines, including your own edits); use them instead of reading the files again. "
-            "workspace_files is metadata only. Do not repeat completed searches or operations."
-        ),
-        "workspace_files": files,
-        "file_snapshots": file_snapshots,
-        "sources": source_state,
-        "recent_operations": operations,
-    }
-    if existing_notes := checkpoint_payload(conversation[:base_message_count]).get("progress_notes"):
-        progress_notes = (list(existing_notes) + progress_notes)[-PROGRESS_NOTE_COUNT:]
-    if progress_notes:
-        checkpoint["progress_notes"] = progress_notes
-        checkpoint["instruction"] += (
-            " progress_notes are your own earlier statements in this task, oldest first: the plan and decisions "
-            "already made. Continue from them instead of re-deriving the plan or repeating completed steps."
-        )
-    if host_evidence is not None:
-        checkpoint["host_operation_evidence"] = host_evidence
-        checkpoint["instruction"] += (
-            " host_operation_evidence preserves historical arguments and results in execution order, including edits. "
-            "Use the recorded changes to continue completed work instead of re-inspecting finished steps."
-        )
-    base = [dict(message) for message in conversation[:base_message_count]]
-    checkpoint_text = json.dumps(checkpoint, ensure_ascii=False, separators=(",", ":"))
-    if base and base[-1].get("role") == "user":
-        # Attach to the current request rather than the system prompt: the
-        # system prompt and earlier history stay byte-identical, so they remain
-        # a cacheable prefix. Responses/Messages would otherwise hoist a
-        # system checkpoint into the leading instructions.
-        base[-1] = _with_message_block(base[-1], CONTEXT_CHECKPOINT_MARKER, checkpoint_text)
-    elif base and base[0].get("role") == "system":
-        original_system = str(base[0].get("content") or "").split(CONTEXT_CHECKPOINT_MARKER, 1)[0]
-        base[0]["content"] = f"{original_system}{CONTEXT_CHECKPOINT_MARKER}{checkpoint_text}"
-    else:
-        base.insert(0, {"role": "system", "content": f"CONTEXT CHECKPOINT:\n{checkpoint_text}"})
-    conversation[:] = [*base, *keep]
-    return True
-
-
-def _with_message_block(message: dict[str, Any], marker: str, text: str) -> dict[str, Any]:
-    """Return a copy of ``message`` with its ``marker`` block replaced by ``text``."""
-    result = dict(message)
-    content = result.get("content")
-    if isinstance(content, list):
-        label = marker.lstrip("\n")
-        parts = [
-            part for part in content
-            if not (isinstance(part, dict) and part.get("type") == "text" and str(part.get("text") or "").startswith(label))
-        ]
-        if text:
-            parts.append({"type": "text", "text": f"{label}{text}"})
-        result["content"] = parts
-    else:
-        original = str(content or "").split(marker, 1)[0]
-        result["content"] = f"{original}{marker}{text}" if text else original
-    return result
-
-
-def checkpoint_present(messages: list[dict[str, Any]]) -> bool:
-    label = CONTEXT_CHECKPOINT_MARKER.lstrip("\n")
-    for message in messages:
-        content = message.get("content")
-        if isinstance(content, list):
-            if any(isinstance(part, dict) and str(part.get("text") or "").startswith(label) for part in content):
-                return True
-        elif CONTEXT_CHECKPOINT_MARKER in str(content or "") or str(content or "").startswith(label):
-            return True
-    return False
-
-
-def checkpoint_payload(messages: list[dict[str, Any]]) -> dict[str, Any]:
-    """Decode the checkpoint JSON from wherever it was attached (tests/diagnostics)."""
-    label = CONTEXT_CHECKPOINT_MARKER.lstrip("\n")
-    for message in messages:
-        content = message.get("content")
-        texts = (
-            [str(part.get("text") or "") for part in content if isinstance(part, dict)]
-            if isinstance(content, list) else [str(content or "")]
-        )
-        for text in texts:
-            if label in text:
-                return json.loads(text.split(label, 1)[1])
-    return {}
 
 
 def _append_runtime_note(conversation: list[dict[str, Any]], note: str) -> bool:
@@ -1077,7 +882,7 @@ async def stream_response(
     else:
         base_prompt = KEYLESS_CUSTOM_SYSTEM_PROMPT
     if agent_mode:
-        base_prompt = f"{base_prompt}\n\n{AGENT_SYSTEM_PROMPT}"
+        base_prompt = f"{base_prompt}\n\n{AGENT_SYSTEM_PROMPT}\n\n{PLAN_PROMPT}"
     system_prompt = _apply_model_system_prompt(
         _dated_system_prompt(base_prompt, user_timezone),
         model,
@@ -1090,7 +895,7 @@ async def stream_response(
             if workspace_access == "edit"
             else WORKSPACE_SYSTEM_PROMPT
         )
-        system_prompt = f"{system_prompt}\n\n{workspace_prompt}"
+        system_prompt = f"{system_prompt}\n\n{workspace_prompt}\n\n{PLAN_PROMPT}"
     if system_addendum.strip():
         system_prompt = f"{system_prompt}\n\n{system_addendum.strip()}"
     # URLs the user actually wrote gate the reader; application context must not.
@@ -1132,7 +937,8 @@ async def stream_response(
     reader_enabled = bool(known_urls)
     final_answer_attempts = 0
     force_final_answer = False
-    host_evidence: list[dict[str, Any]] = []
+    plan = TaskPlan()
+    context_budget = normalize_budget(config.get("context_budget_chars", DEFAULT_CONTEXT_BUDGET_CHARS))
     # Host files can also change through shell commands, so their snapshots
     # are revalidated against disk before a checkpoint reuses them.
     knowledge = FileKnowledge(validate=_host_revision if agent_mode else None)
@@ -1159,6 +965,7 @@ async def stream_response(
     keyless_context = KeylessWebProvider(web_tool_backend) if web_enabled and keyless_mode else _AsyncNullContext()
     workspace_tools_expected = workspace is not None and workspace_access != "none"
     extra_tools_expected = bool(extra_tools and extra_tool_handler is not None)
+    plan_tool_expected = workspace_tools_expected or extra_tools_expected
     tools_expected = web_enabled or workspace_tools_expected or extra_tools_expected
     allowed_workspace_tools = (
         READ_ONLY_WORKSPACE_TOOL_NAMES
@@ -1235,6 +1042,8 @@ async def stream_response(
                         )
                 if extra_tools_expected and tool_rounds_used < role_tool_round_limit:
                     round_tools.extend(extra_tools)
+                if plan_tool_expected and tool_rounds_used < role_tool_round_limit:
+                    round_tools.append(UPDATE_PLAN_TOOL)
             final_answer_only = force_final_answer or (tools_expected and not round_tools)
             mimo_model = is_mimo_model(model)
             request_messages = conversation
@@ -1341,6 +1150,7 @@ async def stream_response(
                 "tools_hash": _short_hash(payload.get("tools") or []),
                 "messages": len(request_messages),
                 "chained": bool(payload.get("previous_response_id")),
+                "request_chars": _serialized_chars(request_messages),
                 "final_only": bool(final_answer_only),
             }
             if runtime_note_kind:
@@ -1722,7 +1532,6 @@ async def stream_response(
             conversation.append(assistant_message)
             tool_results_start = len(conversation)
             tool_rounds_used += 1
-            generation_before_calls = workspace_generation
             for call in calls:
                 call_id = call["id"]
                 function = call.get("function") or {}
@@ -1731,10 +1540,11 @@ async def stream_response(
                 is_search = name == "web_search"
                 is_workspace = workspace_name in WORKSPACE_TOOL_NAMES
                 is_extra = name in extra_tool_names or HOST_LEGACY_TOOL_ALIASES.get(name) in extra_tool_names
+                is_plan = name == "update_plan" and plan_tool_expected
                 step: dict[str, Any] = {
                     "id": call_id,
                     "status": "running",
-                    "action": "workspace" if is_workspace else "search" if is_search else "agent" if is_extra else "open_page",
+                    "action": "workspace" if is_workspace else "search" if is_search else "agent" if is_extra else "plan" if is_plan else "open_page",
                     "query": "",
                     "url": "",
                     "path": "",
@@ -1743,7 +1553,7 @@ async def stream_response(
                 }
                 if is_search:
                     search_steps.append(step)
-                elif not is_workspace and not is_extra:
+                elif not is_workspace and not is_extra and not is_plan:
                     fetch_steps.append(step)
                 steps.append(step)
                 await update(
@@ -2176,11 +1986,8 @@ async def stream_response(
                         failure = _tool_result_failure(result_text)
                         step["status"] = "failed" if failure else "completed"
                         step["error"] = failure
-                        evidence_text = result_text
                         if name in HOST_READ_TOOLS and not failure:
                             read_result = _json_object(result_text)
-                            if read_result:
-                                evidence_text = _read_record(read_result)
                             replacement = knowledge.record_read(read_result)
                             if replacement is not None:
                                 result_text = replacement
@@ -2196,7 +2003,9 @@ async def stream_response(
                                     visible=True,
                                     created=name in HOST_WRITE_TOOLS,
                                 )
-                        _remember_host_evidence(host_evidence, name, arguments, evidence_text, step["status"])
+                    elif is_plan:
+                        result_text = plan.apply(arguments)
+                        step["status"] = "completed"
                     else:
                         raise ValueError(f"不支持的工具：{name or '未命名工具'}")
                 except asyncio.CancelledError:
@@ -2220,6 +2029,8 @@ async def stream_response(
                         result_text = f"工作区操作失败：{str(exc)[:1000]}。请先读取当前文件并修正参数后重试。"
                     elif is_extra:
                         result_text = f"Agent 工具操作失败：{str(exc)[:1000]}。请根据错误结果修正参数后重试。"
+                    elif is_plan:
+                        result_text = f"update_plan 参数无效：{str(exc)[:500]}"
                     else:
                         result_text = f"读取网页失败：{str(exc)[:1000]}。请根据已有搜索结果继续回答，必要时选择其他来源。"
                 if (is_search or name == "fetch_webpage") and WEB_STALL_WARN_CALLS <= web_calls_since_progress <= WEB_STALL_REFUSE_CALLS:
@@ -2262,7 +2073,7 @@ async def stream_response(
                     "name": workspace_name if is_workspace else name,
                     "url": target_url,
                     "path": step.get("path", ""),
-                    "backend": "workspace" if is_workspace else web_tool_backend,
+                    "backend": "workspace" if is_workspace else "plan" if is_plan else web_tool_backend,
                     "status": step["status"],
                     "error": step["error"],
                 }
@@ -2295,20 +2106,32 @@ async def stream_response(
                 )
             if responses_protocol:
                 response_chain.pending = _responses_input(conversation[tool_results_start:])
-            compacted = _maybe_compact_agent_context(
+            compacted = compact_request(
                 conversation,
                 base_message_count=base_message_count,
-                workspace=workspace,
-                sources=sources,
-                tool_trace=tool_trace,
+                budget=context_budget,
                 knowledge=knowledge,
-                refresh_existing=workspace_generation != generation_before_calls,
-                host_evidence=host_evidence if agent_mode else None,
+                workspace_files=workspace.list_files if workspace is not None else None,
+                sources=sources,
+                plan=plan.export(),
             )
-            if compacted and round_stats:
-                round_stats[-1]["compacted_after"] = True
-            if responses_protocol and compacted:
-                response_chain.reset()
+            if compacted:
+                # Content that left the request must not be "already seen".
+                for stub_name, stub_arguments in compacted["stubbed"]:
+                    if stub_name == "fetch_webpage":
+                        try:
+                            attempted_urls.discard(_canonical_url(_safe_fetch_url(stub_arguments.get("url"))))
+                        except (TypeError, ValueError):
+                            pass
+                if round_stats:
+                    round_stats[-1]["compacted_after"] = True
+                    round_stats[-1]["compaction"] = {
+                        "stubbed": len(compacted["stubbed"]),
+                        "dropped_rounds": compacted["dropped_rounds"],
+                        "request_chars": compacted["request_chars"],
+                    }
+                if responses_protocol:
+                    response_chain.reset()
     searches = steps
     return {
         "answer": answer,
@@ -2321,6 +2144,7 @@ async def stream_response(
         "round_stats": round_stats,
         "web_evidence": web_evidence,
         "incomplete": tool_budget_exhausted,
+        "plan": plan.export(),
         "tool_round_limit": role_tool_round_limit,
         "agent_mode": bool(agent_mode),
         "response": {"tool_trace": tool_trace, "agent_mode": bool(agent_mode)},

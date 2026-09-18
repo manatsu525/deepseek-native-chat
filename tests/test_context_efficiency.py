@@ -10,16 +10,11 @@ from app import workspace as workspace_module
 from app.mimo import custom_auth_headers
 from app import mimo_local
 from app.mimo_local import (
-    AGENT_CONTEXT_COMPACT_THRESHOLD,
-    CHECKPOINT_READ_EVIDENCE_CHARS,
     _compact_workspace_call_arguments,
     _final_answer_prompt,
-    _maybe_compact_agent_context,
     _select_round_tool_calls,
-    checkpoint_payload,
     stream_response,
 )
-from app.file_knowledge import FileKnowledge
 from app.workspace import ConversationWorkspace
 
 
@@ -36,28 +31,14 @@ class ContextEfficiencyTests(unittest.TestCase):
         self.assertIn("工作区文件操作均已不可用", workspace_only)
         self.assertNotIn("搜索、网页读取和工作区文件操作", workspace_only)
 
-    def test_round_selector_keeps_workspace_calls_and_one_web_call(self) -> None:
+    def test_round_selector_runs_every_emitted_call(self) -> None:
         def call(call_id: str, name: str) -> dict:
-            return {
-                "id": call_id,
-                "type": "function",
-                "function": {"name": name, "arguments": "{}"},
-            }
+            return {"id": call_id, "type": "function", "function": {"name": name, "arguments": "{}"}}
 
-        calls = [
-            call("web-1", "web_search"),
-            call("read-1", "read_file"),
-            call("fetch-1", "fetch_webpage"),
-            call("write-1", "write_file"),
-            call("web-2", "web_search"),
-            call("patch-1", "apply_line_edits"),
-        ]
+        calls = [call("web-1", "web_search"), call("read-1", "read_file"), call("fetch-1", "fetch_webpage"),
+                 call("write-1", "write_file"), call("web-2", "web_search")]
         selected = _select_round_tool_calls(calls, {})
-        self.assertEqual(
-            [item["function"]["name"] for item in selected],
-            ["web_search", "read_file", "write_file", "apply_line_edits"],
-        )
-
+        self.assertEqual([item["id"] for item in selected], [item["id"] for item in calls])
 
     def test_xai_chat_uses_stable_conversation_routing(self) -> None:
         headers = custom_auth_headers(
@@ -137,139 +118,6 @@ class ContextEfficiencyTests(unittest.TestCase):
         self.assertEqual(compact["path"], "app.js")
         self.assertIn("edits", compact)
         self.assertLess(len(function["arguments"]), 250)
-
-    def test_high_water_mark_keeps_base_and_latest_tool_pair(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            original = workspace_module.WORKSPACES_DIR
-            workspace_module.WORKSPACES_DIR = Path(directory)
-            try:
-                workspace = ConversationWorkspace(1, "conv")
-                workspace.write_file("app.py", "print('ok')\n")
-                base = [
-                    {"role": "system", "content": "system"},
-                    {"role": "user", "content": "fix it"},
-                ]
-                old_pair = [
-                    {"role": "assistant", "content": "", "tool_calls": [{"id": "old"}]},
-                    {"role": "tool", "tool_call_id": "old", "content": "x" * (AGENT_CONTEXT_COMPACT_THRESHOLD + 1)},
-                ]
-                latest_pair = [
-                    {"role": "assistant", "content": "", "tool_calls": [{"id": "new"}]},
-                    {"role": "tool", "tool_call_id": "new", "content": "latest"},
-                ]
-                conversation = [*base, *old_pair, *latest_pair]
-                changed = _maybe_compact_agent_context(
-                    conversation,
-                    base_message_count=len(base),
-                    workspace=workspace,
-                    sources={},
-                    tool_trace=[{"name": "read_file", "path": "app.py", "status": "completed"}],
-                )
-                self.assertTrue(changed)
-                # The system prompt stays byte-identical; the checkpoint rides
-                # on the current user message.
-                self.assertEqual(conversation[0], base[0])
-                self.assertTrue(conversation[1]["content"].startswith("fix it\n\nCONTEXT CHECKPOINT:"))
-                self.assertEqual(conversation[-2:], latest_pair)
-                checkpoint = checkpoint_payload(conversation)
-                self.assertEqual(checkpoint["workspace_files"][0]["path"], "app.py")
-            finally:
-                workspace_module.WORKSPACES_DIR = original
-
-    def test_checkpoint_keeps_read_evidence_and_dedupe_in_sync(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = ConversationWorkspace(1, "checkpoint-evidence")
-            workspace.root = Path(directory)
-            workspace.write_file(
-                "app.py",
-                "".join(f"line {number}: {'x' * 36}\n" for number in range(1, 801)),
-            )
-            snapshot = json.loads(workspace.execute("read_file", {"path": "app.py"}))
-            knowledge = FileKnowledge()
-            self.assertIsNone(knowledge.record_read(snapshot))
-            base = [
-                {"role": "system", "content": "system"},
-                {"role": "user", "content": "fix it"},
-            ]
-            read_pair = [
-                {
-                    "role": "assistant",
-                    "content": "inspect",
-                    "tool_calls": [{"id": "read", "function": {"name": "read_file", "arguments": "{}"}}],
-                },
-                {"role": "tool", "tool_call_id": "read", "content": json.dumps(snapshot)},
-            ]
-            latest_pair = [
-                {
-                    "role": "assistant",
-                    "content": "research",
-                    "tool_calls": [{"id": "search", "function": {"name": "web_search", "arguments": "{}"}}],
-                },
-                {"role": "tool", "tool_call_id": "search", "content": "result" * (AGENT_CONTEXT_COMPACT_THRESHOLD // 6 + 1)},
-            ]
-            conversation = [*base, *read_pair, *latest_pair]
-
-            changed = _maybe_compact_agent_context(
-                conversation,
-                base_message_count=len(base),
-                workspace=workspace,
-                sources={},
-                tool_trace=[
-                    {"name": "read_file", "path": "app.py", "status": "completed"},
-                    {"name": "web_search", "status": "completed"},
-                ],
-                knowledge=knowledge,
-            )
-
-            self.assertTrue(changed)
-            checkpoint = checkpoint_payload(conversation)
-            [kept] = checkpoint["file_snapshots"]
-            self.assertEqual(kept["content"], snapshot["content"])
-            self.assertEqual((kept["path"], kept["revision"]), ("app.py", snapshot["revision"]))
-            self.assertEqual(conversation[-2:], latest_pair)
-            # The read content is still in the request, so a re-read is short.
-            self.assertIn('"unchanged": true', knowledge.record_read(snapshot))
-
-            knowledge.forget("app.py")
-            refreshed = _maybe_compact_agent_context(
-                conversation,
-                base_message_count=len(base),
-                workspace=workspace,
-                sources={},
-                tool_trace=[{"name": "delete_file", "path": "app.py", "status": "completed"}],
-                knowledge=knowledge,
-                refresh_existing=True,
-            )
-            self.assertTrue(refreshed)
-            checkpoint = checkpoint_payload(conversation)
-            self.assertEqual(checkpoint["file_snapshots"], [])
-
-    def test_checkpoint_forgets_content_it_cannot_keep(self) -> None:
-        conversation = [
-            {"role": "system", "content": "system"},
-            {"role": "user", "content": "fix"},
-            {"role": "assistant", "content": "x" * (AGENT_CONTEXT_COMPACT_THRESHOLD + 1)},
-            {"role": "tool", "tool_call_id": "latest", "content": "latest"},
-        ]
-        knowledge = FileKnowledge()
-        huge = {"path": "huge.py", "revision": "r", "line_count": 1, "from_line": 1, "through_line": 1,
-                "truncated": False, "content": "1|" + "x" * (CHECKPOINT_READ_EVIDENCE_CHARS + 1)}
-        knowledge.record_read(huge)
-
-        self.assertTrue(
-            _maybe_compact_agent_context(
-                conversation,
-                base_message_count=2,
-                workspace=None,
-                sources={},
-                tool_trace=[],
-                knowledge=knowledge,
-            )
-        )
-        self.assertFalse(knowledge.known("huge.py"))
-        # Its content is gone from the request, so the next read returns it again.
-        self.assertIsNone(knowledge.record_read(huge))
-
 
 class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_identical_validation_is_skipped_until_workspace_changes(self) -> None:

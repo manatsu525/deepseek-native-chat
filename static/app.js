@@ -959,7 +959,7 @@ function checkedCustomModels(){return $$('#customModelList input[type="checkbox"
 function providerFormData(){const custom=isCustomProviderType(providerType());const manual=custom?manualModelList():[];const selected=custom?[...new Set([...checkedCustomModels(),...manual])]:[$('#providerModel').value||'deepseek-v4-flash'];return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:selected[0]||(custom?'':'deepseek-v4-flash'),selected_models:selected,manual_models:manual}}
 
 function customSettings(provider,model=selectedModel()){
-  const defaults={thinking:'enabled',reasoning_effort:'high',reasoning_effort_enabled:true,lowest_price_aggregators:[],max_completion_tokens:65536,temperature:1,top_p:.95,web_tool_backend:'parallel',request_overrides:{},advanced_enabled:false,advanced_request:{}};
+  const defaults={thinking:'enabled',reasoning_effort:'high',reasoning_effort_enabled:true,lowest_price_aggregators:[],max_completion_tokens:65536,context_budget_chars:240000,temperature:1,top_p:.95,web_tool_backend:'parallel',request_overrides:{},advanced_enabled:false,advanced_request:{}};
   const byModel=provider&&provider.model_settings;
   const saved=byModel&&typeof byModel==='object'&&byModel[model]&&typeof byModel[model]==='object'
     ?byModel[model]
@@ -968,7 +968,7 @@ function customSettings(provider,model=selectedModel()){
 }
 const customEditor={draft:null,preview:null,previewSignature:null,requestId:0,timer:null,providerId:null,model:''};
 function customFormValues(){
-  return {model:customEditor.model,thinking:$('#customThinking').value,reasoning_effort:$('#customReasoningEffort').value,reasoning_effort_enabled:$('#customReasoningEffortEnabled').checked,lowest_price_aggregators:[$('#customLowestPriceOpenRouter').checked?'openrouter':'',$('#customLowestPriceVercel').checked?'vercel':''].filter(Boolean),max_completion_tokens:Number($('#customMaxCompletion').value),temperature:Number($('#customTemperature').value),top_p:Number($('#customTopP').value),web_tool_backend:$('#customWebToolBackend').value,request_overrides:{},advanced_enabled:false,advanced_request:{}};
+  return {model:customEditor.model,thinking:$('#customThinking').value,reasoning_effort:$('#customReasoningEffort').value,reasoning_effort_enabled:$('#customReasoningEffortEnabled').checked,lowest_price_aggregators:[$('#customLowestPriceOpenRouter').checked?'openrouter':'',$('#customLowestPriceVercel').checked?'vercel':''].filter(Boolean),max_completion_tokens:Number($('#customMaxCompletion').value),context_budget_chars:Number($('#customContextBudget').value)||240000,temperature:Number($('#customTemperature').value),top_p:Number($('#customTopP').value),web_tool_backend:$('#customWebToolBackend').value,request_overrides:{},advanced_enabled:false,advanced_request:{}};
 }
 function syncAdvancedEditor(){
   const enabled=$('#customAdvancedEnabled').checked;
@@ -1024,7 +1024,7 @@ async function fillCustomSettings(){
   clearTimeout(customEditor.timer);++customEditor.requestId;
   customEditor.providerId=selectedProvider().id;customEditor.model=model;customEditor.preview=null;customEditor.previewSignature=null;
   customEditor.draft=config.advanced_enabled?JSON.stringify(config.advanced_request||{},null,2):null;
-  $('#customThinking').value=config.thinking;$('#customReasoningEffort').value=config.reasoning_effort||'high';$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customLowestPriceOpenRouter').checked=aggregators.has('openrouter');$('#customLowestPriceVercel').checked=aggregators.has('vercel');$('#customMaxCompletion').value=config.max_completion_tokens;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
+  $('#customThinking').value=config.thinking;$('#customReasoningEffort').value=config.reasoning_effort||'high';$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customLowestPriceOpenRouter').checked=aggregators.has('openrouter');$('#customLowestPriceVercel').checked=aggregators.has('vercel');$('#customMaxCompletion').value=config.max_completion_tokens;$('#customContextBudget').value=config.context_budget_chars||240000;$('#customTemperature').value=config.temperature;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
   $('#customAdvancedEnabled').checked=!!config.advanced_enabled;$('#customAdvancedEnabled').disabled=false;
   syncCustomThinkingFields();syncCustomToolFields();
   syncAdvancedEditor();

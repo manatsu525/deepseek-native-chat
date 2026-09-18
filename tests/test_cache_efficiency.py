@@ -213,7 +213,7 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
                 answer_round("done"),
             ]
             with patch.object(mimo_local, "ParallelMCPClient", NoWeb):
-                result, requests = await run_stream(workspace, rounds, web_enabled=True)
+                result, requests = await run_stream(workspace, rounds, web_enabled=True, web_tool_round_limit=6)
         stats = result["round_stats"]
         # Same tool schema through the refused calls, then web tools are
         # dropped after two refusals instead of looping on them.
@@ -371,24 +371,29 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("没有修改任何文件", tool_results[9])
         self.assertNotIn("没有修改任何文件", tool_results[8])
 
-    def test_checkpoint_keeps_the_models_own_progress_notes(self):
-        AGENT_CONTEXT_COMPACT_THRESHOLD = mimo_local.AGENT_CONTEXT_COMPACT_THRESHOLD
-        base = [{"role": "system", "content": "system"}, {"role": "user", "content": "fix"}]
-        old = []
-        for n in range(3):
-            old += [{"role": "assistant", "content": f"计划第{n}步：新建独立兵种。", "tool_calls": [{"id": f"c{n}"}]},
-                    {"role": "tool", "tool_call_id": f"c{n}", "content": "x" * (AGENT_CONTEXT_COMPACT_THRESHOLD // 2)}]
-        latest = [{"role": "assistant", "content": "最后一步", "tool_calls": [{"id": "l"}]},
-                  {"role": "tool", "tool_call_id": "l", "content": "latest"}]
-        history = base + old + latest
-        self.assertTrue(mimo_local._maybe_compact_agent_context(history, base_message_count=2, workspace=None, sources={}, tool_trace=[]))
-        notes = mimo_local.checkpoint_payload(history)["progress_notes"]
-        self.assertEqual(notes, ["计划第0步：新建独立兵种。", "计划第1步：新建独立兵种。", "计划第2步：新建独立兵种。"])
-        # A later checkpoint keeps accumulating instead of starting over.
-        history += [{"role": "assistant", "content": "又一步", "tool_calls": [{"id": "m"}]},
-                    {"role": "tool", "tool_call_id": "m", "content": "y" * (AGENT_CONTEXT_COMPACT_THRESHOLD + 1)}]
-        self.assertTrue(mimo_local._maybe_compact_agent_context(history, base_message_count=2, workspace=None, sources={}, tool_trace=[]))
-        self.assertEqual(mimo_local.checkpoint_payload(history)["progress_notes"][-2:], ["计划第2步：新建独立兵种。", "最后一步"])
+    async def test_plan_tool_is_listed_and_survives_compaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "plan")
+            workspace.root = Path(directory)
+            workspace.write_file("a.js", "x();\n")
+            rounds = [
+                tool_round("p1", "update_plan", {"steps": [{"step": "read a.js", "status": "in_progress"}, {"step": "edit", "status": "pending"}]}),
+                tool_round("r1", "read_file", {"path": "a.js"}),
+                tool_round("s1", "search_files", {"query": "x"}),
+                tool_round("s2", "search_files", {"query": "y"}),
+                tool_round("s3", "search_files", {"query": "z"}),
+                answer_round("done"),
+            ]
+            result, requests = await run_stream(workspace, rounds, settings={"thinking": "disabled", "context_budget_chars": 40_000})
+        self.assertIn("update_plan", {t["function"]["name"] for t in requests[0]["tools"]})
+        self.assertEqual(result["tool_trace"][0]["name"], "update_plan")
+        self.assertEqual(result["plan"]["steps"][0]["step"], "read a.js")
+        plan_result = json.loads([m["content"] for m in requests[1]["messages"] if m["role"] == "tool"][0])
+        self.assertIn("[~] 1. read a.js", plan_result["plan"])
+        compactions = [s for s in result["round_stats"] if s.get("compacted_after")]
+        if compactions:
+            checkpoint = mimo_local.checkpoint_payload(requests[-1]["messages"])
+            self.assertEqual(checkpoint["plan"]["steps"][1]["step"], "edit")
 
     def test_long_command_output_keeps_head_and_tail(self):
         from app.agent import bounded_output

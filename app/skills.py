@@ -155,19 +155,21 @@ class SkillRegistry:
         return values
 
     def prompt(self) -> str:
+        # Names and descriptions only: full bodies cost thousands of tokens
+        # every round, and skill_read fetches one on demand.
         sections: list[str] = []
         for skill_id in self.enabled_ids():
             skill = self.find(skill_id)
             if skill is None:
                 continue
-            try:
-                body = self.read(skill.skill_id).strip()
-            except (OSError, ValueError, UnicodeDecodeError):
-                continue
-            sections.append(f"## {skill.name} ({skill.skill_id})\n{body[:16_000]}")
+            description = " ".join(str(skill.description or "").split())[:200]
+            sections.append(f"- {skill.skill_id}: {description}" if description else f"- {skill.skill_id}")
         if not sections:
             return ""
-        return "INSTALLED AGENT SKILLS (call skill_read for full text when needed):\n\n" + "\n\n".join(sections)
+        return (
+            "INSTALLED AGENT SKILLS (call skill_read with the id before applying one; read only what the task needs):\n"
+            + "\n".join(sections)
+        )
 
     def install(self, source: str, name: str = "") -> Skill:
         source_value = str(source or "").strip()

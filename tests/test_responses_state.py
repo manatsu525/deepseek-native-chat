@@ -82,7 +82,7 @@ class ResponsesStateTests(unittest.IsolatedAsyncioTestCase):
                 return {"results": [{"url": "https://example.com/age", "title": "age", "excerpts": ["Born in 2000."]}]}
         with patch("app.mimo_local.ParallelMCPClient", Web):
             result = await self.run_stream(transport, web_enabled=True, extra_tools=[], extra_tool_handler=None,
-                                          settings={"web_tool_backend": "parallel"})
+                                          settings={"web_tool_backend": "parallel"}, web_search_limit=3)
         self.assertEqual(requests, ["web_search"] * 3 + ["web_fetch"])
         self.assertEqual(result["answer"], "完成")
         # The tool schema stays identical so the cached prefix survives; the
@@ -91,7 +91,7 @@ class ResponsesStateTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload["tools"], transport.payloads[0]["tools"])
         self.assertEqual([item["name"] for item in transport.payloads[0]["tools"]], ["web_search", "fetch_webpage"])
         for payload in transport.payloads[3:5]:
-            self.assertIn("web_search=0, fetch_webpage=3", json.dumps(payload, ensure_ascii=False))
+            self.assertIn("web_search=0, fetch_webpage=8", json.dumps(payload, ensure_ascii=False))
         # After a tool round the budget note rides on the tool output, so the
         # leading instructions (and their cached prefix) stay unchanged.
         self.assertNotIn("web_search=0", transport.payloads[3]["instructions"])

@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field, field_validator
 from . import attachments
 from .agent import AgentRuntime, build_agent_skills_prompt
 from .config import settings
+from .context import DEFAULT_CONTEXT_BUDGET_CHARS, MAX_CONTEXT_BUDGET_CHARS, MIN_CONTEXT_BUDGET_CHARS
 from .custom_request import validate_request_overrides, validate_advanced_request
 from .responses_state import state_scope, resume_state
 from .db import Database
@@ -127,6 +128,7 @@ class CustomSettingsBody(BaseModel):
     reasoning_effort_enabled: bool = True
     lowest_price_aggregators: list[Literal["openrouter", "vercel"]] = Field(default_factory=list, max_length=2)
     max_completion_tokens: int = Field(default=65536, ge=256, le=MIMO_MAX_COMPLETION_TOKENS)
+    context_budget_chars: int = Field(default=DEFAULT_CONTEXT_BUDGET_CHARS, ge=MIN_CONTEXT_BUDGET_CHARS, le=MAX_CONTEXT_BUDGET_CHARS)
     temperature: float = Field(default=1.0, ge=0, le=1.5)
     top_p: float = Field(default=0.95, ge=0.01, le=1)
     web_tool_backend: Literal["parallel", "keenable", "tavily", "firecrawl", "you", "legacy"] = "parallel"
@@ -807,6 +809,8 @@ async def _execute_job(job_id: str) -> None:
             meta["round_stats"] = result["round_stats"]
         if result.get("incomplete"):
             meta["incomplete"] = True
+        if result.get("plan"):
+            meta["plan"] = result["plan"]
         if kind == "custom_response" and result.get("responses_state"):
             meta["responses_state"] = {**result["responses_state"], "scope": response_scope}
             record_responses_capability(capability_key, result["responses_state"])

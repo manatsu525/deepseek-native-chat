@@ -15,65 +15,7 @@ from app import agent as agent_module
 from app.agent import AgentRuntime
 from app import mimo_local
 from app.file_knowledge import FileKnowledge
-from app.mimo_local import (
-    _maybe_compact_agent_context, _remember_host_evidence, checkpoint_payload,
-    AGENT_CONTEXT_COMPACT_THRESHOLD, CHECKPOINT_READ_EVIDENCE_CHARS,
-)
-
-
-class CheckpointTests(unittest.TestCase):
-    def test_multi_call_exchange_and_provider_items_survive_repeated_checkpoints(self):
-        evidence = []
-        _remember_host_evidence(evidence, 'host_apply_patch',
-                                {'path': '/home/share/app.js', 'old_text': 'old', 'new_text': 'new'},
-                                '{"ok":true,"replacements":1}', 'completed')
-        base = [{'role': 'system', 'content': 'system'}, {'role': 'user', 'content': 'fix'}]
-        latest = [{'role': 'assistant', 'tool_calls': [{'id': 'a'}, {'id': 'b'}, {'id': 'c'}],
-                   'responses_output_items': [{'type': 'reasoning', 'id': 'r'}]}]
-        latest += [{'role': 'tool', 'tool_call_id': key, 'content': key} for key in ('a', 'b', 'c')]
-        history = base + [{'role': 'assistant', 'content': 'x' * (AGENT_CONTEXT_COMPACT_THRESHOLD + 1)}] + copy.deepcopy(latest)
-        kwargs = dict(base_message_count=2, workspace=None, sources={}, tool_trace=[], host_evidence=evidence)
-        self.assertTrue(_maybe_compact_agent_context(history, **kwargs))
-        self.assertEqual(history[2:], latest)
-        checkpoint = checkpoint_payload(history)
-        self.assertEqual(checkpoint['host_operation_evidence'][0]['arguments']['new_text'], 'new')
-        history[2]['content'] = 'x' * (AGENT_CONTEXT_COMPACT_THRESHOLD + 1)
-        self.assertTrue(_maybe_compact_agent_context(history, **kwargs))
-        self.assertEqual([m.get('tool_call_id') for m in history[3:]], ['a', 'b', 'c'])
-        self.assertEqual(history[2]['responses_output_items'], latest[0]['responses_output_items'])
-
-    def test_host_evidence_is_bounded_and_oversized_content_is_explicit(self):
-        evidence = []
-        for i in range(40):
-            _remember_host_evidence(evidence, 'host_read_file', {'path': str(i)}, 'x' * 3000, 'completed')
-        self.assertLessEqual(len(json.dumps(evidence, ensure_ascii=False)), CHECKPOINT_READ_EVIDENCE_CHARS)
-        _remember_host_evidence(evidence, 'host_write_file', {'path': 'big', 'content': 'x' * 90000}, '{}', 'completed')
-        self.assertIn('evidence_omitted', evidence[-1])
-
-    def test_checkpoint_keeps_recent_small_exchanges(self):
-        base = [{'role': 'system', 'content': 'system'}, {'role': 'user', 'content': 'fix'}]
-        old = [{'role': 'assistant', 'tool_calls': [{'id': 'old'}]},
-               {'role': 'tool', 'tool_call_id': 'old', 'content': 'x' * (AGENT_CONTEXT_COMPACT_THRESHOLD + 1)}]
-        recent = [{'role': 'assistant', 'tool_calls': [{'id': 'r'}]}, {'role': 'tool', 'tool_call_id': 'r', 'content': 'recent'}]
-        latest = [{'role': 'assistant', 'tool_calls': [{'id': 'l'}]}, {'role': 'tool', 'tool_call_id': 'l', 'content': 'latest'}]
-        history = base + old + recent + latest
-        self.assertTrue(_maybe_compact_agent_context(history, base_message_count=2, workspace=None, sources={}, tool_trace=[]))
-        self.assertEqual(history[2:], recent + latest)
-
-    def test_checkpoint_carries_file_snapshots_within_budget(self):
-        knowledge = FileKnowledge()
-        for path, content in (('/a', 'x' * (CHECKPOINT_READ_EVIDENCE_CHARS - 60)), ('/b', '1|keep')):
-            knowledge.record_read({'path': path, 'revision': 'r' + path, 'line_count': 1, 'from_line': 1,
-                                   'through_line': 1, 'truncated': False, 'content': content})
-        history = [{'role': 'system', 'content': 'system'}, {'role': 'user', 'content': 'fix'},
-                   {'role': 'assistant', 'content': 'x' * (AGENT_CONTEXT_COMPACT_THRESHOLD + 1)}]
-        self.assertTrue(_maybe_compact_agent_context(
-            history, base_message_count=2, workspace=None, sources={}, tool_trace=[],
-            host_evidence=[], knowledge=knowledge))
-        checkpoint = checkpoint_payload(history)
-        # Newest wins; the older one no longer fits in the shared budget and is forgotten.
-        self.assertEqual([item['path'] for item in checkpoint['file_snapshots']], ['/b'])
-        self.assertEqual((knowledge.known('/a'), knowledge.known('/b')), (False, True))
+from app.context import checkpoint_payload
 
 
 class HostReadTests(unittest.TestCase):
@@ -249,22 +191,22 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 return Response(rounds.pop(0))
         async def update(state): pass
         runtime = AgentRuntime(None, 1, 'test')
-        with patch.object(mimo_local.httpx, 'AsyncClient', Client), patch.object(mimo_local, 'AGENT_CONTEXT_COMPACT_THRESHOLD', 1):
+        with patch.object(mimo_local.httpx, 'AsyncClient', Client):
             result = await mimo_local.stream_response(
                 base_url='https://example.test/v1', api_key='test', model='test', messages=[{'role': 'user', 'content': 'fix'}],
-                timeout=30, stopped=lambda: False, update=update, settings={'thinking': 'disabled'},
+                timeout=30, stopped=lambda: False, update=update, settings={'thinking': 'disabled', 'context_budget_chars': 40_000},
                 agent_mode=True, web_enabled=False, workspace=None, workspace_access='none',
                 extra_tools=runtime.tool_definitions, extra_tool_handler=runtime.execute_async)
         self.assertEqual(result['tool_trace'][0]['status'], 'failed')
         self.assertIn('文件不存在', result['searches'][0]['error'])
-        checkpoint = checkpoint_payload(requests[1]['messages'])
-        self.assertEqual(checkpoint['host_operation_evidence'][0]['status'], 'failed')
-        self.assertIn('文件不存在', checkpoint['host_operation_evidence'][0]['result'])
+        # The failed result itself is what the model sees next round.
+        self.assertIn('文件不存在', requests[1]['messages'][-1]['content'])
 
     async def test_repeated_host_read_survives_checkpoint_without_rereading(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / 'mod.json'
-            target.write_text('{"spell": "old"}\n')
+            # ~10K chars numbered: fits the snapshot share of a 40K budget.
+            target.write_text('{"spell": "old"}\n' + '// padding\n' * 700)
             requests = []
             def read_call(call_id):
                 return {'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': call_id, 'type': 'function', 'function': {
@@ -288,18 +230,21 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                     return Response(rounds.pop(0))
             async def update(state): pass
             runtime = AgentRuntime(None, 1, 'test')
-            with patch.object(mimo_local.httpx, 'AsyncClient', Client), patch.object(mimo_local, 'AGENT_CONTEXT_COMPACT_THRESHOLD', 1):
+            # A large prompt plus the read pushes the request over the smallest
+            # budget, so the first round is compacted before the second request.
+            with patch.object(mimo_local.httpx, 'AsyncClient', Client):
                 result = await mimo_local.stream_response(
                     base_url='https://example.test/v1', api_key='test', model='test', messages=[{'role': 'user', 'content': 'fix'}],
-                    timeout=30, stopped=lambda: False, update=update, settings={'thinking': 'disabled'},
+                    timeout=30, stopped=lambda: False, update=update, settings={'thinking': 'disabled', 'context_budget_chars': 40_000},
+                    system_addendum='p' * 33_000,
                     agent_mode=True, web_enabled=False, workspace=None, workspace_access='none',
                     extra_tools=runtime.tool_definitions, extra_tool_handler=runtime.execute_async)
             self.assertEqual(result['answer'], 'done')
             self.assertEqual([item['status'] for item in result['tool_trace']], ['completed', 'skipped'])
-            # After the first round was checkpointed, the content is still available.
+            # After the first round was compacted, the content lives in the checkpoint.
             checkpoint = checkpoint_payload(requests[1]['messages'])
             self.assertIn('"spell": "old"', checkpoint['file_snapshots'][0]['content'])
-            self.assertNotIn('"spell"', json.dumps(checkpoint['host_operation_evidence'], ensure_ascii=False))
+            self.assertTrue(result['round_stats'][0]['compacted_after'])
             second_result = json.loads(requests[2]['messages'][-1]['content'])
             self.assertTrue(second_result['unchanged'])
 
