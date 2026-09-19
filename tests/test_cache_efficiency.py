@@ -516,6 +516,76 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["answer"], "Changed a.js; assumptions: none.")
         self.assertFalse(result["incomplete"])
 
+    async def test_plain_question_carries_no_file_tools_or_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "lean")
+            workspace.root = Path(directory)
+            result, requests = await run_stream(workspace, [answer_round("你好")])
+        names = [t["function"]["name"] for t in requests[0]["tools"]]
+        self.assertEqual(names, ["load_tools"])
+        system = requests[0]["messages"][0]["content"]
+        self.assertNotIn("edit_file", system)
+        self.assertIn('load_tools with groups ["files"]', system)
+        self.assertLess(len(json.dumps(requests[0]["tools"])) + len(system), 3_000)
+        self.assertEqual(result["answer"], "你好")
+
+    async def test_loading_files_adds_schemas_and_returns_the_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "load")
+            workspace.root = Path(directory)
+            result, requests = await run_stream(workspace, [
+                tool_round("l1", "load_tools", {"groups": ["files"]}),
+                tool_round("w1", "write_file", {"path": "a.py", "content": "print(1)\n"}),
+                answer_round("done"),
+            ])
+            self.assertTrue((Path(directory) / "a.py").exists())
+        second = [t["function"]["name"] for t in requests[1]["tools"]]
+        self.assertIn("write_file", second)
+        self.assertIn("update_plan", second)
+        self.assertEqual(second[-1], "load_tools")
+        load_result = [m["content"] for m in requests[1]["messages"] if m["role"] == "tool"][0]
+        self.assertIn("Loaded tool groups: files", load_result)
+        self.assertIn("edit_file", load_result)
+        # The system prompt did not change, so the prefix stays cacheable.
+        self.assertEqual(requests[0]["messages"][0], requests[1]["messages"][0])
+        self.assertEqual([t["name"] for t in result["tool_trace"]], ["load_tools", "write_file"])
+
+    async def test_direct_call_to_a_deferred_tool_runs_and_loads_the_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "direct")
+            workspace.root = Path(directory)
+            result, requests = await run_stream(workspace, [
+                tool_round("w1", "write_file", {"path": "b.txt", "content": "x\n"}),
+                answer_round("ok"),
+            ])
+        self.assertEqual(result["tool_trace"][0]["status"], "completed")
+        self.assertIn("write_file", [t["function"]["name"] for t in requests[1]["tools"]])
+
+    async def test_workspace_with_files_starts_with_file_tools(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "existing")
+            workspace.root = Path(directory)
+            workspace.write_file("main.py", "print(1)\n")
+            _, requests = await run_stream(workspace, [answer_round("ok")])
+        names = [t["function"]["name"] for t in requests[0]["tools"]]
+        self.assertIn("edit_file", names)
+        self.assertNotIn("load_tools", names)
+        self.assertIn("edit_file", requests[0]["messages"][0]["content"])
+
+    async def test_agent_mode_defers_conversation_and_skill_tools(self):
+        runtime = AgentRuntime(None, 1, "defer", is_admin=True)
+        _, requests = await run_stream(None, [
+            tool_round("l1", "load_tools", {"groups": "skills"}),
+            answer_round("ok"),
+        ], agent_mode=True, workspace_access="none", extra_tools=runtime.tool_definitions,
+            extra_tool_handler=runtime.execute_async)
+        first = [t["function"]["name"] for t in requests[0]["tools"]]
+        self.assertIn("run_command", first)
+        self.assertFalse(any(name.startswith(("skill_", "conversation_")) for name in first))
+        second = [t["function"]["name"] for t in requests[1]["tools"]]
+        self.assertIn("skill_read", second)
+        self.assertFalse(any(name.startswith("conversation_") for name in second))
+
     def test_read_only_command_heuristic(self):
         self.assertTrue(mimo_local._read_only_call("run_command", {"command": "grep -rn foo . | head"}))
         self.assertTrue(mimo_local._read_only_call("run_command", {"command": "sed -n '1,20p' a.json; cat b"}))
@@ -557,6 +627,7 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             workspace = ConversationWorkspace(1, "stats")
             workspace.root = Path(directory)
+            workspace.write_file("main.py", "print(1)\n")
             usage = {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105,
                      "prompt_tokens_details": {"cached_tokens": 80}}
             result, _ = await run_stream(workspace, [

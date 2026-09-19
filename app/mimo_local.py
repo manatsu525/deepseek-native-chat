@@ -21,7 +21,8 @@ from .custom_tool_normalization import normalize_tool_calls
 from .custom_request import apply_request_overrides, expand_advanced_request
 from .responses_state import ResponsesState
 from .agent import HOST_READ_MAX_CHARS, AgentRuntime
-from .prompts import build_system_prompt
+from .prompts import build_system_prompt, files_group_rules
+from .tool_groups import group_of_extra_tool, load_tools_definition, requested_groups
 from .file_knowledge import FileKnowledge
 from .context import (
     CONTEXT_CHECKPOINT_MARKER,
@@ -884,6 +885,17 @@ async def stream_response(
     if api_protocol == "messages":
         headers["x-api-key"] = api_key
         headers["anthropic-version"] = "2023-06-01"
+    # Deferred tool groups (see app/tool_groups.py). In standard mode the file
+    # tools are sent from the start only once the conversation's workspace has
+    # files; in Agent mode the conversation and Skill tools wait for load_tools.
+    files_deferrable = (
+        not agent_mode and workspace is not None and workspace_access == "full" and not workspace.list_files()
+    )
+    extra_groups = sorted({
+        group for group in (group_of_extra_tool(name) for name in extra_tool_names) if group
+    }) if agent_mode else []
+    deferrable_groups = (["files"] if files_deferrable else []) + extra_groups
+    loaded_groups: set[str] = set()
     system_prompt = _apply_model_system_prompt(
         build_system_prompt(
             agent_mode=agent_mode,
@@ -892,6 +904,7 @@ async def stream_response(
             workspace_access=workspace_access if workspace is not None else None,
             user_timezone=user_timezone,
             skills_prompt=system_addendum,
+            file_tools_loaded=not files_deferrable,
         ),
         model,
     )
@@ -1033,7 +1046,9 @@ async def stream_response(
                         round_tools.append(FETCH_WEBPAGE_TOOL)
                     else:
                         round_tools.append(KEYLESS_FETCH_WEBPAGE_TOOL)
-                if workspace is not None and workspace_access != "none" and tool_rounds_used < role_tool_round_limit:
+                files_listed = not files_deferrable or "files" in loaded_groups
+                if (workspace is not None and workspace_access != "none" and files_listed
+                        and tool_rounds_used < role_tool_round_limit):
                     round_tools.extend(workspace.tool_definitions(workspace_access))
                     if inkling_compat_active:
                         round_tools, inkling_patch_bindings = bind_inkling_patch_tools(
@@ -1041,9 +1056,17 @@ async def stream_response(
                             [item["path"] for item in workspace.list_files()],
                         )
                 if extra_tools_expected and tool_rounds_used < role_tool_round_limit:
-                    round_tools.extend(extra_tools)
-                if plan_tool_expected and tool_rounds_used < role_tool_round_limit:
+                    round_tools.extend(
+                        tool for tool in extra_tools
+                        if (group_of_extra_tool(str((tool.get("function") or {}).get("name") or "")) if agent_mode else None)
+                        in (None, *loaded_groups)
+                    )
+                if plan_tool_expected and files_listed and tool_rounds_used < role_tool_round_limit:
                     round_tools.append(UPDATE_PLAN_TOOL)
+                if deferrable_groups and tool_rounds_used < role_tool_round_limit:
+                    # Stays listed after loading, so the tool list changes
+                    # once per loaded group and not again.
+                    round_tools.append(load_tools_definition(deferrable_groups))
             final_answer_only = force_final_answer or (tools_expected and not round_tools)
             mimo_model = is_mimo_model(model)
             request_messages = conversation
@@ -1543,10 +1566,20 @@ async def stream_response(
                 )
                 is_workspace = workspace_tools_expected and not is_extra and workspace_name in WORKSPACE_TOOL_NAMES
                 is_plan = name == "update_plan" and plan_tool_expected
+                is_load = name == "load_tools" and bool(deferrable_groups)
+                # A deferred tool the model calls directly (it knows it from
+                # the group summary or an earlier turn) simply runs: its group
+                # counts as loaded from here on.
+                if (is_workspace or is_plan) and files_deferrable:
+                    loaded_groups.add("files")
+                if is_extra and agent_mode:
+                    direct_group = group_of_extra_tool(HOST_LEGACY_TOOL_ALIASES.get(name, name))
+                    if direct_group:
+                        loaded_groups.add(direct_group)
                 step: dict[str, Any] = {
                     "id": call_id,
                     "status": "running",
-                    "action": "workspace" if is_workspace else "search" if is_search else "agent" if is_extra else "plan" if is_plan else "open_page",
+                    "action": "workspace" if is_workspace else "search" if is_search else "agent" if is_extra else "plan" if is_plan else "tools" if is_load else "open_page",
                     "query": "",
                     "url": "",
                     "path": "",
@@ -1555,7 +1588,7 @@ async def stream_response(
                 }
                 if is_search:
                     search_steps.append(step)
-                elif not is_workspace and not is_extra and not is_plan:
+                elif not is_workspace and not is_extra and not is_plan and not is_load:
                     fetch_steps.append(step)
                 steps.append(step)
                 await update(
@@ -2030,6 +2063,15 @@ async def stream_response(
                     elif is_plan:
                         result_text = plan.apply(arguments)
                         step["status"] = "completed"
+                    elif is_load:
+                        groups = requested_groups(arguments, deferrable_groups)
+                        loaded_groups.update(groups)
+                        step["path"] = ", ".join(groups)
+                        parts = [f"Loaded tool groups: {', '.join(groups)}. Their tools are available from your next step."]
+                        if "files" in groups:
+                            parts.append(files_group_rules(workspace_access))
+                        result_text = "\n\n".join(parts)
+                        step["status"] = "completed"
                     else:
                         raise ValueError(f"不支持的工具：{name or '未命名工具'}")
                 except asyncio.CancelledError:
@@ -2111,7 +2153,7 @@ async def stream_response(
                     "name": workspace_name if is_workspace else name,
                     "url": target_url,
                     "path": step.get("path", ""),
-                    "backend": "workspace" if is_workspace else "plan" if is_plan else web_tool_backend,
+                    "backend": "workspace" if is_workspace else "plan" if is_plan else "tools" if is_load else web_tool_backend,
                     "status": step["status"],
                     "error": step["error"],
                 }

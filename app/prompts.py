@@ -30,7 +30,7 @@ TOOL_RULES = """Working with files and commands:
 - For any task that needs more than two or three tool calls, call update_plan first with concrete steps, including the step that writes the files, and update it as steps complete; it is kept for you across context compaction.
 - Work visibly: before each tool call or batch of calls, write one or two plain sentences for the user saying what you learned and what you do next. That text is the record of your decisions; keep it short and do not repeat tool output in it.
 - Decide, then act. Once the facts you need are in front of you, make the change in that same turn; do not spend further calls confirming what a tool already returned. When the format documentation or an existing example already shows how something is done, follow it: do not read an engine's or framework's source code to prove what the documentation says, and do not look for certainty the tools cannot give (for example a game mod when the game is not installed). Write the files, check their syntax, and list the remaining assumptions in your answer.
-- Verify with the smallest relevant check: use check_web_syntax for HTML/JS and tests/run_smoke.py for routine Python edits. Do not run the entire test-discovery suite after every edit; run it only for cross-cutting runtime, tool or schema changes, or before final delivery, and never rerun an unchanged passing test. Treat ok=false or a nonzero exit as a real failure. Syntax success does not prove runtime behavior; say so.
+- Verify code when a checker is available (check_web_syntax for HTML/JS, run_python or run_command for programs); treat ok=false or a nonzero exit as a real failure. Syntax success does not prove runtime behavior; say so.
 - When finished, summarize the files you changed. The UI provides download links; do not paste whole files into the answer."""
 
 WORKSPACE_RULES = {
@@ -57,10 +57,16 @@ AGENT_RULES = (
     "You are running as the host-level agent of this server with root access. Relative paths resolve from the shared "
     "workspace /home/share; use absolute paths to change the real application, repositories or system configuration. "
     "run_command executes real bash on the host. For a new project, create the files under /home/share; for an "
-    "existing project, preserve unrelated work. Skills are working instructions: read one with skill_read before "
-    "applying it; only administrators can install, enable or remove Skills. You may inspect, create, rename and "
-    "delete this user's conversations with the conversation tools. Never claim an operation happened without "
-    "calling the tool and checking its result; do not wait for permission between ordinary tool calls."
+    "existing project, preserve unrelated work. Skills are working instructions: load the skills tools with "
+    "load_tools and read one with skill_read before applying it; only administrators can install, enable or remove "
+    "Skills. The conversations tools (also through load_tools) inspect, create, rename and delete this user's "
+    "conversations. Never claim an operation happened without calling the tool and checking its result; do not wait "
+    "for permission between ordinary tool calls."
+)
+
+FILES_DEFERRED_NOTE = (
+    "Tools for files, code, commands and calculations are not loaded yet. Before any coding, file, data-processing "
+    "or calculation task, call load_tools with groups [\"files\"]; answer ordinary questions directly."
 )
 
 AGENT_RESEARCH = (
@@ -94,6 +100,11 @@ RESEARCH_RULES = (
 )
 
 
+def files_group_rules(workspace_access: str) -> str:
+    """What load_tools returns when the files group is loaded in standard mode."""
+    return TOOL_RULES + "\n\n" + WORKSPACE_RULES.get(workspace_access, WORKSPACE_RULES["full"])
+
+
 def date_context(user_timezone: str) -> str:
     try:
         timezone = ZoneInfo(user_timezone)
@@ -117,18 +128,25 @@ def build_system_prompt(
     workspace_access: str | None,
     user_timezone: str,
     skills_prompt: str = "",
+    file_tools_loaded: bool = True,
 ) -> str:
-    """Assemble the prompt for one answer. Stable per configuration for prompt caching."""
+    """Assemble the prompt for one answer. Stable per configuration for prompt caching.
+
+    With ``file_tools_loaded`` false (standard mode before any file work), the
+    file rules are left out: load_tools returns them when the group is loaded.
+    """
     sections = [IDENTITY, date_context(user_timezone)]
-    tools_available = agent_mode or workspace_access in WORKSPACE_RULES
-    if tools_available:
+    workspace_mode = not agent_mode and workspace_access in WORKSPACE_RULES
+    if agent_mode or (workspace_mode and file_tools_loaded):
         sections.append(TOOL_RULES)
     if agent_mode:
         sections.append(AGENT_RULES)
         if skills_prompt.strip():
             sections.append(skills_prompt.strip())
-    elif workspace_access in WORKSPACE_RULES:
+    elif workspace_mode and file_tools_loaded:
         sections.append(WORKSPACE_RULES[workspace_access])
+    elif workspace_mode:
+        sections.append(FILES_DEFERRED_NOTE)
     if web_enabled:
         family = "parallel" if web_backend == "parallel" else "legacy" if web_backend == "legacy" else "keyless"
         research = WEB_RULES[family] + " " + RESEARCH_RULES
