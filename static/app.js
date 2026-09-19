@@ -533,10 +533,26 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
   const agentLabels={list_files:'列出文件',read_file:'读取文件',write_file:'写入文件',edit_file:'修改文件',search_files:'搜索文件',run_command:'运行命令',delete_file:'删除路径',check_web_syntax:'检查网页语法',update_plan:'更新计划',host_list_files:'列出主机文件',host_read_file:'读取主机文件',host_write_file:'写入主机文件',host_apply_patch:'修改主机文件',host_search_files:'搜索主机文件',host_run_command:'运行主机命令',host_delete_path:'删除主机路径',conversation_list:'列出对话',conversation_read:'读取对话',conversation_create:'创建对话',conversation_rename:'重命名对话',conversation_delete:'删除对话',skill_list:'列出 Skill',skill_read:'读取 Skill',skill_install:'安装 Skill',skill_enable:'启用/禁用 Skill',skill_remove:'删除 Skill',frontend_list_pages:'列出前端页面',frontend_read_page:'读取前端页面',frontend_write_page:'写入前端页面',frontend_validate_page:'检查前端页面'};
   const searchHtml = searches.map((s,i) => {
     const workspaceLabels={list_files:'列出文件',read_file:'读取文件',write_file:'写入文件',edit_file:'修改文件',run_command:'运行命令',update_plan:'更新计划',apply_patch:'修改文件',apply_patch_batch:'批量修改文件',search_files:'搜索文件',delete_file:'删除文件',run_python:'运行 Python',check_web_syntax:'检查网页语法'};
-    const label=s.action==='workspace'?(workspaceLabels[s.tool]||'工作区操作'):s.action==='agent'?(agentLabels[s.tool]||s.tool||'Agent 操作'):s.action==='open_page'?'读取网页':'联网搜索';
+    const action=String(s.action||'');
+    const isPlan=action==='plan';
+    const isSearch=action==='search';
+    const label=action==='workspace'?(workspaceLabels[s.tool]||'工作区操作'):action==='agent'?(agentLabels[s.tool]||s.tool||'Agent 操作'):isPlan?'更新计划':action==='open_page'?'读取网页':isSearch?'联网搜索':(s.tool||'工具操作');
     const searchKey=`${detailKey}-search-${s.id || i}`;
     const searchOpen=detailState.get(searchKey) ? ' open' : '';
-    const detail=s.action==='workspace'||s.action==='agent'?escapeHtml(s.path||s.query||(s.action==='agent'?'Agent 操作':'工作区')):s.url?`<a href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(s.url)}</a>`:escapeHtml(Array.isArray(s.query)?s.query.filter(x=>!String(x).startsWith('ws_call_id=')).join('；'):(s.query||'DeepSeek 未返回查询词'));
+    let detail;
+    if (isPlan) {
+      detail='计划已更新';
+    } else if (action==='workspace'||action==='agent') {
+      detail=escapeHtml(s.path||s.query||(action==='agent'?'Agent 操作':'工作区'));
+    } else if (s.url) {
+      detail=`<a href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(s.url)}</a>`;
+    } else if (Array.isArray(s.query)) {
+      const queries=s.query.filter(x=>!String(x).startsWith('ws_call_id=')).join('；');
+      detail=escapeHtml(queries || (isSearch ? (['running','searching'].includes(s.status) ? '准备查询词' : '未返回查询词') : '工具未返回详情'));
+    } else {
+      const query=String(s.query||'').trim();
+      detail=escapeHtml(query || (isSearch ? (['running','searching'].includes(s.status) ? '准备查询词' : '未返回查询词') : action==='open_page' ? '未返回网页地址' : '工具未返回详情'));
+    }
     const error=s.error?`<div class="search-error">${escapeHtml(s.error)}</div>`:'';
     const statusLabels={running:'进行中',searching:'搜索中',completed:'已完成',failed:'失败',rejected:'已拒绝',skipped:'已跳过'};
     return `<details class="search-step" data-detail-key="${escapeHtml(searchKey)}"${searchOpen}><summary>${label} ${i+1} · ${escapeHtml(statusLabels[s.status] || s.status || '已完成')}</summary><div class="search-detail">${detail}${error}</div></details>`;
@@ -546,7 +562,8 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
   const readCount=searches.filter(item=>item.action==='open_page'&&item.status==='completed').length;
   const fileCount=searches.filter(item=>item.action==='workspace').length;
   const agentCount=searches.filter(item=>item.action==='agent').length;
-  const activity=`${searchCount ? ` · ${searchCount} 次搜索` : ''}${readCount ? ` · ${readCount} 次读取` : ''}${fileCount ? ` · ${fileCount} 次文件操作` : ''}${agentCount ? ` · ${agentCount} 次 Agent 操作` : ''}`;
+  const planCount=searches.filter(item=>item.action==='plan').length;
+  const activity=`${searchCount ? ` · ${searchCount} 次搜索` : ''}${readCount ? ` · ${readCount} 次读取` : ''}${fileCount ? ` · ${fileCount} 次文件操作` : ''}${agentCount ? ` · ${agentCount} 次 Agent 操作` : ''}${planCount ? ` · ${planCount} 次计划更新` : ''}`;
   return `<details class="trace" data-detail-key="${escapeHtml(detailKey)}"${traceOpen}><summary>思考与工具 · ${status}${activity}</summary><div class="trace-body">${reasoning ? `<div class="reasoning-text" data-scroll-key="${escapeHtml(detailKey)}-reasoning">${escapeHtml(reasoning)}</div>` : active ? '<div class="typing"><i></i><i></i><i></i></div>' : ''}${searchHtml}</div></details>`;
 }
 
