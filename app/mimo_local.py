@@ -470,12 +470,6 @@ def _append_runtime_note(conversation: list[dict[str, Any]], note: str) -> bool:
     return True
 
 
-def _is_nvidia_deepseek_v4(base_url: str, model: str) -> bool:
-    host = (urlsplit(base_url).hostname or "").casefold()
-    model_name = str(model or "").casefold().rsplit("/", 1)[-1]
-    return host == "integrate.api.nvidia.com" and model_name in {"deepseek-v4-flash", "deepseek-v4-pro"}
-
-
 def _is_nemotron_model(model: str) -> bool:
     """Nemotron reasoning controls use NVIDIA's chat-template extension."""
     return "nemotron" in str(model or "").casefold()
@@ -547,10 +541,6 @@ def _apply_thinking_options(
     selected_effort = normalize_reasoning_effort(effort)
     if is_mimo_model(model):
         payload["thinking"] = {"type": thinking}
-    elif _is_nvidia_deepseek_v4(base_url, model):
-        payload["chat_template_kwargs"] = {"thinking": thinking_enabled}
-        if effort_enabled:
-            payload["chat_template_kwargs"]["reasoning_effort"] = selected_effort
     elif _is_nemotron_model(model):
         payload["chat_template_kwargs"] = {"enable_thinking": thinking_enabled}
         if host == "integrate.api.nvidia.com" and model_name == "nemotron-3-ultra-550b-a55b" and thinking_enabled:
@@ -561,7 +551,7 @@ def _apply_thinking_options(
         # shape is intentionally user-controlled: incompatible providers may
         # reject it, after which it can be disabled in Custom settings.
         payload["thinking"] = {"type": thinking}
-    if effort_enabled and not _is_nvidia_deepseek_v4(base_url, model) and not _is_nemotron_model(model):
+    if effort_enabled and not _is_nemotron_model(model):
         payload["reasoning_effort"] = selected_effort
 
 

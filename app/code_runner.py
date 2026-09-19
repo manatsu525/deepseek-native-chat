@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 
-RUN_ROOT = Path("/run/deepseek-code-runs")
+RUN_ROOT = Path("/run/custom-code-runs")
 MAX_ARGUMENTS = 20
 MAX_ARGUMENT_CHARS = 1000
 MAX_OUTPUT_CHARS = 12_000
@@ -240,7 +240,7 @@ def check_web_syntax(source_root: Path, relative_path: str) -> dict[str, Any]:
             if parser.unclosed_script:
                 return {"ok": False, "path": path.as_posix(), "html_parsed": False, "checks": [], "error": "HTML 中存在未闭合的 <script> 标签"}
             html_parsed = True
-            generated = run_root / ".deepseek-syntax"
+            generated = run_root / ".custom-syntax"
             generated.mkdir(mode=0o777)
             for index, (content, module) in enumerate(parser.inline, 1):
                 inline_path = generated / f"inline-{index}{'.mjs' if module else '.js'}"

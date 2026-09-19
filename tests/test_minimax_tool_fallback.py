@@ -22,7 +22,7 @@ class MiniMaxToolFallbackTests(unittest.TestCase):
             os.environ.pop("MINIMAX_TOOL_FALLBACK", None)
             self.assertTrue(applies_to("minimaxai/minimax-m3"))
             self.assertTrue(applies_to("MiniMax-M2.7"))
-            self.assertFalse(applies_to("deepseek-v4-flash"))
+            self.assertFalse(applies_to("ordinary-model"))
         with patch.dict(os.environ, {"MINIMAX_TOOL_FALLBACK": "off"}):
             self.assertFalse(applies_to("minimax-m3"))
 

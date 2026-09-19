@@ -62,7 +62,7 @@ chmod 600 "$INSTALL_DIR/.env"
 
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=DeepSeek Native Chat
+Description=Custom Native Chat
 After=network-online.target
 Wants=network-online.target
 

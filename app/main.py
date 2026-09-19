@@ -28,8 +28,6 @@ from .context import DEFAULT_CONTEXT_BUDGET_CHARS, MAX_CONTEXT_BUDGET_CHARS, MIN
 from .custom_request import validate_request_overrides, validate_advanced_request
 from .responses_state import state_scope, resume_state
 from .db import Database
-from .deepseek import list_models as deepseek_list_models
-from .deepseek import stream_response as deepseek_stream_response
 from .custom_responses import stream_response as custom_responses_stream_response
 from .custom_messages import stream_response as custom_messages_stream_response
 from .mimo import DEFAULT_SETTINGS as CUSTOM_DEFAULT_SETTINGS
@@ -64,7 +62,6 @@ attachment_upload_locks: dict[int, asyncio.Lock] = {}
 attachment_processing_lock = asyncio.Lock()
 attachment_job_lock = asyncio.Lock()
 SUPPORTED_MODELS = {
-    "deepseek": {"deepseek-v4-flash", "deepseek-v4-pro"},
     # Custom providers advertise their own model IDs through /models or a
     # manually entered model name, so there is no static allow-list here.
     "custom": set(),
@@ -72,7 +69,6 @@ SUPPORTED_MODELS = {
     "custom_messages": set(),
 }
 DEFAULT_BASE_URLS = {
-    "deepseek": "https://api.deepseek.com",
     "custom": "https://api.openai.com/v1",
     "custom_response": "https://api.openai.com/v1",
     "custom_messages": "https://api.anthropic.com/v1",
@@ -97,7 +93,7 @@ class PasswordBody(BaseModel):
 class ProviderBody(BaseModel):
     name: str = Field(min_length=1, max_length=40)
     api_key: str = Field(min_length=8, max_length=300)
-    provider_type: Literal["deepseek", "custom", "custom_response", "custom_messages"] = "deepseek"
+    provider_type: Literal["custom", "custom_response", "custom_messages"] = "custom"
     base_url: str = ""
     model: str = ""
     selected_models: list[str] = Field(default_factory=list, max_length=500)
@@ -116,7 +112,7 @@ class ProviderEditBody(BaseModel):
 
     name: str = Field(default="", max_length=40)
     api_key: str = Field(default="", max_length=300)
-    provider_type: Optional[Literal["deepseek", "custom", "custom_response", "custom_messages"]] = None
+    provider_type: Optional[Literal["custom", "custom_response", "custom_messages"]] = None
     base_url: str = ""
     model: str = ""
     selected_models: list[str] = Field(default_factory=list, max_length=500)
@@ -276,8 +272,10 @@ normalize_mimo_settings = normalize_custom_settings
 
 
 def provider_type(row: dict[str, Any]) -> str:
-    kind = row.get("provider_type") or "deepseek"
-    return "custom" if kind == "mimo" else kind
+    # Legacy rows are normalized by Database.init(); keep this mapping here
+    # as a defensive fallback when an old job/provider is read in isolation.
+    kind = str(row.get("provider_type") or "custom")
+    return {"mimo": "custom", "deepseek": "custom_response"}.get(kind, kind)
 
 
 def is_custom_provider(kind: str) -> bool:
@@ -318,16 +316,13 @@ def provider_models(row: dict[str, Any]) -> list[str]:
 
 def validate_provider_selection(kind: str, model: str, provider: Optional[dict[str, Any]] = None) -> None:
     if kind not in SUPPORTED_MODELS:
-        raise HTTPException(400, "不支持的服务商类型")
-    if is_custom_provider(kind):
-        if not model.strip():
-            raise HTTPException(400, "请选择或填写一个 custom 模型")
-        if provider is not None and model not in provider_models(provider):
-            raise HTTPException(400, "该模型未在此 custom API 配置中启用")
-        return
-    if model not in SUPPORTED_MODELS[kind]:
-        available = "、".join(sorted(SUPPORTED_MODELS[kind]))
-        raise HTTPException(400, f"{kind} 当前支持的模型为：{available}")
+        raise HTTPException(400, "不支持的 Custom 接口类型")
+    if not is_custom_provider(kind):
+        raise HTTPException(400, "仅支持 Custom API 配置")
+    if not model.strip():
+        raise HTTPException(400, "请选择或填写一个 Custom 模型")
+    if provider is not None and model not in provider_models(provider):
+        raise HTTPException(400, "该模型未在此 Custom API 配置中启用")
 
 
 def now() -> int:
@@ -436,6 +431,8 @@ def public_job(row: dict[str, Any]) -> dict[str, Any]:
     row["stop_requested"] = bool(row["stop_requested"])
     if row.get("provider_type") == "mimo":
         row["provider_type"] = "custom"
+    elif row.get("provider_type") == "deepseek":
+        row["provider_type"] = "custom_response"
     # Historical jobs used the removed four-agent mode. Keep their records
     # readable without exposing that mode as a new runtime option.
     if row.get("chat_mode") == "multi_agent":
@@ -784,16 +781,7 @@ async def _execute_job(job_id: str) -> None:
                 **response_options,
             )
         else:
-            result = await deepseek_stream_response(
-                base_url=provider["base_url"],
-                api_key=provider["api_key"],
-                model=job["model"],
-                messages=history,
-                effort=job["effort"],
-                timeout=settings.request_timeout,
-                stopped=stopped,
-                update=update,
-            )
+            raise RuntimeError("该 API 配置类型已移除，请重新保存为 Custom 配置")
         if result.get("web_evidence"):
             db.upsert_web_evidence(
                 job["user_id"],
@@ -957,7 +945,7 @@ async def lifespan(_: FastAPI):
         task.cancel()
 
 
-app = FastAPI(title="DeepSeek Native Chat", lifespan=lifespan)
+app = FastAPI(title="Custom Native Chat", lifespan=lifespan)
 static_dir = Path(__file__).resolve().parent.parent / "static"
 app.mount("/assets", StaticFiles(directory=static_dir), name="assets")
 
@@ -1291,34 +1279,32 @@ async def test_provider_credentials(kind: str, base: str, api_key: str, manual_v
     # names. Fall back to selected_models for older clients.
     manual_models = _clean_model_ids(manual_values)
     manual_tested: list[str] = []
+    if not is_custom_provider(kind):
+        raise HTTPException(400, "仅支持 Custom API 配置")
+    protocol = "responses" if kind == "custom_response" else "messages" if kind == "custom_messages" else "chat_completions"
     try:
-        protocol = "responses" if kind == "custom_response" else "messages" if kind == "custom_messages" else "chat_completions"
-        models = await (custom_list_models(base, api_key, api_protocol=protocol) if is_custom_provider(kind) else deepseek_list_models(base, api_key))
+        models = await custom_list_models(base, api_key, api_protocol=protocol)
     except Exception as exc:
-        if not is_custom_provider(kind) or not manual_models:
+        if not manual_models:
             raise HTTPException(400, f"API 测试失败：{exc}") from exc
         models = []
         models_warning = str(exc)
     else:
         models_warning = ""
-    if is_custom_provider(kind):
-        if len(manual_models) > 20:
-            raise HTTPException(400, "一次最多测试 20 个手填模型")
-        advertised = set(models)
-        for model_id in manual_models:
-            if model_id not in advertised:
-                await test_custom_model(base, api_key, model_id, api_protocol=protocol)
-                manual_tested.append(model_id)
-        models = list(dict.fromkeys([*models, *manual_models]))
-        supported = models
-    else:
-        supported = sorted(SUPPORTED_MODELS[kind])
+    if len(manual_models) > 20:
+        raise HTTPException(400, "一次最多测试 20 个手填模型")
+    advertised = set(models)
+    for model_id in manual_models:
+        if model_id not in advertised:
+            await test_custom_model(base, api_key, model_id, api_protocol=protocol)
+            manual_tested.append(model_id)
+    models = list(dict.fromkeys([*models, *manual_models]))
+    supported = models
     return {
         "ok": True,
         "provider_type": kind,
         "models": models,
         "supported_models": supported,
-        "native_search_models": [m for m in models if m in SUPPORTED_MODELS[kind]],
         "manual_tested": manual_tested,
         "models_warning": models_warning,
     }
@@ -1337,25 +1323,18 @@ def add_provider(body: ProviderBody, admin: dict[str, Any] = Depends(admin_user)
     kind = body.provider_type
     base = clean_base_url(body.base_url or DEFAULT_BASE_URLS[kind])
     selected_models = _clean_model_ids(body.selected_models)
-    if is_custom_provider(kind):
-        model = body.model.strip() or (selected_models[0] if selected_models else "")
-        if model and model not in selected_models:
-            selected_models.insert(0, model)
-        if not selected_models:
-            raise HTTPException(400, "请至少选择或填写一个 custom 模型")
-    else:
-        model = body.model.strip() or "deepseek-v4-flash"
-        selected_models = [model]
+    model = body.model.strip() or (selected_models[0] if selected_models else "")
+    if model and model not in selected_models:
+        selected_models.insert(0, model)
+    if not selected_models:
+        raise HTTPException(400, "请至少选择或填写一个 Custom 模型")
     validate_provider_selection(kind, model)
-    if is_custom_provider(kind):
-        settings_value = {
-            "models": selected_models,
-            "model_settings": {item: normalize_model_settings(
-                {"base_url": base, "provider_type": kind}, item, body.custom_settings or {},
-            ) for item in selected_models},
-        }
-    else:
-        settings_value = {"models": selected_models}
+    settings_value = {
+        "models": selected_models,
+        "model_settings": {item: normalize_model_settings(
+            {"base_url": base, "provider_type": kind}, item, body.custom_settings or {},
+        ) for item in selected_models},
+    }
     settings_json = json.dumps(settings_value, ensure_ascii=False)
     provider_id = db.run(
         "INSERT INTO providers(user_id,name,api_key,base_url,model,provider_type,settings_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -1394,17 +1373,12 @@ def update_provider(provider_id: int, body: ProviderEditBody, _: dict[str, Any] 
         raise HTTPException(400, "API Key 至少需要 8 个字符")
     base = clean_base_url(body.base_url or provider["base_url"] or DEFAULT_BASE_URLS[kind])
     selected_models = _clean_model_ids(body.selected_models)
-    if is_custom_provider(kind):
-        model = body.model.strip() or (selected_models[0] if selected_models else "")
-        if model and model not in selected_models:
-            selected_models.insert(0, model)
-        if not selected_models:
-            raise HTTPException(400, "请至少选择或填写一个 custom 模型")
-        settings_value = custom_settings_document(provider, selected_models)
-    else:
-        model = body.model.strip() or "deepseek-v4-flash"
-        selected_models = [model]
-        settings_value = {"models": selected_models}
+    model = body.model.strip() or (selected_models[0] if selected_models else "")
+    if model and model not in selected_models:
+        selected_models.insert(0, model)
+    if not selected_models:
+        raise HTTPException(400, "请至少选择或填写一个 Custom 模型")
+    settings_value = custom_settings_document(provider, selected_models)
     validate_provider_selection(kind, model)
     db.run(
         """UPDATE providers
@@ -1430,21 +1404,13 @@ def update_provider_models(provider_id: int, body: ProviderModelsBody, _: dict[s
         raise HTTPException(404, "API 配置不存在")
     kind = provider_type(provider)
     selected_models = _clean_model_ids(body.selected_models)
-    if is_custom_provider(kind):
-        model = body.model.strip() or (selected_models[0] if selected_models else "")
-        if model and model not in selected_models:
-            selected_models.insert(0, model)
-        if not selected_models:
-            raise HTTPException(400, "请至少选择或填写一个 custom 模型")
-    else:
-        model = body.model.strip() or "deepseek-v4-flash"
-        selected_models = [model]
+    model = body.model.strip() or (selected_models[0] if selected_models else "")
+    if model and model not in selected_models:
+        selected_models.insert(0, model)
+    if not selected_models:
+        raise HTTPException(400, "请至少选择或填写一个 Custom 模型")
     validate_provider_selection(kind, model)
-    settings_value = (
-        custom_settings_document(provider, selected_models)
-        if is_custom_provider(kind)
-        else {"models": selected_models}
-    )
+    settings_value = custom_settings_document(provider, selected_models)
     db.run(
         "UPDATE providers SET model=?,settings_json=? WHERE id=?",
         (model, json.dumps(settings_value, ensure_ascii=False), provider_id),
@@ -1682,11 +1648,7 @@ async def retry_answer(
         raise HTTPException(404, "请选择有效的 API 配置")
     kind = provider_type(provider)
     model = body.model.strip() or provider["model"]
-    if kind == "deepseek" and model != provider["model"]:
-        raise HTTPException(400, "当前回答使用的模型与 API 配置不一致，请重新选择模型配置")
     validate_provider_selection(kind, model, provider)
-    if body.chat_mode == "agent" and not is_custom_provider(kind):
-        raise HTTPException(400, "Agent 模式仅支持 Custom 模型")
     validate_effort(body.effort)
     timezone_name = clean_timezone(body.timezone)
     job_id = uuid.uuid4().hex
@@ -1729,8 +1691,6 @@ async def retry_answer(
                 raise HTTPException(409, "原问题的附件文件已经不可用，无法重新回答")
             if body.chat_mode != "agent" and any(row["kind"] == "agent_file" for row in attachment_rows):
                 raise HTTPException(400, "原问题包含 Agent 原文件，请使用 Agent 模式重新回答")
-            if not is_custom_provider(kind) and any(row["kind"] == "image" for row in attachment_rows):
-                raise HTTPException(400, "当前 DeepSeek Responses 路由不接受图片，请改用支持视觉输入的 Custom 模型")
 
         connection.execute(
             "DELETE FROM messages WHERE conversation_id=? AND id>?",
@@ -1793,11 +1753,7 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
         raise HTTPException(404, "请选择有效的 API 配置")
     kind = provider_type(provider)
     model = body.model.strip() or provider["model"]
-    if kind == "deepseek" and model != provider["model"]:
-        raise HTTPException(400, "当前回答使用的模型与 API 配置不一致，请重新选择模型配置")
     validate_provider_selection(kind, model, provider)
-    if body.chat_mode == "agent" and not is_custom_provider(kind):
-        raise HTTPException(400, "Agent 模式仅支持 Custom 模型")
     validate_effort(body.effort)
     content = body.content.strip()
     attachment_ids = list(dict.fromkeys(body.attachment_ids))
@@ -1810,8 +1766,6 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
         raise HTTPException(400, "部分附件不存在、已过期或已经发送")
     if body.chat_mode != "agent" and any(item["kind"] == "agent_file" for item in attachment_records):
         raise HTTPException(400, "附件包含 Agent 原文件，请切换到 Agent 模式或移除这些附件")
-    if not is_custom_provider(kind) and any(item["kind"] == "image" for item in attachment_records):
-        raise HTTPException(400, "当前 DeepSeek Responses 路由不接受图片，请改用支持视觉输入的 Custom 模型")
     timezone_name = clean_timezone(body.timezone)
     conversation_id = body.conversation_id
     created_conversation = False

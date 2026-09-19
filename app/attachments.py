@@ -420,7 +420,7 @@ def build_model_messages(messages: list[dict[str, Any]], records: list[dict[str,
             document_parts.append(f"\n\n--- 附件：{record['original_name']}（提取文本）---\n{text}")
         elif record["kind"] == "image":
             if not allow_images:
-                raise AttachmentError("当前 DeepSeek Responses 路由不接受图片，请改用支持视觉输入的 Custom 模型")
+                raise AttachmentError("当前 API 配置不接受图片，请改用支持视觉输入的 Custom 模型")
             raw = path.read_bytes()
             image_bytes += len(raw)
             if image_bytes > MAX_PROCESSED_IMAGE_BYTES * MAX_ATTACHMENTS:

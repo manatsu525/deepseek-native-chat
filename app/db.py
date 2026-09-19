@@ -45,9 +45,9 @@ class Database:
                     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                     name TEXT NOT NULL,
                     api_key TEXT NOT NULL,
-                    base_url TEXT NOT NULL DEFAULT 'https://api.deepseek.com',
-                    model TEXT NOT NULL DEFAULT 'deepseek-v4-flash',
-                    provider_type TEXT NOT NULL DEFAULT 'deepseek',
+                    base_url TEXT NOT NULL DEFAULT 'https://api.openai.com/v1',
+                    model TEXT NOT NULL DEFAULT '',
+                    provider_type TEXT NOT NULL DEFAULT 'custom',
                     settings_json TEXT NOT NULL DEFAULT '{}',
                     created_at INTEGER NOT NULL
                 );
@@ -74,7 +74,7 @@ class Database:
                     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
                     provider_id INTEGER NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
-                    provider_type TEXT NOT NULL DEFAULT 'deepseek',
+                    provider_type TEXT NOT NULL DEFAULT 'custom',
                     model TEXT NOT NULL,
                     effort TEXT NOT NULL,
                     timezone TEXT NOT NULL DEFAULT 'UTC',
@@ -135,7 +135,7 @@ class Database:
             )
             provider_columns = {row["name"] for row in db.execute("PRAGMA table_info(providers)").fetchall()}
             if "provider_type" not in provider_columns:
-                db.execute("ALTER TABLE providers ADD COLUMN provider_type TEXT NOT NULL DEFAULT 'deepseek'")
+                db.execute("ALTER TABLE providers ADD COLUMN provider_type TEXT NOT NULL DEFAULT 'custom'")
             if "settings_json" not in provider_columns:
                 db.execute("ALTER TABLE providers ADD COLUMN settings_json TEXT NOT NULL DEFAULT '{}'")
             conversation_columns = {row["name"] for row in db.execute("PRAGMA table_info(conversations)").fetchall()}
@@ -147,7 +147,7 @@ class Database:
             )
             job_columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)").fetchall()}
             if "provider_type" not in job_columns:
-                db.execute("ALTER TABLE jobs ADD COLUMN provider_type TEXT NOT NULL DEFAULT 'deepseek'")
+                db.execute("ALTER TABLE jobs ADD COLUMN provider_type TEXT NOT NULL DEFAULT 'custom'")
             if "timezone" not in job_columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'")
             if "chat_mode" not in job_columns:
@@ -159,6 +159,15 @@ class Database:
             # new generic name everywhere after the next startup.
             db.execute("UPDATE providers SET provider_type='custom' WHERE provider_type='mimo'")
             db.execute("UPDATE jobs SET provider_type='custom' WHERE provider_type='mimo'")
+            # The former dedicated provider is now a normal Custom Responses
+            # configuration. Keep its API key, model and history intact while
+            # removing the old provider type and visible name.
+            db.execute(
+                "UPDATE providers SET provider_type='custom_response', "
+                "name=CASE WHEN lower(name) LIKE '%deepseek%' THEN 'Custom Responses' ELSE name END "
+                "WHERE provider_type='deepseek'"
+            )
+            db.execute("UPDATE jobs SET provider_type='custom_response' WHERE provider_type='deepseek'")
         self.path.chmod(0o600)
 
     def one(self, sql: str, args: tuple[Any, ...] = ()) -> Optional[dict[str, Any]]:

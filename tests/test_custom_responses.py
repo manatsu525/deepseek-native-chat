@@ -16,7 +16,6 @@ class CustomResponsesProtocolTests(unittest.TestCase):
         self.assertTrue(main.is_custom_provider("custom"))
         self.assertTrue(main.is_custom_provider("custom_response"))
         self.assertTrue(main.is_custom_provider("custom_messages"))
-        self.assertFalse(main.is_custom_provider("deepseek"))
         main.validate_provider_selection("custom_response", "muse-spark-1.2")
 
     def test_chat_tool_history_becomes_responses_items(self) -> None:

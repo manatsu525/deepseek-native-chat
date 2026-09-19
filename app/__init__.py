@@ -1,1 +1,1 @@
-"""DeepSeek Native Chat."""
+"""Custom Native Chat."""

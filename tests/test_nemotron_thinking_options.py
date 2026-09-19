@@ -53,7 +53,7 @@ class NemotronThinkingOptionsTests(unittest.TestCase):
         self.assertIn("final answer MUST be in Chinese", prompt)
 
     def test_other_models_do_not_get_language_instruction(self) -> None:
-        self.assertEqual(_apply_model_system_prompt("base prompt", "deepseek-v4-flash"), "base prompt")
+        self.assertEqual(_apply_model_system_prompt("base prompt", "ordinary-model"), "base prompt")
 
 
 if __name__ == "__main__":

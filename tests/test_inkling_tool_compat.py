@@ -27,7 +27,7 @@ class InklingToolCompatTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("INKLING_TOOL_COMPAT", None)
             self.assertTrue(applies_to("lihuahuili--ep-inkling-nvfp4"))
-            self.assertFalse(applies_to("deepseek-v4-flash"))
+            self.assertFalse(applies_to("ordinary-model"))
         with patch.dict(os.environ, {"INKLING_TOOL_COMPAT": "off"}):
             self.assertFalse(applies_to("inkling-nvfp4"))
 

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#0b1220">
-  <title>Native Web Chat</title>
+  <title>Custom Native Chat</title>
   <link rel="stylesheet" href="/assets/vendor/katex/katex.min.css">
   <link rel="stylesheet" href="/assets/style.css">
   <style>
@@ -70,8 +70,8 @@
     <div class="login-card">
       <div class="brand-mark">AI</div>
       <p class="eyebrow">PRIVATE WORKSPACE</p>
-      <h1>Native Web Chat</h1>
-      <p class="muted">DeepSeek 保留原生联网；Custom API 使用标准 OpenAI 接口并可调用本地搜索与网页阅读。</p>
+      <h1>Custom Native Chat</h1>
+      <p class="muted">统一使用 Custom API，可调用本地搜索与网页阅读。</p>
       <form id="loginForm" class="stack">
         <label>账号<input id="loginUser" autocomplete="username" required></label>
         <label>密码<input id="loginPass" type="password" autocomplete="current-password" required></label>
@@ -84,7 +84,7 @@
   <div id="appView" class="app hidden">
     <aside id="sidebar" class="sidebar">
       <div class="side-head">
-        <div><p class="eyebrow">NATIVE WEB</p><strong>AI Chat</strong></div>
+        <div><p class="eyebrow">CUSTOM CHAT</p><strong>AI Chat</strong></div>
         <button id="closeSidebar" class="icon-btn mobile-only" aria-label="关闭">×</button>
       </div>
       <button id="newChat" class="new-chat"><span>＋</span> 新对话</button>
@@ -111,7 +111,7 @@
         <button id="openSidebar" class="icon-btn mobile-only" aria-label="菜单">☰</button>
         <div class="title-block"><h2 id="conversationTitle">新对话</h2><span id="statusText" class="status-dot">标准模式 · 外部搜索工具已就绪</span></div>
         <div class="top-actions">
-          <label id="effortControl" class="compact-select" title="控制 DeepSeek 模型的 reasoning effort"><span id="effortLabel">推理</span><select id="effort" aria-label="DeepSeek 推理档位"><option value="low">低</option><option value="medium">中</option><option value="high" selected>高</option><option value="xhigh">很高</option><option value="max">最大</option></select></label>
+          <label id="effortControl" class="compact-select" title="思考档位请在 Custom 参数中设置"><span id="effortLabel">推理</span><select id="effort" aria-label="Custom 推理档位"><option value="low">低</option><option value="medium">中</option><option value="high" selected>高</option><option value="xhigh">很高</option><option value="max">最大</option></select></label>
           <button id="workspaceButton" class="soft-btn hidden" type="button">文件 <span id="workspaceCount">0</span></button>
           <button id="providerButton" class="soft-btn">API</button>
           <button id="customSettingsButton" class="soft-btn hidden">Custom 参数</button>
@@ -123,9 +123,9 @@
       <section id="chatScroll" class="chat-scroll">
         <div id="welcome" class="welcome">
           <div class="welcome-orbit"><span id="welcomeOrbitMark">AI</span></div>
-          <p id="welcomeEyebrow" class="eyebrow">DEEPSEEK V4 FLASH</p>
-          <h1 id="welcomeTitle">问点需要查证的问题</h1>
-          <p id="welcomeDescription">模型会在 DeepSeek 服务端自行判断是否搜索，并在需要时多轮检索。</p>
+          <p id="welcomeEyebrow" class="eyebrow">CUSTOM · CHAT COMPLETIONS</p>
+          <h1 id="welcomeTitle">使用 Custom 本地联网</h1>
+          <p id="welcomeDescription">模型通过标准 Custom API 调用搜索与网页读取工具。</p>
           <div class="suggestions">
             <button data-prompt="搜索并梳理今天最重要的人工智能新闻，说明事件发生时间并附上来源。">今日 AI 动态</button>
             <button data-prompt="调查一个近期有争议的科技话题，分别列出各方证据和不确定之处。">多源调查</button>
@@ -147,7 +147,7 @@
                 <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.4 11.6 12 21a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 1 1 5.7 5.7l-9.2 9.2a2 2 0 1 1-2.9-2.8l8.6-8.6"></path></svg>
               </button>
               <input id="fileInput" class="hidden" type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,image/bmp,.pdf,.docx,.xlsx,.txt,.md,.markdown,.csv,.tsv,.json,.jsonl,.xml,.yaml,.yml,.log,.ini,.cfg,.conf,.py,.js,.ts,.jsx,.tsx,.html,.htm,.css,.scss,.sql,.sh,.java,.kt,.c,.h,.cpp,.hpp,.cs,.go,.rs,.rb,.php,.swift,.vue,.svelte">
-              <span id="nativePill" class="native-pill">● Native Web</span><select id="providerSelect"><option value="">请先添加 API</option></select>
+              <span id="nativePill" class="native-pill">● Custom</span><select id="providerSelect"><option value="">请先添加 API</option></select>
             </div>
             <div class="send-actions">
               <button id="stopButton" class="stop hidden" type="button">■ 停止</button>
@@ -155,7 +155,7 @@
             </div>
           </div>
         </form>
-        <p id="footnote" class="footnote">标准模式：Custom API 使用你选择的搜索与网页抓取方案；DeepSeek 使用服务端原生联网。</p>
+        <p id="footnote" class="footnote">标准模式：Custom API 使用你选择的搜索与网页抓取方案。</p>
       </footer>
     </main>
   </div>
@@ -165,12 +165,12 @@
     <p id="providerAccessNote" class="wide muted"></p>
     <div id="providerList" class="item-list"></div>
     <form id="providerForm" class="form-grid">
-      <label>配置名称<input id="providerName" placeholder="例如：我的 DeepSeek" required></label>
+      <label>配置名称<input id="providerName" placeholder="例如：我的 Custom API" required></label>
       <label>API Key<input id="providerKey" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="输入对应服务商 API Key" required></label>
-      <label>接口类型<select id="providerType"><option value="deepseek">DeepSeek · Responses（专用）</option><option value="custom">Custom · Chat Completions</option><option value="custom_response">Custom · Responses</option><option value="custom_messages">Custom · Messages（Anthropic）</option></select></label>
-      <label>API 地址<input id="providerBase" value="https://api.deepseek.com" required></label>
+      <label>接口类型<select id="providerType"><option value="custom">Custom · Chat Completions</option><option value="custom_response">Custom · Responses</option><option value="custom_messages">Custom · Messages（Anthropic）</option></select></label>
+      <label>API 地址<input id="providerBase" value="https://api.openai.com/v1" required></label>
       <label id="providerModelField">模型
-        <select id="providerModel"><option value="deepseek-v4-flash">deepseek-v4-flash</option><option value="deepseek-v4-pro">deepseek-v4-pro</option></select>
+        <select id="providerModel"><option value=""></option></select>
       </label>
       <label class="wide" id="manualModelField">手动模型名<textarea id="manualModel" rows="2" placeholder="Custom 可填写一个或多个模型名，每行一个；测试失败也可以直接保存"></textarea></label>
       <div id="customModelsPanel" class="wide custom-models-panel hidden">

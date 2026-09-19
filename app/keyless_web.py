@@ -230,7 +230,7 @@ class KeylessWebProvider:
                 "params": {
                     "protocolVersion": MCP_PROTOCOL,
                     "capabilities": {},
-                    "clientInfo": {"name": "deepseek-native-chat", "version": "1.0.0"},
+                    "clientInfo": {"name": "custom-native-chat", "version": "1.0.0"},
                 },
             },
         )

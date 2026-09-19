@@ -40,21 +40,19 @@ class ReasoningEffortTests(unittest.TestCase):
         )
         self.assertEqual(payload["reasoning_effort"], "xhigh")
 
-    def test_nvidia_deepseek_uses_chat_template_kwargs(self) -> None:
+    def test_generic_custom_model_uses_standard_reasoning_fields(self) -> None:
         payload: dict = {}
         _apply_thinking_options(
             payload,
             "https://integrate.api.nvidia.com/v1",
-            "deepseek-ai/deepseek-v4-flash",
+            "provider/model",
             "enabled",
             "medium",
             True,
             65536,
         )
-        self.assertEqual(
-            payload["chat_template_kwargs"],
-            {"thinking": True, "reasoning_effort": "medium"},
-        )
+        self.assertEqual(payload["thinking"], {"type": "enabled"})
+        self.assertEqual(payload["reasoning_effort"], "medium")
 
     def test_disabled_reasoning_effort_is_not_sent(self) -> None:
         payload: dict = {}

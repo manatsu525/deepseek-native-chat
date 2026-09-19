@@ -1,11 +1,10 @@
-# DeepSeek Native Chat
+# Custom Native Chat
 
-一个面向低配置 VPS 的私人 DeepSeek / Custom 聊天站。DeepSeek 使用服务端原生联网；Custom 使用标准 OpenAI Chat Completions，可选择 Parallel、Keenable、Tavily、Firecrawl、You.com 或 DDG + Jina 匿名联网方案，不安装 SearXNG 或浏览器。
+一个面向低配置 VPS 的私人 Custom 聊天站。所有模型都通过可配置的 Custom Chat Completions、Responses 或 Anthropic Messages 接入，并可选择 Parallel、Keenable、Tavily、Firecrawl、You.com 或 DDG + Jina 匿名联网方案，不安装 SearXNG 或浏览器。
 
 ## 功能
 
-- DeepSeek V4 Flash Responses API 原生多轮联网搜索
-- Custom OpenAI 兼容 Chat Completions 外部多轮搜索与网页读取
+- Custom Chat Completions、Responses 和 Anthropic Messages 外部多轮搜索与网页读取
 - 流式回答、思考过程、搜索步骤和来源折叠展示
 - 输入、缓存命中、输出和推理 Token 统计
 - 后台生成：刷新页面、切换应用或锁屏后任务继续运行
@@ -24,7 +23,7 @@
 - 手机和桌面端响应式界面
 - 浏览器自动上报 IANA 时区；Custom/MiMo 每次回答都会获得对应的当前本地日期，并要求按绝对日期核对“今天/最新”等时效性问题
 - 每个账号可以一键清空自己的全部聊天记录；级联删除消息、思考、搜索记录和任务后会截断 WAL 并压缩 SQLite，实际释放 VPS 磁盘空间
-- NVIDIA Build 的 DeepSeek V4 Flash/Pro 会按官方协议发送 `chat_template_kwargs.thinking` 与所选 `reasoning_effort` 档位，并兼容解析 `reasoning`/`reasoning_content`
+- 兼容部分托管模型的专用思考字段，并兼容解析 `reasoning`/`reasoning_content`
 - NVIDIA Nemotron 3 Ultra 使用 `enable_thinking`、工具兼容标志和 16K reasoning budget；GLM-5.2 使用 `thinking.enabled` 与所选 `reasoning_effort` 档位
 - 每个对话拥有隔离且持久的编码工作区。Custom 模型可列出、读取、搜索、创建、按原文片段原子批量修改（不依赖行号，文件一次完整读取）和删除 UTF-8 文本文件；网页端支持单文件和 ZIP 下载。`run_command` 可在 systemd 动态用户、断网、限时限内存的一次性工作区副本中执行任意 bash 命令（grep、构建、测试；副本里的文件改动不会保存），Python 文件也可用 `run_python` 运行验证；HTML 会解析并用 Node.js 检查内联脚本、事件处理器和本地 JS，独立 JavaScript 文件也可做语法检查。运行产生的文件不会写回持久工作区。删除对话时同步清理
 - Custom 的 Agent 模式直接在真实主机上工作，使用与普通模式相同的一套工具（list_files / read_file / write_file / edit_file / search_files / run_command / delete_file / check_web_syntax / update_plan）直接操作真实主机，另有对话和 Skill 管理工具；相对路径统一使用 `/home/share`，顶部文件面板也展示和下载该目录。`/home/share` 是共享持久目录，不随单个对话删除；它与普通聊天按会话隔离的工作区严格分开。内置编程、调试、验证、React、网页设计、对话管理和 Skill 管理 Skills，并可从 Git 或本地目录安装新 Skill。工具调用按模型发出的顺序串行执行；每个模型可设置上下文预算，超出后旧的工具结果会被压缩为一行存根，文件内容、任务计划（update_plan）和来源保留在检查点中
@@ -57,7 +56,7 @@ sudo ./install.sh
 
 默认访问地址为 `https://服务器IP:8000`。证书为自签证书，首次访问需要在浏览器中确认继续。
 
-进入页面后，在右上角打开“API”，接口类型分为四种：DeepSeek 专用 Responses、Custom Chat Completions、Custom Responses 和 Custom Messages（Anthropic）。填写 Custom API 地址和 API Key 后，点击“测试并读取模型”；`/models` 返回的模型会以复选框显示，也可以手动填写不在列表中的模型名并测试。DeepSeek 使用 `https://api.deepseek.com`，Chat/Responses 默认使用 `https://api.openai.com/v1`，Messages 默认使用 `https://api.anthropic.com/v1`，均可改成兼容平台地址。协议是每条 API 配置的一部分，不会根据模型名自动猜测；同一平台需要多种协议时请分别添加配置。
+进入页面后，在右上角打开“API”，接口类型分为三种：Custom Chat Completions、Custom Responses 和 Custom Messages（Anthropic）。填写 API 地址和 API Key 后，点击“测试并读取模型”；`/models` 返回的模型会以复选框显示，也可以手动填写不在列表中的模型名并测试。Chat/Responses 默认使用 `https://api.openai.com/v1`，Messages 默认使用 `https://api.anthropic.com/v1`，均可改成兼容平台地址。协议是每条 API 配置的一部分，不会根据模型名自动猜测；同一平台需要多种协议时请分别添加配置。
 
 升级旧版本时，原来的 MiMo API 配置会自动迁移为 Custom，已保存的模型和对话不会删除。
 
@@ -79,7 +78,7 @@ sudo ./uninstall.sh --yes
 
 ## 设计说明
 
-DeepSeek 使用官方 `/responses` 路由及原生联网。Custom Chat 使用标准 `/chat/completions`，Custom Responses 使用标准 `/responses`，Custom Messages 使用 Anthropic `/messages`；普通 Custom 聊天由本机后端提供 `web_search`、`fetch_webpage` 和按会话隔离的工作区工具。单独的 Custom Agent 模式提供真实主机工具、对话管理、Skill 管理和前端页面管理，Agent 相对路径和文件展示统一指向 `/home/share`，不再使用四智能体协作；普通模式的路由、提示词、工作区和工具额度保持独立。Messages 会转换 system、图片、tool use/tool result、thinking 及签名块，并发送 `x-api-key` 和 `anthropic-version` 请求头。默认方案匿名连接 Parallel 官方 Streamable HTTP MCP；也可以手动选择 Keenable、Tavily Keyless、Firecrawl Keyless、You.com Free 或 DDG + Jina。选择后，搜索与抓取固定使用对应的一组实现，不自动切换、不 fallback、不同 provider 之间不并发。You.com Free 只提供搜索，因此它是唯一复用现有 Jina Reader 抓取的新增方案。查询词和待读取 URL 会发送给当前选择的服务。
+Custom Chat 使用标准 `/chat/completions`，Custom Responses 使用标准 `/responses`，Custom Messages 使用 Anthropic `/messages`；普通 Custom 聊天由本机后端提供 `web_search`、`fetch_webpage` 和按会话隔离的工作区工具。单独的 Custom Agent 模式提供真实主机工具、对话管理、Skill 管理和前端页面管理，Agent 相对路径和文件展示统一指向 `/home/share`，不再使用四智能体协作；普通模式的路由、提示词、工作区和工具额度保持独立。Messages 会转换 system、图片、tool use/tool result、thinking 及签名块，并发送 `x-api-key` 和 `anthropic-version` 请求头。默认方案匿名连接 Parallel 官方 Streamable HTTP MCP；也可以手动选择 Keenable、Tavily Keyless、Firecrawl Keyless、You.com Free 或 DDG + Jina。选择后，搜索与抓取固定使用对应的一组实现，不自动切换、不 fallback、不同 provider 之间不并发。You.com Free 只提供搜索，因此它是唯一复用现有 Jina Reader 抓取的新增方案。查询词和待读取 URL 会发送给当前选择的服务。
 
 新增匿名 MCP 由独立的轻量客户端适配：Keenable 调用 `https://api.keenable.ai/mcp` 的 `search_web_pages` / `fetch_page_content`，抓取固定发送 `live=true`；Tavily 调用 `https://mcp.tavily.com/mcp/` 的 `tavily_search` / `tavily_extract`，每次请求固定发送 `X-Tavily-Access-Mode: keyless`；Firecrawl 调用 `https://mcp.firecrawl.dev/v2/mcp`，只使用 `firecrawl_search` / `firecrawl_scrape`；You.com 调用 `https://api.you.com/mcp?profile=free` 的 `you-search`，抓取则直接复用原来的 Jina Reader。四种服务的原始响应都会归一化为相同的标题、URL、摘要和正文格式，再作为 `tool` 消息回传给 LLM。
 
@@ -87,11 +86,11 @@ DeepSeek 使用官方 `/responses` 路由及原生联网。Custom Chat 使用标
 
 前端发起问题时会同时提交浏览器的 IANA 时区（如 `Asia/Shanghai`）。后端只把“当前本地日期 + 时区”追加到 Custom 的固定系统提示词末尾，并要求模型把“今天、昨天、明天、目前、最新”等相对时间转换为绝对日期，核对来源的发布/事件日期，禁止把搜索返回的最新一篇误当作当天资料。日期每天只变化一次，且放在静态提示之后，以尽量保留固定前缀的缓存价值；旧客户端未提交时区时使用 UTC。
 
-Custom 的 `thinking` 和 `reasoning_effort` 都由用户控制：每个模型在“Custom 参数”中独立保存 `thinking` 开/关、`reasoning_effort` 档位和发送开关，档位为 Low、Medium、High、Extra High 或 Max，默认 High；同一处还可以手动勾选最低价路由聚合商。OpenRouter 勾选后追加 `:floor`，Vercel AI Gateway 勾选后发送 `providerOptions.gateway.sort=cost`，默认不改写任何请求。DeepSeek 仍使用顶部推理档位。MiMo、NVIDIA DeepSeek V4 和 NVIDIA Nemotron 3 Ultra 使用其官方请求方言，其他 Custom 使用通用顶层 `thinking` / `reasoning_effort`；OpenAI 兼容协议本身并未标准化这两个扩展字段，因此不兼容的供应商可能返回参数错误，此时可在 Custom 参数中分别关闭。后端兼容解析 `reasoning` / `reasoning_content` 输出。工具额度结束后，后端会强制进入最终作答阶段；模型若把工具请求伪装成 `<tool_call>` 文本，该输出不会被保存为答案，而会进行一次受限纠正。
+Custom 的 `thinking` 和 `reasoning_effort` 都由用户控制：每个模型在“Custom 参数”中独立保存 `thinking` 开/关、`reasoning_effort` 档位和发送开关，档位为 Low、Medium、High、Extra High 或 Max，默认 High；同一处还可以手动勾选最低价路由聚合商。OpenRouter 勾选后追加 `:floor`，Vercel AI Gateway 勾选后发送 `providerOptions.gateway.sort=cost`，默认不改写任何请求。MiMo、NVIDIA Nemotron 3 Ultra 等少数模型使用其官方请求方言，其他 Custom 使用通用顶层 `thinking` / `reasoning_effort`；OpenAI 兼容协议本身并未标准化这两个扩展字段，因此不兼容的供应商可能返回参数错误，此时可在 Custom 参数中分别关闭。后端兼容解析 `reasoning` / `reasoning_content` 输出。工具额度结束后，后端会强制进入最终作答阶段；模型若把工具请求伪装成 `<tool_call>` 文本，该输出不会被保存为答案，而会进行一次受限纠正。
 
 备用方案的 `fetch_webpage` 把公开 URL 交给 `https://r.jina.ai/`，得到干净 Markdown 后作为 `tool` 结果回传给 Custom。Jina Reader 不需要 API Key；后端按约 20 次/分钟做进程级节流，每个回答最多读取 3 页，每页最多保留约 8,000 字符，并设置 `X-Respond-With: markdown`、`X-Timeout: 30` 和 `X-Remove-Selector`，自动移除常见 header、nav、aside、footer、sidebar、菜单、广告和 cookie 弹窗元素。Jina 官方支持通过 `X-Remove-Selector` 排除这些 CSS 选择器；如果目标站点有明确的文章容器，后续还可以针对该站点增加 `X-Target-Selector`。
 
-DeepSeek 当前会忽略 Responses API 的 `max_tool_calls`。项目在系统提示中要求单次回答最多搜索五次，但无法像客户端工具循环一样做强制的逐次拦截；实际搜索次数以 DeepSeek 服务端执行结果为准。
+Custom Responses 的工具循环由本机统一管理，并按当前配置的工具额度执行。
 
 输入框左下角的回形针可以一次选择多个附件。每条消息最多 10 个，所有原始文件合计最多 50MB。浏览器逐个上传，服务器以数据流落盘，处理完成后立即删除原文件：
 
@@ -100,11 +99,11 @@ DeepSeek 当前会忽略 Responses API 的 `max_tool_calls`。项目在系统提
 - DOCX：流式读取正文 XML；XLSX：最多读取前 5 个工作表和每表 2,000 行，并限制共享字符串内存。
 - 常见文本、Markdown、CSV、JSON 和代码文件：按文本读取。旧版 `.doc`、`.xls` 需要先另存为 `.docx`、`.xlsx`。
 
-一次回答中的全部文档摘录最多 80,000 字符。已发送附件随所属对话保留，因此可以对带附件的问题执行“重新回答”；删除对话或普通对话超过 100 条被自动清理时，附件文件会同步删除。尚未发送的附件按草稿保留，刷新页面可以恢复，超过 24 小时会自动清理。DeepSeek Responses 路由仍不接收图片，但可以使用已提取为文字的文档；图片请切换到支持视觉的 Custom 模型。
+一次回答中的全部文档摘录最多 80,000 字符。已发送附件随所属对话保留，因此可以对带附件的问题执行“重新回答”；删除对话或普通对话超过 100 条被自动清理时，附件文件会同步删除。尚未发送的附件按草稿保留，刷新页面可以恢复，超过 24 小时会自动清理。图片是否可用由当前 Custom 上游模型决定；不支持视觉输入时请切换模型或改用文字附件。
 
 ## 数据与安全
 
-Custom Responses 默认发送 `store:true`，成功响应的 ID 随助手消息保存在本地数据库。工具轮次通过 `previous_response_id` 只回填新增工具结果；下一条用户消息通过同一 ID 链续接。每次请求重新发送 `instructions`，工具可用性仍按原额度变化。会话、用户、API 配置、密钥、模型或聊天模式变化时不复用旧链；重新回答使用被重试问题之前的父状态。Chat Completions、Anthropic Messages 和原生 DeepSeek 路由保持原逻辑。
+Custom Responses 默认发送 `store:true`，成功响应的 ID 随助手消息保存在本地数据库。工具轮次通过 `previous_response_id` 只回填新增工具结果；下一条用户消息通过同一 ID 链续接。每次请求重新发送 `instructions`，工具可用性仍按原额度变化。会话、用户、API 配置、密钥、模型或聊天模式变化时不复用旧链；重新回答使用被重试问题之前的父状态。Chat Completions、Anthropic Messages 和 Custom Responses 各自保持对应协议逻辑。
 
 只有完整成功响应的 ID 才会保存。上游不返回可存储 ID，或明确拒绝 `store` / `previous_response_id` 时，该聊天转为本地历史回填；状态错误仅在消费输出之前补发一次，不重复执行工具，503/429 等错误不自动重试。高级 JSON 的 `store:false` 可禁用状态续接，`previous_response_id` / `conversation` 由服务端管理。上下文压缩或丢弃未执行的工具调用时，从本地有效历史建立新链。状态模式仍会计费历史输入，缓存命中及价格取决于上游，不能保证降低账单。
 
