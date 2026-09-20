@@ -198,11 +198,16 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["incomplete"])
         self.assertIsNone(result["plan"])
 
-    async def test_503_retries_immediately_and_reports_recovery(self):
-        result, payloads, _, updates = await self.run_loop(
-            [["hello"]], status_sequence=[503, 503]
-        )
+    async def test_503_waits_five_seconds_and_reports_recovery(self):
+        delays = []
+        async def fake_sleep(seconds):
+            delays.append(seconds)
+        with patch.object(mimo_local.asyncio, "sleep", fake_sleep):
+            result, payloads, _, updates = await self.run_loop(
+                [["hello"]], status_sequence=[503, 503]
+            )
         self.assertEqual(len(payloads), 3)
+        self.assertEqual(delays, [5, 5])
         self.assertEqual(result["retry_status"]["status"], "recovered")
         self.assertEqual(result["retry_status"]["attempt"], 2)
         self.assertTrue(any(item.get("retry_status", {}).get("active") for item in updates))

@@ -530,7 +530,7 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
   const searches = meta.searches || [];
   const planSteps = (meta.plan && meta.plan.steps) || [];
   const retryStatus = meta.retry_status || {};
-  const retryMessage = retryStatus.message || (retryStatus.active ? `上游返回 503，正在重试（第 ${retryStatus.attempt || 0}/${retryStatus.max_attempts || 60} 次）` : '');
+  const retryMessage = retryStatus.message || (retryStatus.active ? `上游返回 503，5 秒后重试（第 ${retryStatus.attempt || 0}/${retryStatus.max_attempts || 60} 次）` : '');
   const retryHtml = retryMessage ? `<div class="retry-status ${retryStatus.status === 'recovered' ? 'recovered' : retryStatus.status === 'failed' ? 'failed' : ''}">${escapeHtml(retryMessage)}</div>` : '';
   const planLabels = {pending:'待处理',in_progress:'执行中',done:'已完成',blocked:'受阻'};
   const planHtml = planSteps.length ? `<div class="search-step"><strong>执行计划</strong><ol>${planSteps.map(s=>`<li>${escapeHtml(planLabels[s.status]||s.status)} · ${escapeHtml(s.step)}${s.outcome?`<div>${escapeHtml(s.outcome)}</div>`:''}</li>`).join('')}</ol></div>` : '';

@@ -103,6 +103,7 @@ FINAL_ANSWER_ATTEMPTS = 2
 MAX_AGENT_TOOL_ROUNDS = 40
 AGENT_HOST_TOOL_ROUNDS = 96
 MAX_503_RETRIES = 60
+HTTP_503_RETRY_DELAY_SECONDS = 5
 PARALLEL_MAX_SEARCH_EXCERPT_CHARS = 1200
 WORKSPACE_ARGUMENT_COMPACT_THRESHOLD = 4096
 # Keep ordinary freshly-created files in the next requests so the model can
@@ -997,7 +998,7 @@ async def stream_response(
         """Persist a visible status while the upstream is temporarily unavailable."""
         nonlocal retry_status
         if status == "retrying":
-            message = f"上游返回 503，正在重试（第 {attempt}/{MAX_503_RETRIES} 次）"
+            message = f"上游返回 503，{HTTP_503_RETRY_DELAY_SECONDS} 秒后重试（第 {attempt}/{MAX_503_RETRIES} 次）"
             active = True
         elif status == "recovered":
             message = f"上游已恢复（已重试 {attempt} 次）"
@@ -1262,7 +1263,7 @@ async def stream_response(
                                     f"Custom API 503: 已重试 {MAX_503_RETRIES} 次仍失败：{body}"
                                 )
                             await publish_503_retry(retry_index + 1, "retrying", body)
-                            # No backoff: a 503 is retried immediately as requested.
+                            await asyncio.sleep(HTTP_503_RETRY_DELAY_SECONDS)
                             continue
                         if retry_index:
                             await publish_503_retry(retry_index, "recovered")
