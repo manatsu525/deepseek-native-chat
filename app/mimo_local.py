@@ -2082,7 +2082,17 @@ async def stream_response(
                                     created=name in HOST_WRITE_TOOLS,
                                 )
                     elif is_plan:
-                        result_text = plan.apply(arguments)
+                        result_text = plan.apply(
+                            arguments,
+                            debug_context={
+                                "conversation_id": conversation_id,
+                                "call_id": call_id,
+                                "round": round_number + 1,
+                                "tool_round": tool_rounds_used,
+                                "api_protocol": api_protocol,
+                                "model": model,
+                            },
+                        )
                         step["status"] = "completed"
                     elif is_load:
                         groups = requested_groups(arguments, deferrable_groups)

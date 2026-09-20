@@ -9,6 +9,7 @@ compaction, instead of re-deriving the approach every round.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import copy
 from typing import Any
@@ -20,6 +21,23 @@ STEP_ALIASES = ("step", "title", "description", "task", "content", "text", "name
 STATUS_ALIASES = {"todo": "pending", "not_started": "pending", "open": "pending", "doing": "in_progress",
                   "active": "in_progress", "wip": "in_progress", "completed": "done", "complete": "done",
                   "finished": "done", "closed": "done"}
+
+# Temporary diagnostics for the execution-plan rollout. This intentionally
+# logs only update_plan documents and plan receipts (not prompts, file bodies,
+# API keys, or ordinary tool arguments). Remove this block after the plan
+# contract has been stabilized.
+_PLAN_DEBUG_LOGGER = logging.getLogger("app.plan.debug")
+_PLAN_DEBUG_MAX_CHARS = 24_000
+
+
+def _plan_debug_json(value: Any) -> str:
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        encoded = repr(value)
+    if len(encoded) <= _PLAN_DEBUG_MAX_CHARS:
+        return encoded
+    return encoded[:_PLAN_DEBUG_MAX_CHARS] + f"...[truncated chars={len(encoded)}]"
 
 UPDATE_PLAN_TOOL = {
     "type": "function",
@@ -209,10 +227,76 @@ class ExecutionPlan(TaskPlan):
         if self.needs_plan:
             raise ValueError("当前处于规划阶段：先调用 update_plan 建立或调整计划并指定一个 in_progress 步骤，再执行工具。")
 
-    def apply(self, arguments: dict[str, Any]) -> str:
+    def _debug_snapshot(self) -> dict[str, Any]:
+        return {
+            "steps": copy.deepcopy(self.steps),
+            "note": self.note,
+            "updates": self.updates,
+            "operations": self.operations,
+            "serial": self.serial,
+            "receipts": {
+                key: [
+                    {"id": item.get("id"), "tool": item.get("tool"), "status": item.get("status"),
+                     "path": item.get("path"), "result": item.get("result")}
+                    for item in values
+                ]
+                for key, values in self.receipts.items()
+            },
+        }
+
+    def _debug_event(
+        self,
+        event: str,
+        arguments: dict[str, Any],
+        before: dict[str, Any],
+        *,
+        context: dict[str, Any] | None = None,
+        candidate: Any = None,
+        **details: Any,
+    ) -> None:
+        record: dict[str, Any] = {
+            "event": event,
+            "context": context or {},
+            "arguments": arguments,
+            "before": before,
+            "after": self._debug_snapshot(),
+        }
+        if candidate is not None:
+            record["candidate"] = copy.deepcopy(candidate)
+        if details:
+            record["details"] = details
+        _PLAN_DEBUG_LOGGER.warning("PLAN_DEBUG %s", _plan_debug_json(record))
+
+    def _reject_plan_update(
+        self,
+        message: str,
+        arguments: dict[str, Any],
+        before: dict[str, Any],
+        *,
+        context: dict[str, Any] | None = None,
+        candidate: Any = None,
+        **details: Any,
+    ) -> None:
+        self._debug_event(
+            "rejected",
+            arguments,
+            before,
+            context=context,
+            candidate=candidate,
+            reason=message,
+            **details,
+        )
+        raise ValueError(message)
+
+    def apply(self, arguments: dict[str, Any], *, debug_context: dict[str, Any] | None = None) -> str:
+        before = self._debug_snapshot()
+        self._debug_event("received", arguments, before, context=debug_context)
         raw = arguments.get("steps")
         if not isinstance(raw, list) or not raw or len(raw) > MAX_PLAN_ITEMS:
-            raise ValueError("steps 必须包含 1–20 个完整步骤")
+            self._reject_plan_update(
+                "steps 必须包含 1–20 个完整步骤", arguments, before, context=debug_context,
+                raw_type=type(raw).__name__, raw_length=len(raw) if isinstance(raw, list) else None,
+            )
         reason = str(arguments.get("replan_reason") or "").strip()[:1000]
         previous = {s["id"]: s for s in self.steps}
         titles = {s["step"]: s for s in self.steps}
@@ -220,13 +304,22 @@ class ExecutionPlan(TaskPlan):
         serial = self.serial
         for item in raw:
             if not isinstance(item, dict) or item.get("status") not in STATUSES:
-                raise ValueError("每个步骤需要 step 和有效的 status")
+                self._reject_plan_update(
+                    "每个步骤需要 step 和有效的 status", arguments, before, context=debug_context,
+                    candidate=candidate, invalid_item=item,
+                )
             title = " ".join(str(item.get("step") or "").split())[:MAX_ITEM_CHARS]
             if not title:
-                raise ValueError("步骤描述不能为空")
+                self._reject_plan_update(
+                    "步骤描述不能为空", arguments, before, context=debug_context,
+                    candidate=candidate, invalid_item=item,
+                )
             old = previous.get(str(item.get("id") or "")) if item.get("id") else titles.get(title)
             if item.get("id") and not old:
-                raise ValueError("未知步骤 ID；新增步骤请省略 id")
+                self._reject_plan_update(
+                    "未知步骤 ID；新增步骤请省略 id", arguments, before, context=debug_context,
+                    candidate=candidate, invalid_id=item.get("id"), known_ids=sorted(previous),
+                )
             if not old:
                 serial += 1
             step = {"id": old["id"] if old else f"s{serial}", "step": title, "status": item["status"],
@@ -236,31 +329,65 @@ class ExecutionPlan(TaskPlan):
             if step["status"] == "done" and status_changed:
                 available = {r["id"] for r in self.receipts.get(step["id"], []) if r["status"] == "completed"}
                 evidence = item.get("evidence") or []
-                if not old or old["status"] != "in_progress" or old["step"] != title or not step["outcome"] or not isinstance(evidence, list) or not evidence or any(not isinstance(e, str) or e not in available for e in evidence):
-                    raise ValueError("完成步骤需要先执行该当前步骤，再提供 outcome 和该步骤成功工具调用的 evidence ID")
+                evidence_types = [type(item). __name__ for item in evidence] if isinstance(evidence, list) else []
+                invalid_evidence = [e for e in evidence if not isinstance(e, str) or e not in available] if isinstance(evidence, list) else evidence
+                if not old or old["status"] != "in_progress" or old["step"] != title or not step["outcome"] or not isinstance(evidence, list) or not evidence or invalid_evidence:
+                    self._reject_plan_update(
+                        "完成步骤需要先执行该当前步骤，再提供 outcome 和该步骤成功工具调用的 evidence ID",
+                        arguments, before, context=debug_context, candidate=candidate + [step],
+                        validation="done_transition",
+                        step_id=step["id"], old_step=old, available_evidence=sorted(available),
+                        supplied_evidence=evidence, invalid_evidence=invalid_evidence,
+                        evidence_types=evidence_types, has_outcome=bool(step["outcome"]),
+                    )
                 step["evidence"] = evidence[:8]
             if step["status"] == "blocked" and not step["outcome"]:
-                raise ValueError("blocked 步骤必须用 outcome 说明缺失条件")
+                self._reject_plan_update(
+                    "blocked 步骤必须用 outcome 说明缺失条件", arguments, before, context=debug_context,
+                    candidate=candidate + [step], validation="blocked_outcome", step_id=step["id"],
+                )
             if old and old["status"] == "done" and step != old and not reason:
-                raise ValueError("修改已完成步骤需要 replan_reason")
+                self._reject_plan_update(
+                    "修改已完成步骤需要 replan_reason", arguments, before, context=debug_context,
+                    candidate=candidate + [step], validation="completed_step_changed", step_id=step["id"],
+                )
             if old and old["status"] == "done" and step != old and step["status"] != "in_progress":
-                raise ValueError("返工已完成步骤时，先用相同 ID 设为 in_progress，再执行并提交新证据")
+                self._reject_plan_update(
+                    "返工已完成步骤时，先用相同 ID 设为 in_progress，再执行并提交新证据",
+                    arguments, before, context=debug_context, candidate=candidate + [step],
+                    validation="completed_step_reactivation", step_id=step["id"],
+                )
             if old and old["status"] != "in_progress" and step["status"] == "in_progress":
                 step["evidence"] = []
                 step["outcome"] = ""
             candidate.append(step)
         ids = [s["id"] for s in candidate]
         if len(set(ids)) != len(ids) or len({s["step"] for s in candidate}) != len(candidate):
-            raise ValueError("步骤不能重复")
+            self._reject_plan_update(
+                "步骤不能重复", arguments, before, context=debug_context, candidate=candidate,
+                validation="duplicate_step_or_id", ids=ids,
+            )
         active_count = sum(s["status"] == "in_progress" for s in candidate)
         if active_count > 1 or (any(s["status"] == "pending" for s in candidate) and active_count != 1):
-            raise ValueError("有待处理步骤时必须且只能有一个 in_progress 步骤")
+            self._reject_plan_update(
+                "有待处理步骤时必须且只能有一个 in_progress 步骤", arguments, before,
+                context=debug_context, candidate=candidate, validation="active_step_count",
+                active_count=active_count, pending_count=sum(s["status"] == "pending" for s in candidate),
+            )
         structural_change = [(s["id"], s["step"]) for s in candidate] != [(s["id"], s["step"]) for s in self.steps]
         deferred = self.active and next((s["status"] for s in candidate if s["id"] == self.active["id"]), "removed") == "pending"
         if self.steps and (structural_change or deferred) and not reason:
-            raise ValueError("调整步骤或推迟当前步骤需要 replan_reason，说明新发现")
+            self._reject_plan_update(
+                "调整步骤或推迟当前步骤需要 replan_reason，说明新发现", arguments, before,
+                context=debug_context, candidate=candidate, validation="structural_change_without_reason",
+                structural_change=structural_change, deferred=bool(deferred),
+            )
         if any(s["status"] == "done" and s["id"] not in ids for s in self.steps):
-            raise ValueError("保留已完成步骤作为执行记录；需要返工时用相同 ID 重新激活")
+            self._reject_plan_update(
+                "保留已完成步骤作为执行记录；需要返工时用相同 ID 重新激活", arguments, before,
+                context=debug_context, candidate=candidate, validation="completed_step_removed",
+                removed_done_ids=[s["id"] for s in self.steps if s["status"] == "done" and s["id"] not in ids],
+            )
         if reason:
             self.revisions = (self.revisions + [{"reason": reason, "previous": copy.deepcopy(self.steps)}])[-5:]
         for s in candidate:
@@ -271,6 +398,8 @@ class ExecutionPlan(TaskPlan):
         if "note" in arguments:
             self.note = str(arguments.get("note") or "")[:1000]
         self.updates += 1
+        self._debug_event("accepted", arguments, before, context=debug_context, candidate=candidate,
+                          replan_reason=reason)
         return json.dumps({"ok": True, "plan": self.export()}, ensure_ascii=False)
 
     def record(self, call_id: str, name: str, status: str, path: str, result: str) -> None:

@@ -22,8 +22,11 @@ class ExecutionPlanTests(unittest.TestCase):
         proposed[0].update(status="done", outcome="wrote file", evidence=["write1"])
         proposed[1]["status"] = "in_progress"
         before = p.export()
-        with self.assertRaises(ValueError):
-            p.apply({"steps": proposed})
+        with self.assertLogs("app.plan.debug", level="WARNING") as logs:
+            with self.assertRaises(ValueError):
+                p.apply({"steps": proposed})
+        self.assertIn('"validation": "done_transition"', "\n".join(logs.output))
+        self.assertIn('"available_evidence"', "\n".join(logs.output))
         self.assertEqual(p.export(), before)
         p.record("write1", "write_file", "failed", "a.py", "error")
         with self.assertRaises(ValueError):
