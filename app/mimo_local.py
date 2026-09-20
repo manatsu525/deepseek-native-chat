@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -101,6 +102,7 @@ class ToolQuotaExceeded(RuntimeError):
 FINAL_ANSWER_ATTEMPTS = 2
 MAX_AGENT_TOOL_ROUNDS = 40
 AGENT_HOST_TOOL_ROUNDS = 96
+MAX_503_RETRIES = 60
 PARALLEL_MAX_SEARCH_EXCERPT_CHARS = 1200
 WORKSPACE_ARGUMENT_COMPACT_THRESHOLD = 4096
 # Keep ordinary freshly-created files in the next requests so the model can
@@ -942,6 +944,7 @@ async def stream_response(
     force_final_answer = False
     plan = ExecutionPlan(initial_plan)
     plan_final_retries = 0
+    retry_status: dict[str, Any] = {}
     if initial_plan and plan.steps:
         conversation.append({"role": "user", "content": plan.runtime_note()})
         response_chain.reset()
@@ -989,6 +992,43 @@ async def stream_response(
     web_round_limit = max(0, int(web_tool_round_limit)) if agent_mode else max(0, min(MIMO_MAX_TOOL_ROUNDS, int(web_tool_round_limit)))
     # A web budget that is empty from the start never lists the tools at all.
     web_tools_offered = web_enabled and web_round_limit > 0 and (search_limit > 0 or fetch_limit > 0)
+
+    async def publish_503_retry(attempt: int, status: str, error: str = "") -> None:
+        """Persist a visible status while the upstream is temporarily unavailable."""
+        nonlocal retry_status
+        if status == "retrying":
+            message = f"上游返回 503，正在重试（第 {attempt}/{MAX_503_RETRIES} 次）"
+            active = True
+        elif status == "recovered":
+            message = f"上游已恢复（已重试 {attempt} 次）"
+            active = False
+        else:
+            message = f"上游连续返回 503，已重试 {MAX_503_RETRIES} 次，任务失败"
+            active = False
+        retry_status = {
+            "active": active,
+            "status": status,
+            "attempt": int(attempt),
+            "max_attempts": MAX_503_RETRIES,
+            "message": message,
+        }
+        if error:
+            retry_status["error"] = str(error)[:500]
+        await update(
+            {
+                "answer": answer,
+                "reasoning": reasoning,
+                "searches": steps,
+                "usage": usage,
+                "sources": list(sources.values()),
+                "web_evidence": web_evidence,
+                "plan": plan.export(),
+                "tool_trace": tool_trace,
+                "round_stats": round_stats,
+                "retry_status": retry_status,
+            }
+        )
+
     async with (
         httpx.AsyncClient(timeout=api_limits) as api_client,
         search_context as search_client,
@@ -1196,12 +1236,40 @@ async def stream_response(
             if before_model_call is not None:
                 before_model_call()
             endpoint = "/responses" if responses_protocol else "/messages" if messages_protocol else "/chat/completions"
-            stream_context = (
-                response_chain.stream(api_client, "POST", _url(base_url, endpoint),
-                                      headers=headers, json=payload, full_input=full_response_input)
-                if responses_protocol else
-                api_client.stream("POST", _url(base_url, endpoint), headers=headers, json=payload)
-            )
+            @asynccontextmanager
+            async def open_model_stream():
+                for retry_index in range(MAX_503_RETRIES + 1):
+                    if stopped():
+                        raise asyncio.CancelledError
+                    stream_context = (
+                        response_chain.stream(
+                            api_client,
+                            "POST",
+                            _url(base_url, endpoint),
+                            headers=headers,
+                            json=payload,
+                            full_input=full_response_input,
+                        )
+                        if responses_protocol else
+                        api_client.stream("POST", _url(base_url, endpoint), headers=headers, json=payload)
+                    )
+                    async with stream_context as candidate:
+                        if candidate.status_code == 503:
+                            body = (await candidate.aread()).decode(errors="replace")[:1000]
+                            if retry_index >= MAX_503_RETRIES:
+                                await publish_503_retry(MAX_503_RETRIES, "failed", body)
+                                raise RuntimeError(
+                                    f"Custom API 503: 已重试 {MAX_503_RETRIES} 次仍失败：{body}"
+                                )
+                            await publish_503_retry(retry_index + 1, "retrying", body)
+                            # No backoff: a 503 is retried immediately as requested.
+                            continue
+                        if retry_index:
+                            await publish_503_retry(retry_index, "recovered")
+                        yield candidate
+                        return
+
+            stream_context = open_model_stream()
             async with stream_context as response:
                 if response.status_code >= 400:
                     body = (await response.aread()).decode(errors="replace")[:2000]
@@ -2283,6 +2351,7 @@ async def stream_response(
         "incomplete": tool_budget_exhausted or plan.unfinished,
         "incomplete_reason": "plan_unfinished" if plan.unfinished else "",
         "plan": plan.export(),
+        "retry_status": retry_status,
         "tool_round_limit": role_tool_round_limit,
         "agent_mode": bool(agent_mode),
         "response": {"tool_trace": tool_trace, "agent_mode": bool(agent_mode)},

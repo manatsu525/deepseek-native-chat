@@ -426,7 +426,7 @@ def public_provider(row: dict[str, Any]) -> dict[str, Any]:
 
 def public_job(row: dict[str, Any]) -> dict[str, Any]:
     row = dict(row)
-    for name, fallback in (("searches_json", []), ("sources_json", []), ("usage_json", {}), ("agents_json", []), ("plan_json", {})):
+    for name, fallback in (("searches_json", []), ("sources_json", []), ("usage_json", {}), ("agents_json", []), ("plan_json", {}), ("retry_status_json", {})):
         row[name.removesuffix("_json")] = db.decode(row.pop(name, ""), fallback)
     row["stop_requested"] = bool(row["stop_requested"])
     if row.get("provider_type") == "mimo":
@@ -699,6 +699,15 @@ async def _execute_job(job_id: str) -> None:
         for key in ("tool_trace", "round_stats"):
             if key in state:
                 live_diagnostics[key] = list(state[key])
+        retry_state = state.get("retry_status")
+        if retry_state is not None:
+            live_diagnostics["retry_status"] = dict(retry_state)
+            # A 503 retry must be visible before the next poll, even though
+            # normal streaming updates are throttled to reduce SQLite writes.
+            db.update_job(
+                job_id,
+                retry_status_json=json.dumps(retry_state, ensure_ascii=False),
+            )
         state_evidence = state.get("web_evidence") or []
         if state_evidence:
             db.upsert_web_evidence(
@@ -708,7 +717,7 @@ async def _execute_job(job_id: str) -> None:
                 state_evidence,
             )
         stamp = time.monotonic()
-        if stamp - last_write < 0.35 and not state.get("usage"):
+        if stamp - last_write < 0.35 and not state.get("usage") and retry_state is None:
             return
         last_write = stamp
         db.update_job(
@@ -821,6 +830,8 @@ async def _execute_job(job_id: str) -> None:
             meta["incomplete"] = True
         if result.get("plan"):
             meta["plan"] = result["plan"]
+        if result.get("retry_status"):
+            meta["retry_status"] = result["retry_status"]
         if kind == "custom_response" and result.get("responses_state"):
             meta["responses_state"] = {**result["responses_state"], "scope": response_scope}
             record_responses_capability(capability_key, result["responses_state"])
@@ -839,6 +850,7 @@ async def _execute_job(job_id: str) -> None:
             usage_json=json.dumps(result["usage"], ensure_ascii=False),
             agents_json=json.dumps(result.get("agents", []), ensure_ascii=False),
             plan_json=json.dumps(result.get("plan") or {}, ensure_ascii=False),
+            retry_status_json=json.dumps(result.get("retry_status") or {}, ensure_ascii=False),
         )
     except asyncio.CancelledError:
         partial = db.one("SELECT answer, reasoning, searches_json, sources_json, usage_json, agents_json FROM jobs WHERE id=?", (job_id,)) or {}

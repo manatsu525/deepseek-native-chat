@@ -18,3 +18,4 @@
 .history-pin,.history-delete{opacity:1;border:0;background:transparent;color:#8190a7;padding:4px;font-size:14px;line-height:1}
 .history-pin{color:#e6c86a}
 .history-pin:hover,.history-delete:hover{color:white}
+.retry-status{color:#a56a18;font-size:11px;line-height:1.5;margin:4px 0 8px;padding-left:2px}.retry-status.recovered{color:#32835d}.retry-status.failed{color:var(--danger)}

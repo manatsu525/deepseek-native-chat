@@ -92,6 +92,12 @@ class ResponsesState:
         # any generated output. 503/429/auth errors are never auto-retried.
         for attempt in range(2):
             async with client.stream(method, url, headers=headers, json=json) as response:
+                # Let the shared retry controller observe 503. Other HTTP
+                # errors remain handled here because Responses state fallback
+                # needs to inspect their body.
+                if response.status_code == 503:
+                    yield response
+                    return
                 if response.status_code >= 400:
                     body = (await response.aread()).decode(errors="replace")[:2000]
                     lowered = body.lower()

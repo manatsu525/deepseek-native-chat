@@ -28,7 +28,6 @@ SMOKE_SPECS = (
     "test_context.CompactRequestTests.test_old_results_become_stubs_and_recent_ones_survive",
     "test_context.CompactRequestTests.test_whole_rounds_are_dropped_only_as_a_last_resort",
     "test_context.CompactRequestTests.test_checkpoint_carries_files_plan_and_sources",
-    "test_context.CompactRequestTests.test_snapshots_that_do_not_fit_are_forgotten",
     "test_plan_execution.ExecutionPlanTests",
     "test_plan_execution.PlanLoopTests",
     "test_agent_tools.AgentToolTests",

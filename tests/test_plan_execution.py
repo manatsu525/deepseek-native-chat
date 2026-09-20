@@ -96,12 +96,14 @@ class ExecutionPlanTests(unittest.TestCase):
 
 
 class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
-    async def run_loop(self, rounds, protocol="chat_completions"):
+    async def run_loop(self, rounds, protocol="chat_completions", status_sequence=None):
         payloads, executed, updates = [], [], []
+        statuses = list(status_sequence or [])
         def event(obj):
             return "data: " + json.dumps(obj)
         class Response:
-            status_code = 200
+            def __init__(self, status_code=200):
+                self.status_code = status_code
             async def aiter_lines(self):
                 actions = rounds.pop(0)
                 if protocol == "responses":
@@ -132,7 +134,9 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
             async def aread(self):
                 return b""
         class Context:
-            async def __aenter__(self): return Response()
+            def __init__(self, status_code=200):
+                self.status_code = status_code
+            async def __aenter__(self): return Response(self.status_code)
             async def __aexit__(self, *_): return False
         class Client:
             def __init__(self, **_): pass
@@ -140,7 +144,7 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *_): return False
             def stream(self, *_, **kwargs):
                 payloads.append(copy.deepcopy(kwargs["json"]))
-                return Context()
+                return Context(statuses.pop(0) if statuses else 200)
         async def update(state): updates.append(copy.deepcopy(state))
         async def execute(name, args):
             executed.append(args["command"])
@@ -193,3 +197,12 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(payloads),1)
         self.assertFalse(result["incomplete"])
         self.assertIsNone(result["plan"])
+
+    async def test_503_retries_immediately_and_reports_recovery(self):
+        result, payloads, _, updates = await self.run_loop(
+            [["hello"]], status_sequence=[503, 503]
+        )
+        self.assertEqual(len(payloads), 3)
+        self.assertEqual(result["retry_status"]["status"], "recovered")
+        self.assertEqual(result["retry_status"]["attempt"], 2)
+        self.assertTrue(any(item.get("retry_status", {}).get("active") for item in updates))
