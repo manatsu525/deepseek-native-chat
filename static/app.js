@@ -528,7 +528,10 @@ function usageHtml(usage={}) {
 function traceHtml(meta={}, active=false, detailKey='trace') {
   const reasoning = meta.reasoning || '';
   const searches = meta.searches || [];
-  if (!reasoning && !searches.length && !active) return '';
+  const planSteps = (meta.plan && meta.plan.steps) || [];
+  const planLabels = {pending:'待处理',in_progress:'执行中',done:'已完成',blocked:'受阻'};
+  const planHtml = planSteps.length ? `<div class="search-step"><strong>执行计划</strong><ol>${planSteps.map(s=>`<li>${escapeHtml(planLabels[s.status]||s.status)} · ${escapeHtml(s.step)}${s.outcome?`<div>${escapeHtml(s.outcome)}</div>`:''}</li>`).join('')}</ol></div>` : '';
+  if (!reasoning && !searches.length && !active && !planSteps.length) return '';
   const status = active ? '进行中' : (meta.stopped ? '已停止' : '已完成');
   const agentLabels={list_files:'列出文件',read_file:'读取文件',write_file:'写入文件',edit_file:'修改文件',search_files:'搜索文件',run_command:'运行命令',delete_file:'删除路径',check_web_syntax:'检查网页语法',update_plan:'更新计划',host_list_files:'列出主机文件',host_read_file:'读取主机文件',host_write_file:'写入主机文件',host_apply_patch:'修改主机文件',host_search_files:'搜索主机文件',host_run_command:'运行主机命令',host_delete_path:'删除主机路径',conversation_list:'列出对话',conversation_read:'读取对话',conversation_create:'创建对话',conversation_rename:'重命名对话',conversation_delete:'删除对话',skill_list:'列出 Skill',skill_read:'读取 Skill',skill_install:'安装 Skill',skill_enable:'启用/禁用 Skill',skill_remove:'删除 Skill',frontend_list_pages:'列出前端页面',frontend_read_page:'读取前端页面',frontend_write_page:'写入前端页面',frontend_validate_page:'检查前端页面'};
   const searchHtml = searches.map((s,i) => {
@@ -548,7 +551,7 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
   const fileCount=searches.filter(item=>item.action==='workspace').length;
   const agentCount=searches.filter(item=>item.action==='agent').length;
   const activity=`${searchCount ? ` · ${searchCount} 次搜索` : ''}${readCount ? ` · ${readCount} 次读取` : ''}${fileCount ? ` · ${fileCount} 次文件操作` : ''}${agentCount ? ` · ${agentCount} 次 Agent 操作` : ''}`;
-  return `<details class="trace" data-detail-key="${escapeHtml(detailKey)}"${traceOpen}><summary>思考与工具 · ${status}${activity}</summary><div class="trace-body">${reasoning ? `<div class="reasoning-text" data-scroll-key="${escapeHtml(detailKey)}-reasoning">${escapeHtml(reasoning)}</div>` : active ? '<div class="typing"><i></i><i></i><i></i></div>' : ''}${searchHtml}</div></details>`;
+  return `<details class="trace" data-detail-key="${escapeHtml(detailKey)}"${traceOpen}><summary>思考与工具 · ${status}${activity}</summary><div class="trace-body">${planHtml}${reasoning ? `<div class="reasoning-text" data-scroll-key="${escapeHtml(detailKey)}-reasoning">${escapeHtml(reasoning)}</div>` : active ? '<div class="typing"><i></i><i></i><i></i></div>' : ''}${searchHtml}</div></details>`;
 }
 
 function sourcesHtml(meta={}, detailKey='trace') {
@@ -600,7 +603,7 @@ function renderMessages() {
   rememberNestedScroll($('#messages'));
   const items = [...state.messages];
   if (state.job && ['queued','running','failed','stopped'].includes(state.job.status)) {
-    items.push({role:'assistant', content:state.job.answer || '', meta:{job_id:state.job.id,trace_key:state.job.trace_key,conversation_id:state.job.conversation_id||(state.conversation&&state.conversation.id),provider_id:state.job.provider_id,provider_type:state.job.provider_type,model:state.job.model,chat_mode:state.job.chat_mode||'standard',agents:state.job.agents||[],reasoning:state.job.reasoning,searches:state.job.searches,sources:state.job.sources,usage:state.job.usage,workspace_files:state.job.workspace_files||[],error:state.job.error,stopped:state.job.status==='stopped'}, live:['queued','running'].includes(state.job.status)});
+items.push({role:'assistant', content:state.job.answer || '', meta:{job_id:state.job.id,trace_key:state.job.trace_key,conversation_id:state.job.conversation_id||(state.conversation&&state.conversation.id),provider_id:state.job.provider_id,provider_type:state.job.provider_type,model:state.job.model,chat_mode:state.job.chat_mode||'standard',agents:state.job.agents||[],plan:state.job.plan,reasoning:state.job.reasoning,searches:state.job.searches,sources:state.job.sources,usage:state.job.usage,workspace_files:state.job.workspace_files||[],error:state.job.error,stopped:state.job.status==='stopped'}, live:['queued','running'].includes(state.job.status)});
   }
   const retryBlocked = state.retryingAnswer || (state.job && ['queued','running'].includes(state.job.status));
   $('#welcome').classList.toggle('hidden', items.length > 0);
@@ -624,6 +627,7 @@ function replaceJobMessage(job, liveState) {
       model: job.model,
       chat_mode: job.chat_mode || 'standard',
       agents: job.agents || [],
+      plan: job.plan,
       reasoning: job.reasoning,
       searches: job.searches,
       sources: job.sources,

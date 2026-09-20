@@ -35,7 +35,7 @@ from .context import (
     serialized_chars as _serialized_chars,
     with_message_block as _with_message_block,
 )
-from .plan import UPDATE_PLAN_TOOL, TaskPlan
+from .plan import UPDATE_PLAN_TOOL, ExecutionPlan
 from .keyless_web import (
     KEYLESS_FETCH_WEBPAGE_TOOL,
     KEYLESS_SEARCH_WEB_TOOL,
@@ -837,6 +837,7 @@ async def stream_response(
     extra_tool_handler: Callable[[str, dict[str, Any]], str | Awaitable[str]] | None = None,
     user_context_addendum: str = "",
     context_window_tokens: int | None = None,
+    initial_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run a custom OpenAI-compatible model with local web tools.
 
@@ -939,7 +940,11 @@ async def stream_response(
     reader_enabled = bool(known_urls)
     final_answer_attempts = 0
     force_final_answer = False
-    plan = TaskPlan()
+    plan = ExecutionPlan(initial_plan)
+    plan_final_retries = 0
+    if initial_plan and plan.steps:
+        conversation.append({"role": "user", "content": plan.runtime_note()})
+        response_chain.reset()
     context_budget_setting = normalize_budget(config.get("context_budget_chars", DEFAULT_CONTEXT_BUDGET_CHARS))
     context_budget = context_budget_setting
     # Host files can also change through shell commands, so their snapshots
@@ -1057,6 +1062,10 @@ async def stream_response(
                     # Stays listed after loading, so the tool list changes
                     # once per loaded group and not again.
                     round_tools.append(load_tools_definition(deferrable_groups))
+                if plan_tool_expected and plan.needs_plan:
+                    # Planning is an actual scheduler phase, not an optional
+                    # checklist. Execution resumes as soon as a valid step is active.
+                    round_tools = [UPDATE_PLAN_TOOL]
             final_answer_only = force_final_answer or (tools_expected and not round_tools)
             mimo_model = is_mimo_model(model)
             request_messages = conversation
@@ -1496,6 +1505,24 @@ async def stream_response(
                     raise RuntimeError("上游连续返回空正文，未生成最终答案")
                 raise RuntimeError("上游在最终回答阶段仍返回工具调用，未生成最终答案")
 
+            if not calls and not final_answer_only and plan.active and plan_final_retries < 2:
+                # Keep the attempted answer visible/history intact, but reconcile
+                # authoritative state before declaring unfinished work complete.
+                plan_final_retries += 1
+                answer = _join_round_text(answer, round_answer)
+                reasoning += round_reasoning
+                attempted_final: dict[str, Any] = {"role": "assistant", "content": round_answer}
+                if round_reasoning:
+                    attempted_final["reasoning_content"] = round_reasoning
+                if messages_protocol and anthropic_thinking_blocks:
+                    attempted_final["anthropic_thinking_blocks"] = [anthropic_thinking_blocks[i] for i in sorted(anthropic_thinking_blocks)]
+                if responses_protocol and responses_output_items_by_index:
+                    attempted_final["responses_output_items"] = [responses_output_items_by_index[i] for i in sorted(responses_output_items_by_index)]
+                conversation.append(attempted_final)
+                conversation.append({"role": "user", "content":
+                    "计划尚未收尾。请根据实际工具结果更新步骤；继续未完成工作，或明确标记 blocked 并解释阻碍。\n" + plan.runtime_note()})
+                response_chain.reset()
+                continue
             answer = _join_round_text(answer, round_answer)
             reasoning += round_reasoning
             if responses_protocol:
@@ -1593,7 +1620,11 @@ async def stream_response(
 
                 result_text = ""
                 target_url = ""
+                execution_allowed = True
                 try:
+                    if not is_plan and not is_load and (is_workspace or is_extra or plan.steps):
+                        execution_allowed = not plan.needs_plan
+                        plan.require_execution()
                     # Quota errors must take precedence over argument validation. If
                     # the model calls an exhausted tool with malformed arguments,
                     # tell it to stop using that tool instead of inviting a retry.
@@ -2069,7 +2100,10 @@ async def stream_response(
                 except Exception as exc:
                     step["status"] = "failed"
                     step["error"] = str(exc)[:1000]
-                    if isinstance(exc, ToolQuotaExceeded):
+                    if not execution_allowed:
+                        step["status"] = "rejected"
+                        result_text = str(exc)
+                    elif isinstance(exc, ToolQuotaExceeded):
                         result_text = str(exc)[:1000]
                         refused_web_calls += 1
                     elif is_search:
@@ -2102,14 +2136,16 @@ async def stream_response(
                     (is_workspace and workspace_name in WORKSPACE_MUTATION_TOOLS | {"run_python", "run_command", "check_web_syntax"})
                     or (is_extra and (name in HOST_FILE_MUTATION_TOOLS or name in HOST_VALIDATION_TOOLS))
                 )
-                calls_since_mutation = 0 if mutated else calls_since_mutation + 1
+                if not is_plan and not is_load:
+                    calls_since_mutation = 0 if mutated else calls_since_mutation + 1
                 if mutated and (
                     (is_workspace and workspace_name in WORKSPACE_MUTATION_TOOLS)
                     or (is_extra and name in HOST_FILE_MUTATION_TOOLS)
                 ):
                     files_changed += 1
                 if (
-                    calls_since_mutation >= MUTATION_STALL_CALLS
+                    not is_plan and not is_load
+                    and calls_since_mutation >= MUTATION_STALL_CALLS
                     and (calls_since_mutation - MUTATION_STALL_CALLS) % MUTATION_STALL_EVERY == 0
                     and (workspace_tools_expected or extra_tools_expected)
                 ):
@@ -2161,7 +2197,15 @@ async def stream_response(
                         if field in step:
                             trace_item[field] = step[field]
                 tool_trace.append(trace_item)
+                if execution_allowed and not is_plan and not is_load and (is_workspace or is_extra or plan.steps):
+                    plan.record(call_id, trace_item["name"], step["status"], str(step.get("path") or ""), result_text)
+                    trace_item["plan_step_id"] = (plan.active or {}).get("id")
                 conversation.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
+                # The latest result carries authoritative progress even without
+                # compaction or visible reasoning. Added before Responses pending
+                # is built, so stateful and stateless protocols see the same state.
+                if call is calls[-1] and (plan.steps or plan.needs_plan):
+                    _append_runtime_note(conversation, plan.runtime_note())
                 await update(
                     {
                         "answer": answer,
@@ -2170,6 +2214,7 @@ async def stream_response(
                         "usage": usage,
                         "sources": list(sources.values()),
                         "web_evidence": web_evidence,
+                        "plan": plan.export(),
                         "tool_trace": tool_trace,
                         "round_stats": round_stats,
                     }
@@ -2225,7 +2270,8 @@ async def stream_response(
         "tool_trace": tool_trace,
         "round_stats": round_stats,
         "web_evidence": web_evidence,
-        "incomplete": tool_budget_exhausted,
+        "incomplete": tool_budget_exhausted or plan.unfinished,
+        "incomplete_reason": "plan_unfinished" if plan.unfinished else "",
         "plan": plan.export(),
         "tool_round_limit": role_tool_round_limit,
         "agent_mode": bool(agent_mode),

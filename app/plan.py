@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import json
 import re
+import copy
 from typing import Any
 
 MAX_PLAN_ITEMS = 20
 MAX_ITEM_CHARS = 200
-STATUSES = ("pending", "in_progress", "done")
+STATUSES = ("pending", "in_progress", "done", "blocked")
 STEP_ALIASES = ("step", "title", "description", "task", "content", "text", "name", "item")
 STATUS_ALIASES = {"todo": "pending", "not_started": "pending", "open": "pending", "doing": "in_progress",
                   "active": "in_progress", "wip": "in_progress", "completed": "done", "complete": "done",
@@ -25,10 +26,11 @@ UPDATE_PLAN_TOOL = {
     "function": {
         "name": "update_plan",
         "description": (
-            "Record or update your step-by-step plan for the current task. Call it once with all steps before "
-            "starting a task that needs more than two or three tool calls, then again whenever a step's status "
-            "changes (mark the finished step done and the next one in_progress). Always send the full list. "
-            "The plan is kept for you across context compaction."
+            "Manage the execution plan. For multi-step work, create concrete deliverables and a verification step; "
+            "keep exactly one step in_progress while work remains. Execute that step, then mark it done with "
+            "outcome and evidence (successful tool call IDs from its results), activating the next step. "
+            "Always send the full list; retain returned step IDs. Use blocked with an outcome explaining the blocker. "
+            "Changing steps or revisiting completed work requires replan_reason. State survives compaction."
         ),
         "parameters": {
             "type": "object",
@@ -42,12 +44,16 @@ UPDATE_PLAN_TOOL = {
                         "properties": {
                             "step": {"type": "string", "description": "Short description of the step"},
                             "status": {"type": "string", "enum": list(STATUSES)},
+                            "id": {"type": "string", "description": "Keep the server-assigned step ID on updates"},
+                            "outcome": {"type": "string", "description": "Concrete result or blocker"},
+                            "evidence": {"type": "array", "items": {"type": "string"}, "description": "Successful tool call IDs for this step"},
                         },
                         "required": ["step", "status"],
                         "additionalProperties": False,
                     },
                 },
                 "note": {"type": "string", "description": "Optional: decisions or assumptions made so far"},
+                "replan_reason": {"type": "string", "description": "New evidence justifying a changed plan"},
             },
             "required": ["steps"],
             "additionalProperties": False,
@@ -151,7 +157,7 @@ class TaskPlan:
         )
 
     def render(self) -> str:
-        marks = {"pending": "[ ]", "in_progress": "[~]", "done": "[x]"}
+        marks = {"pending": "[ ]", "in_progress": "[~]", "done": "[x]", "blocked": "[!]"}
         lines = [f"{marks[item['status']]} {index}. {item['step']}" for index, item in enumerate(self.steps, 1)]
         if self.note:
             lines.append(f"note: {self.note}")
@@ -161,3 +167,133 @@ class TaskPlan:
         if not self.steps:
             return None
         return {"steps": self.steps, "note": self.note}
+
+
+class ExecutionPlan(TaskPlan):
+    """Validated execution state, independent of model protocol and reasoning visibility.
+
+    Evidence proves that an operation succeeded, not that the user's goal was
+    semantically met. The model must state the outcome and plan verification.
+    """
+
+    def __init__(self, saved: dict[str, Any] | None = None) -> None:
+        super().__init__()
+        self.operations = 0
+        self.serial = 0
+        self.revisions: list[dict[str, Any]] = []
+        self.receipts: dict[str, list[dict[str, Any]]] = {}
+        if saved and saved.get("version") == 1:
+            self.steps = copy.deepcopy(saved.get("steps") or [])
+            self.note = str(saved.get("note") or "")
+            self.operations = int(saved.get("operations") or 0)
+            self.serial = int(saved.get("serial") or len(self.steps))
+            self.revisions = copy.deepcopy(saved.get("revisions") or [])
+            # A process restart does not restore tool history or guarantee that
+            # files are unchanged. Retain completed outcomes, but require fresh
+            # evidence before completing the interrupted active step.
+            self.note += "\n恢复的计划：先核对当前步骤涉及的文件，再继续；中断前的操作可能已经生效。"
+
+    @property
+    def active(self) -> dict[str, Any] | None:
+        return next((s for s in self.steps if s["status"] == "in_progress"), None)
+
+    @property
+    def needs_plan(self) -> bool:
+        return (not self.steps and self.operations >= 2) or bool(self.steps and not self.active)
+
+    @property
+    def unfinished(self) -> bool:
+        return bool(self.steps and any(s["status"] != "done" for s in self.steps))
+
+    def require_execution(self) -> None:
+        if self.needs_plan:
+            raise ValueError("当前处于规划阶段：先调用 update_plan 建立或调整计划并指定一个 in_progress 步骤，再执行工具。")
+
+    def apply(self, arguments: dict[str, Any]) -> str:
+        raw = arguments.get("steps")
+        if not isinstance(raw, list) or not raw or len(raw) > MAX_PLAN_ITEMS:
+            raise ValueError("steps 必须包含 1–20 个完整步骤")
+        reason = str(arguments.get("replan_reason") or "").strip()[:1000]
+        previous = {s["id"]: s for s in self.steps}
+        titles = {s["step"]: s for s in self.steps}
+        candidate = []
+        serial = self.serial
+        for item in raw:
+            if not isinstance(item, dict) or item.get("status") not in STATUSES:
+                raise ValueError("每个步骤需要 step 和有效的 status")
+            title = " ".join(str(item.get("step") or "").split())[:MAX_ITEM_CHARS]
+            if not title:
+                raise ValueError("步骤描述不能为空")
+            old = previous.get(str(item.get("id") or "")) if item.get("id") else titles.get(title)
+            if item.get("id") and not old:
+                raise ValueError("未知步骤 ID；新增步骤请省略 id")
+            if not old:
+                serial += 1
+            step = {"id": old["id"] if old else f"s{serial}", "step": title, "status": item["status"],
+                    "outcome": str(item.get("outcome", (old or {}).get("outcome", ""))).strip()[:1000],
+                    "evidence": list((old or {}).get("evidence") or [])}
+            status_changed = not old or old["status"] != step["status"]
+            if step["status"] == "done" and status_changed:
+                available = {r["id"] for r in self.receipts.get(step["id"], []) if r["status"] == "completed"}
+                evidence = item.get("evidence") or []
+                if not old or old["status"] != "in_progress" or old["step"] != title or not step["outcome"] or not isinstance(evidence, list) or not evidence or any(not isinstance(e, str) or e not in available for e in evidence):
+                    raise ValueError("完成步骤需要先执行该当前步骤，再提供 outcome 和该步骤成功工具调用的 evidence ID")
+                step["evidence"] = evidence[:8]
+            if step["status"] == "blocked" and not step["outcome"]:
+                raise ValueError("blocked 步骤必须用 outcome 说明缺失条件")
+            if old and old["status"] == "done" and step != old and not reason:
+                raise ValueError("修改已完成步骤需要 replan_reason")
+            if old and old["status"] == "done" and step != old and step["status"] != "in_progress":
+                raise ValueError("返工已完成步骤时，先用相同 ID 设为 in_progress，再执行并提交新证据")
+            if old and old["status"] != "in_progress" and step["status"] == "in_progress":
+                step["evidence"] = []
+                step["outcome"] = ""
+            candidate.append(step)
+        ids = [s["id"] for s in candidate]
+        if len(set(ids)) != len(ids) or len({s["step"] for s in candidate}) != len(candidate):
+            raise ValueError("步骤不能重复")
+        active_count = sum(s["status"] == "in_progress" for s in candidate)
+        if active_count > 1 or (any(s["status"] == "pending" for s in candidate) and active_count != 1):
+            raise ValueError("有待处理步骤时必须且只能有一个 in_progress 步骤")
+        structural_change = [(s["id"], s["step"]) for s in candidate] != [(s["id"], s["step"]) for s in self.steps]
+        deferred = self.active and next((s["status"] for s in candidate if s["id"] == self.active["id"]), "removed") == "pending"
+        if self.steps and (structural_change or deferred) and not reason:
+            raise ValueError("调整步骤或推迟当前步骤需要 replan_reason，说明新发现")
+        if any(s["status"] == "done" and s["id"] not in ids for s in self.steps):
+            raise ValueError("保留已完成步骤作为执行记录；需要返工时用相同 ID 重新激活")
+        if reason:
+            self.revisions = (self.revisions + [{"reason": reason, "previous": copy.deepcopy(self.steps)}])[-5:]
+        for s in candidate:
+            old = previous.get(s["id"])
+            if s["status"] == "in_progress" and (not old or old["status"] != "in_progress" or old["step"] != s["step"]):
+                self.receipts[s["id"]] = []
+        self.steps, self.serial = candidate, serial
+        if "note" in arguments:
+            self.note = str(arguments.get("note") or "")[:1000]
+        self.updates += 1
+        return json.dumps({"ok": True, "plan": self.export()}, ensure_ascii=False)
+
+    def record(self, call_id: str, name: str, status: str, path: str, result: str) -> None:
+        self.operations += 1
+        if self.active:
+            key = self.active["id"]
+            receipts = self.receipts.setdefault(key, [])
+            receipts.append({"id": call_id, "tool": name, "status": status, "path": path[:300],
+                             "result": result[:200]})
+
+    def runtime_note(self) -> str:
+        if not self.steps:
+            return ("规划阶段：已完成初步探索。若任务仍需工具，先用 update_plan 建立具体交付步骤和验证步骤，"
+                    "其中一个为 in_progress；若两次操作已足够，可直接回答。") if self.needs_plan else ""
+        receipts = self.receipts.get((self.active or {}).get("id", ""), [])
+        state = {"steps": self.steps, "note": self.note, "recent_results": receipts[-3:],
+                 "eligible_evidence_ids": [r["id"] for r in receipts if r["status"] == "completed"]}
+        return ("服务端执行状态（权威）：" + json.dumps(state, ensure_ascii=False) +
+                "\n只推进当前步骤；达到该步骤结果后，用 update_plan 提交 outcome 和成功调用的 evidence ID，激活下一步。"
+                "遇到新事实可用 replan_reason 调整；无法继续则标记 blocked 并说明原因。所有步骤完成后再给最终交付。")
+
+    def export(self) -> dict[str, Any] | None:
+        if not self.steps and not self.operations:
+            return None
+        return copy.deepcopy({"version": 1, "steps": self.steps, "note": self.note, "operations": self.operations,
+                              "serial": self.serial, "revisions": self.revisions, "receipts": self.receipts})

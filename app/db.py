@@ -146,6 +146,8 @@ class Database:
                 "ON conversations(user_id, pinned_at DESC, updated_at DESC)"
             )
             job_columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)").fetchall()}
+            if "plan_json" not in job_columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN plan_json TEXT NOT NULL DEFAULT '{}'")
             if "provider_type" not in job_columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN provider_type TEXT NOT NULL DEFAULT 'custom'")
             if "timezone" not in job_columns:

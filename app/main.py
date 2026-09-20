@@ -426,7 +426,7 @@ def public_provider(row: dict[str, Any]) -> dict[str, Any]:
 
 def public_job(row: dict[str, Any]) -> dict[str, Any]:
     row = dict(row)
-    for name, fallback in (("searches_json", []), ("sources_json", []), ("usage_json", {}), ("agents_json", [])):
+    for name, fallback in (("searches_json", []), ("sources_json", []), ("usage_json", {}), ("agents_json", []), ("plan_json", {})):
         row[name.removesuffix("_json")] = db.decode(row.pop(name, ""), fallback)
     row["stop_requested"] = bool(row["stop_requested"])
     if row.get("provider_type") == "mimo":
@@ -656,6 +656,10 @@ async def _execute_job(job_id: str) -> None:
         # An incomplete answer already lists its completed operations.
         if row["role"] == "assistant" and meta.get("work_log") and not meta.get("incomplete"):
             message["content"] = with_work_log(message["content"], str(meta["work_log"]))
+        if row["role"] == "assistant" and (meta.get("plan") or {}).get("steps"):
+            prior_plan = meta["plan"]
+            message["content"] += "\n\n[本轮执行计划记录]\n" + json.dumps(
+                {"steps": prior_plan["steps"], "note": prior_plan.get("note", "")}, ensure_ascii=False)
         history.append(message)
     prior_web_evidence = db.web_evidence_for_conversation(
         job["user_id"],
@@ -688,6 +692,10 @@ async def _execute_job(job_id: str) -> None:
 
     async def update(state: dict[str, Any]) -> None:
         nonlocal last_write
+        if "plan" in state:
+            live_diagnostics["plan"] = state["plan"]
+            # Progress checkpoints must not be lost to UI streaming throttling.
+            db.update_job(job_id, plan_json=json.dumps(state["plan"] or {}, ensure_ascii=False))
         for key in ("tool_trace", "round_stats"):
             if key in state:
                 live_diagnostics[key] = list(state[key])
@@ -740,6 +748,7 @@ async def _execute_job(job_id: str) -> None:
                 stopped=stopped,
                 update=update,
                 settings=provider_settings,
+                initial_plan=db.decode(job.get("plan_json", "{}"), {}),
                 conversation_id=job["conversation_id"],
                 user_timezone=job.get("timezone") or "UTC",
                 effort=provider_settings.get("reasoning_effort") or job["effort"],
@@ -772,6 +781,7 @@ async def _execute_job(job_id: str) -> None:
                 stopped=stopped,
                 update=update,
                 settings=provider_settings,
+                initial_plan=db.decode(job.get("plan_json", "{}"), {}),
                 conversation_id=job["conversation_id"],
                 user_timezone=job.get("timezone") or "UTC",
                 effort=provider_settings.get("reasoning_effort") or job["effort"],
@@ -790,9 +800,14 @@ async def _execute_job(job_id: str) -> None:
                 result["web_evidence"],
             )
         if result.get("incomplete"):
-            result["answer"] = incomplete_answer(
-                result.get("answer") or "", result.get("tool_trace") or [], int(result.get("tool_round_limit") or 0)
-            )
+            if result.get("incomplete_reason") == "plan_unfinished":
+                remaining = [s for s in (result.get("plan") or {}).get("steps", []) if s["status"] != "done"]
+                result["answer"] = (result.get("answer") or "").rstrip() + "\n\n---\n本轮计划尚未全部完成：\n" + "\n".join(
+                    f"- {s['step']}（{s['status']}）" + (f"：{s['outcome']}" if s.get("outcome") else "") for s in remaining)
+            else:
+                result["answer"] = incomplete_answer(
+                    result.get("answer") or "", result.get("tool_trace") or [], int(result.get("tool_round_limit") or 0)
+                )
         display_files = agent_workspace.list_files() if agent_job else job_workspace.list_files()
         meta = {"job_id": job_id, "conversation_id": job["conversation_id"], "provider_id": job["provider_id"], "provider_type": kind, "model": job["model"], "chat_mode": job.get("chat_mode") or "standard", "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"], "agents": result.get("agents", []), "workspace_files": display_files}
         if result.get("tool_trace"):
@@ -823,6 +838,7 @@ async def _execute_job(job_id: str) -> None:
             sources_json=json.dumps(result["sources"], ensure_ascii=False),
             usage_json=json.dumps(result["usage"], ensure_ascii=False),
             agents_json=json.dumps(result.get("agents", []), ensure_ascii=False),
+            plan_json=json.dumps(result.get("plan") or {}, ensure_ascii=False),
         )
     except asyncio.CancelledError:
         partial = db.one("SELECT answer, reasoning, searches_json, sources_json, usage_json, agents_json FROM jobs WHERE id=?", (job_id,)) or {}
