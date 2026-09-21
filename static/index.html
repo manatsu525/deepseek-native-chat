@@ -197,10 +197,12 @@
       </div>
       <label>最大生成 Token<input id="customMaxCompletion" type="number" min="256" max="131072" step="256" value="65536"></label>
       <label>上下文预算（字符，超出后压缩旧工具结果；保持默认值 240000 时按模型上下文窗口自动决定）<input id="customContextBudget" type="number" min="40000" max="4000000" step="10000" value="240000"></label>
+      <label class="check"><input id="customTemperatureEnabled" type="checkbox"> 发送 temperature</label>
       <label>temperature<input id="customTemperature" type="number" min="0" max="1.5" step="0.05" value="1"></label>
+      <label class="check"><input id="customTopPEnabled" type="checkbox"> 发送 top_p</label>
       <label>top_p<input id="customTopP" type="number" min="0.01" max="1" step="0.01" value="0.95"></label>
       <label class="wide">搜索/抓取工具方案<select id="customWebToolBackend"><option value="parallel">Parallel（默认）</option><option value="keenable">Keenable</option><option value="tavily">Tavily</option><option value="firecrawl">Firecrawl</option><option value="you">You.com</option><option value="legacy">DDG + Jina</option></select></label>
-      <p id="customSamplingNote" class="wide muted">普通 Custom 模型使用标准 temperature/top_p；兼容 thinking 参数的模型才会发送该字段。</p>
+      <p id="customSamplingNote" class="wide muted">默认不发送 temperature/top_p；勾选对应开关后才会加入真实上游 JSON。</p>
       <p id="customToolNote" class="wide muted custom-cost-note">默认通过免费的 Parallel Search MCP 搜索并提取相关网页内容，不需要 Parallel API Key。</p>
       <p class="wide muted custom-cost-note">所有方案均由本机后端调用并强制限制：每个回答最多搜索 3 次、读取 3 个网页、执行 6 个工具轮次；资料足够时可以提前停止。每次搜索最多向模型返回 10 条结果。</p>
       <label class="check wide"><input id="customAdvancedEnabled" type="checkbox"> 启用高级 JSON 配置</label>

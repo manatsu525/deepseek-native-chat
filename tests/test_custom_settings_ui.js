@@ -4,7 +4,7 @@ const vm=require('vm');
 const source=fs.readFileSync('static/app.js','utf8');
 const nodes=new Map(),pending=[];
 const node=id=>{if(!nodes.has(id))nodes.set(id,{value:'',checked:false,disabled:false,readOnly:false,textContent:'',close(){}});return nodes.get(id)};
-const provider={id:1,provider_type:'custom',model_settings:{a:{temperature:0.8},b:{temperature:0.6}}};
+const provider={id:1,provider_type:'custom',model_settings:{a:{temperature_enabled:true,temperature:0.8,top_p_enabled:true,top_p:0.9},b:{temperature_enabled:true,temperature:0.6,top_p_enabled:true,top_p:0.9}}};
 let model='a';
 const context=vm.createContext({console,JSON,Number,Set,setTimeout,clearTimeout,
   $:node,selectedModel:()=>model,selectedProvider:()=>provider,syncCustomThinkingFields:()=>{},syncCustomToolFields:()=>{},

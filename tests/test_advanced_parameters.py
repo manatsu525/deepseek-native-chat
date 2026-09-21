@@ -57,10 +57,27 @@ class AdvancedParameterTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn(missing, payload)
 
     async def test_disabled_advanced_document_does_not_affect_request(self):
-        config = {"advanced_enabled": False, "temperature": 0.8, "advanced_request": {"temperature": 0.1},
+        config = {"advanced_enabled": False, "temperature_enabled": True, "temperature": 0.8, "advanced_request": {"temperature": 0.1},
                   "request_overrides": {"temperature": 0.2}}
         payload = await self.send("chat_completions", config)
         self.assertEqual(payload["temperature"], 0.8)
+
+    async def test_sampling_parameters_are_opt_in(self):
+        config = {"advanced_enabled": False, "thinking": "disabled", "temperature": 0.2, "top_p": 0.8,
+                  "max_completion_tokens": 4096}
+        for protocol in ("responses", "messages", "chat_completions"):
+            with self.subTest(protocol=protocol):
+                preview = build_custom_request_parameters(
+                    "https://test.invalid/v1", "test-model", config, api_protocol=protocol
+                )
+                self.assertNotIn("temperature", preview)
+                self.assertNotIn("top_p", preview)
+                enabled = {**config, "temperature_enabled": True, "top_p_enabled": True}
+                preview = build_custom_request_parameters(
+                    "https://test.invalid/v1", "test-model", enabled, api_protocol=protocol
+                )
+                self.assertEqual(preview["temperature"], 0.2)
+                self.assertEqual(preview["top_p"], 0.8)
 
     def test_advanced_validates_runtime_fields_and_json_types(self):
         for value in ([], {"messages": []}, {"previous_response_id": "old"}, {"stream": False},

@@ -589,9 +589,14 @@ def build_custom_request_parameters(
     else:
         _apply_thinking_options(parameters, base_url, model, config["thinking"], effort,
                                 bool(config.get("reasoning_effort_enabled", True)), int(config["max_completion_tokens"]))
-    if api_protocol == "responses" or not thinking or (api_protocol == "chat_completions" and not is_mimo_model(model)):
-        parameters["temperature"] = float(config["temperature"])
-        parameters["top_p"] = float(config["top_p"])
+    sampling_allowed = api_protocol == "responses" or not thinking or (
+        api_protocol == "chat_completions" and not is_mimo_model(model)
+    )
+    if sampling_allowed:
+        if config.get("temperature_enabled", False):
+            parameters["temperature"] = float(config["temperature"])
+        if config.get("top_p_enabled", False):
+            parameters["top_p"] = float(config["top_p"])
     _apply_lowest_price_routing(parameters, model, config)
     if legacy:
         apply_request_overrides(parameters, config.get("request_overrides"), context=context)

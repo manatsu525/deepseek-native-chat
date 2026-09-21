@@ -126,7 +126,9 @@ class CustomSettingsBody(BaseModel):
     lowest_price_aggregators: list[Literal["openrouter", "vercel"]] = Field(default_factory=list, max_length=2)
     max_completion_tokens: int = Field(default=65536, ge=256, le=MIMO_MAX_COMPLETION_TOKENS)
     context_budget_chars: int = Field(default=DEFAULT_CONTEXT_BUDGET_CHARS, ge=MIN_CONTEXT_BUDGET_CHARS, le=MAX_CONTEXT_BUDGET_CHARS)
+    temperature_enabled: bool = False
     temperature: float = Field(default=1.0, ge=0, le=1.5)
+    top_p_enabled: bool = False
     top_p: float = Field(default=0.95, ge=0.01, le=1)
     web_tool_backend: Literal["parallel", "keenable", "tavily", "firecrawl", "you", "legacy"] = "parallel"
     request_overrides: dict[str, Any] = Field(default_factory=dict)
