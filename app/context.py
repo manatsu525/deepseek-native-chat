@@ -97,6 +97,10 @@ def effective_context_budget(
     if setting != DEFAULT_CONTEXT_BUDGET_CHARS:
         return setting
     if input_tokens <= 0 or request_chars <= 0:
+        if window_tokens and window_tokens > 0:
+            cold_tokens = min(int(window_tokens * CONTEXT_WINDOW_SHARE), CONTEXT_TOKEN_CAP)
+            estimated_chars = int(cold_tokens * 3.0)
+            return int(max(MIN_CONTEXT_BUDGET_CHARS, min(setting, estimated_chars)))
         return setting
     ratio = request_chars / input_tokens
     tokens = min(int((window_tokens or ASSUMED_WINDOW_TOKENS) * CONTEXT_WINDOW_SHARE), CONTEXT_TOKEN_CAP)

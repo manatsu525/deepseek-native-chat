@@ -593,5 +593,110 @@ class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
             ["completed", "completed"],
         )
 
+    async def test_read_only_workspace_exempt_from_mutation_stall(self) -> None:
+        def tool_response(call_id: str, name: str, arguments: dict) -> list[str]:
+            event = {
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": json.dumps(arguments)},
+                        }]
+                    }
+                }]
+            }
+            return ["data: " + json.dumps(event), "data: [DONE]"]
+
+        class FakeResponse:
+            status_code = 200
+            def __init__(self, lines: list[str]) -> None:
+                self.lines = lines
+            async def aiter_lines(self):
+                for line in self.lines:
+                    yield line
+            async def aread(self) -> bytes:
+                return b""
+
+        class FakeStreamContext:
+            def __init__(self, lines: list[str]) -> None:
+                self.response = FakeResponse(lines)
+            async def __aenter__(self):
+                return self.response
+            async def __aexit__(self, *_):
+                return False
+
+        limit = mimo_local.MUTATION_STALL_REFUSE_CALLS  # 16
+        # Generate 18 search calls in read_only workspace
+        responses = [tool_response(f"s{n}", "search_files", {"query": f"needle{n}"}) for n in range(limit + 2)]
+        responses.append(["data: " + json.dumps({"choices": [{"delta": {"content": "审查完成"}}]}), "data: [DONE]"])
+
+        class FakeAsyncClient:
+            def __init__(self, **_):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *_):
+                return False
+            def stream(self, *_args, **_kwargs):
+                return FakeStreamContext(responses.pop(0))
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConversationWorkspace(1, "read-only-test")
+            workspace.root = Path(directory)
+            (workspace.root / "app.py").write_text("print(1)\n")
+
+            with patch.object(mimo_local.httpx, "AsyncClient", FakeAsyncClient):
+                result = await stream_response(
+                    base_url="https://example.test/v1",
+                    api_key="test-key",
+                    model="test-model",
+                    messages=[{"role": "user", "content": "审查代码库"}],
+                    timeout=30,
+                    stopped=lambda: False,
+                    update=lambda _: asyncio.sleep(0),
+                    settings={"thinking": "disabled", "max_completion_tokens": 1024},
+                    workspace=workspace,
+                    workspace_access="read_only",
+                    web_enabled=False,
+                )
+
+        # None of the 18 calls should be rejected with "只读操作已暂停"
+        self.assertEqual(len(result["tool_trace"]), limit + 2)
+        for item in result["tool_trace"]:
+            self.assertEqual(item["status"], "completed")
+            self.assertNotIn("只读操作已暂停", item["error"])
+        self.assertEqual(result["answer"], "审查完成")
+
+    def test_cold_start_budget_adapts_to_small_context_window(self) -> None:
+        from app.context import DEFAULT_CONTEXT_BUDGET_CHARS, effective_context_budget
+        # 32K token model cold start (no request_chars or input_tokens yet)
+        cold_budget_32k = effective_context_budget(
+            DEFAULT_CONTEXT_BUDGET_CHARS,
+            window_tokens=32_000,
+            request_chars=0,
+            input_tokens=0,
+        )
+        self.assertEqual(cold_budget_32k, 57_600)
+
+        # 64K token model cold start
+        cold_budget_64k = effective_context_budget(
+            DEFAULT_CONTEXT_BUDGET_CHARS,
+            window_tokens=64_000,
+            request_chars=0,
+            input_tokens=0,
+        )
+        self.assertEqual(cold_budget_64k, 115_200)
+
+        # Explicit user budget setting overrides automatic window sizing
+        user_budget = effective_context_budget(
+            80_000,
+            window_tokens=32_000,
+            request_chars=0,
+            input_tokens=0,
+        )
+        self.assertEqual(user_budget, 80_000)
+
 if __name__ == "__main__":
     unittest.main()

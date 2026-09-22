@@ -265,7 +265,10 @@ class ExecutionPlan(TaskPlan):
             record["candidate"] = copy.deepcopy(candidate)
         if details:
             record["details"] = details
-        _PLAN_DEBUG_LOGGER.warning("PLAN_DEBUG %s", _plan_debug_json(record))
+        if event == "rejected":
+            _PLAN_DEBUG_LOGGER.warning("PLAN_DEBUG %s", _plan_debug_json(record))
+        else:
+            _PLAN_DEBUG_LOGGER.debug("PLAN_DEBUG %s", _plan_debug_json(record))
 
     def _reject_plan_update(
         self,

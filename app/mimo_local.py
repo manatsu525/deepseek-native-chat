@@ -179,6 +179,19 @@ def _read_only_call(name: str, arguments: dict[str, Any]) -> bool:
         command = _DISCARD_REDIRECT_RE.sub(" ", str(arguments.get("command") or ""))
         return not _WRITING_COMMAND_RE.search(command)
     return False
+
+
+def _is_analysis_active_step(plan: Any) -> bool:
+    """Whether the current active plan step is an inspection, review, or analysis step."""
+    if not plan or not getattr(plan, "active", None):
+        return False
+    step_desc = str((plan.active or {}).get("step") or "").lower()
+    analysis_keywords = (
+        "inspect", "review", "analyze", "analysis", "investigate", "audit", "diagnose",
+        "read", "search", "explore",
+        "排查", "分析", "审查", "查看", "调研", "定位", "诊断", "阅读", "了解", "搜索", "确认",
+    )
+    return any(k in step_desc for k in analysis_keywords)
 RUNTIME_NOTE_MARKER = "\n\n[Runtime note] "
 USER_CONTEXT_MARKER = "\n\n---\n[Context supplied by the application, not written by the user]\n"
 FINAL_ANSWER_PROMPT = (
@@ -961,7 +974,12 @@ async def stream_response(
         conversation.append({"role": "user", "content": plan.runtime_note()})
         response_chain.reset()
     context_budget_setting = normalize_budget(config.get("context_budget_chars", DEFAULT_CONTEXT_BUDGET_CHARS))
-    context_budget = context_budget_setting
+    context_budget = effective_context_budget(
+        context_budget_setting,
+        window_tokens=context_window_tokens,
+        request_chars=0,
+        input_tokens=0,
+    )
     # Host files can also change through shell commands, so their snapshots
     # are revalidated against disk before a checkpoint reuses them.
     knowledge = FileKnowledge(validate=_host_revision if agent_mode else None)
@@ -1808,8 +1826,12 @@ async def stream_response(
                         raise ValueError("工具参数必须是 JSON 对象")
                     received_keys = sorted(arguments)
                     arguments = normalize_file_tool_arguments(workspace_name if is_workspace else name, arguments)
+                    read_only_mode = workspace_access == "read_only"
+                    analysis_step = _is_analysis_active_step(plan)
                     if (
-                        calls_since_mutation >= MUTATION_STALL_REFUSE_CALLS
+                        not read_only_mode
+                        and not analysis_step
+                        and calls_since_mutation >= MUTATION_STALL_REFUSE_CALLS
                         and (workspace_tools_expected or extra_tools_expected)
                         and _read_only_call(workspace_name if is_workspace else name, arguments)
                     ):
@@ -2279,8 +2301,12 @@ async def stream_response(
                     or (is_extra and name in HOST_FILE_MUTATION_TOOLS)
                 ):
                     files_changed += 1
+                read_only_mode = workspace_access == "read_only"
+                analysis_step = _is_analysis_active_step(plan)
                 if (
                     not is_plan and not is_load
+                    and not read_only_mode
+                    and not analysis_step
                     and calls_since_mutation >= MUTATION_STALL_CALLS
                     and (calls_since_mutation - MUTATION_STALL_CALLS) % MUTATION_STALL_EVERY == 0
                     and (workspace_tools_expected or extra_tools_expected)
@@ -2298,6 +2324,20 @@ async def stream_response(
                             "如果方案已经清楚，现在就写文件，不要再确认已经拿到的信息；"
                             "如果确实还缺一个事实，一次性获取后立即动手，并把无法确认的地方写成明确假设。"
                         )
+                    if plan.steps:
+                        result_text += "\n当前计划：\n" + plan.render()
+                elif (
+                    not is_plan and not is_load
+                    and (read_only_mode or analysis_step)
+                    and calls_since_mutation >= MUTATION_STALL_REFUSE_CALLS
+                    and (calls_since_mutation - MUTATION_STALL_REFUSE_CALLS) % MUTATION_STALL_EVERY == 0
+                    and (workspace_tools_expected or extra_tools_expected)
+                ):
+                    step["mutation_stall_warning"] = calls_since_mutation
+                    result_text += (
+                        f"\n\n[Runtime note] 当前排查/只读分析已进行了 {calls_since_mutation} 次检索调用。"
+                        "若已有充分证据与分析结论，请基于已有发现直接回答用户或推进计划。"
+                    )
                     if plan.steps:
                         result_text += "\n当前计划：\n" + plan.render()
                 compacted_arguments = False
