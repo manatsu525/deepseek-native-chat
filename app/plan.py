@@ -64,7 +64,7 @@ UPDATE_PLAN_TOOL = {
                             "status": {"type": "string", "enum": list(STATUSES)},
                             "id": {"type": "string", "description": "Keep the server-assigned step ID on updates"},
                             "outcome": {"type": "string", "description": "Concrete result or blocker"},
-                            "evidence": {"type": "array", "items": {"type": "string"}, "description": "Successful tool call IDs for this step"},
+                            "evidence": {"type": "array", "items": {"type": "string"}, "description": "Successful tool call IDs for this step (refer to eligible_evidence_ids in server execution state)"},
                         },
                         "required": ["step", "status"],
                         "additionalProperties": False,
@@ -304,7 +304,18 @@ class ExecutionPlan(TaskPlan):
         serial = self.serial
         initial_plan = not self.steps
         for item in raw:
-            if not isinstance(item, dict) or item.get("status") not in STATUSES:
+            if not isinstance(item, dict):
+                self._reject_plan_update(
+                    "每个步骤需要是对象", arguments, before, context=debug_context,
+                    candidate=candidate, invalid_item=item,
+                )
+            raw_status = item.get("status")
+            if isinstance(raw_status, bool):
+                norm_status = "done" if raw_status else "pending"
+            else:
+                norm_status = str(raw_status or "").strip().lower()
+                norm_status = STATUS_ALIASES.get(norm_status, norm_status)
+            if norm_status not in STATUSES:
                 self._reject_plan_update(
                     "每个步骤需要 step 和有效的 status", arguments, before, context=debug_context,
                     candidate=candidate, invalid_item=item,
@@ -329,15 +340,33 @@ class ExecutionPlan(TaskPlan):
                 serial += 1
             supplied_id = " ".join(str(item.get("id") or "").split())[:64]
             step_id = old["id"] if old else supplied_id or f"s{serial}"
-            step = {"id": step_id, "step": title, "status": item["status"],
-                    "outcome": str(item.get("outcome", (old or {}).get("outcome", ""))).strip()[:1000],
+            raw_outcome = (
+                item.get("outcome")
+                or item.get("result")
+                or item.get("output")
+                or item.get("summary")
+                or (old or {}).get("outcome", "")
+            )
+            step = {"id": step_id, "step": title, "status": norm_status,
+                    "outcome": str(raw_outcome).strip()[:1000],
                     "evidence": list((old or {}).get("evidence") or [])}
             status_changed = not old or old["status"] != step["status"]
             if step["status"] == "done" and status_changed:
                 available = self._available_evidence()
-                evidence = item.get("evidence") or []
-                evidence_types = [type(item). __name__ for item in evidence] if isinstance(evidence, list) else []
-                invalid_evidence = [e for e in evidence if not isinstance(e, str) or e not in available] if isinstance(evidence, list) else evidence
+                raw_evidence = (
+                    item.get("evidence")
+                    or item.get("evidence_ids")
+                    or item.get("evidences")
+                    or item.get("evidence_id")
+                )
+                if isinstance(raw_evidence, str):
+                    evidence = [s.strip() for s in raw_evidence.split(",") if s.strip()]
+                elif isinstance(raw_evidence, list):
+                    evidence = [str(x).strip() for x in raw_evidence if str(x).strip()]
+                else:
+                    evidence = []
+                evidence_types = [type(x).__name__ for x in evidence]
+                invalid_evidence = [e for e in evidence if not isinstance(e, str) or e not in available]
                 if (
                     not old
                     or old["status"] not in {"pending", "in_progress"}
@@ -347,8 +376,22 @@ class ExecutionPlan(TaskPlan):
                     or not evidence
                     or invalid_evidence
                 ):
+                    reasons = []
+                    if not old:
+                        reasons.append("新增步骤不能直接设为 done，需先经历 in_progress")
+                    elif old["status"] not in {"pending", "in_progress"}:
+                        reasons.append(f"该步骤当前状态为 {old['status']}，不能直接设为 done")
+                    if not step["outcome"]:
+                        reasons.append("缺少 outcome 字段说明执行成果")
+                    if not evidence:
+                        reasons.append(f"缺少有效 evidence ID（当前可用证据 ID: {sorted(available)}）")
+                    elif invalid_evidence:
+                        reasons.append(f"包含无效 evidence ID {invalid_evidence}（当前可用证据 ID: {sorted(available)}）")
+                    err_msg = "完成步骤需要 outcome 和成功工具调用的 evidence ID"
+                    if reasons:
+                        err_msg += "：" + "；".join(reasons)
                     self._reject_plan_update(
-                        "完成步骤需要 outcome 和成功工具调用的 evidence ID",
+                        err_msg,
                         arguments, before, context=debug_context, candidate=candidate + [step],
                         validation="done_transition",
                         step_id=step["id"], old_step=old, available_evidence=sorted(available),

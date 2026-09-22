@@ -17,7 +17,7 @@ import unittest
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 TESTS_ROOT = PROJECT_ROOT / "tests"
-MAX_SMOKE_TESTS = 50
+MAX_SMOKE_TESTS = 55
 
 # Keep this balanced across the persistent workspace, context/tool loop,
 # custom protocol translation, web evidence, prompts, and code execution.

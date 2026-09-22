@@ -119,6 +119,39 @@ class ContextEfficiencyTests(unittest.TestCase):
         self.assertIn("edits", compact)
         self.assertLess(len(function["arguments"]), 250)
 
+    def test_host_mutation_tools_are_compacted(self) -> None:
+        function = {
+            "name": "write_file",
+            "arguments": json.dumps({"path": "/home/share/app.js", "content": "x" * 100_000}),
+        }
+        changed = _compact_workspace_call_arguments(
+            function,
+            name="write_file",
+            path="/home/share/app.js",
+            succeeded=True,
+        )
+        self.assertTrue(changed)
+        compact = json.loads(function["arguments"])
+        self.assertEqual(compact["path"], "/home/share/app.js")
+        self.assertEqual(compact["content"], "[successful write body omitted from repeated context]")
+
+        function_edit = {
+            "name": "host_edit_file",
+            "arguments": json.dumps({
+                "path": "/home/share/app.js",
+                "edits": [{"old_text": "old", "new_text": "x" * 10_000}],
+            }),
+        }
+        changed_edit = _compact_workspace_call_arguments(
+            function_edit,
+            name="host_edit_file",
+            path="/home/share/app.js",
+            succeeded=True,
+        )
+        self.assertTrue(changed_edit)
+        compact_edit = json.loads(function_edit["arguments"])
+        self.assertIn("edits", compact_edit)
+
 class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_identical_validation_is_skipped_until_workspace_changes(self) -> None:
         class CountingWorkspace(ConversationWorkspace):

@@ -358,17 +358,18 @@ def _compact_workspace_call_arguments(
             function["arguments"] = "{}"
             return True
         return False
-    compact_threshold = FRESH_WRITE_CONTEXT_THRESHOLD if name == "write_file" else WORKSPACE_ARGUMENT_COMPACT_THRESHOLD
-    if name not in WORKSPACE_MUTATION_TOOLS or len(raw) <= compact_threshold:
+    canonical = HOST_LEGACY_TOOL_ALIASES.get(name, name)
+    compact_threshold = FRESH_WRITE_CONTEXT_THRESHOLD if canonical == "write_file" else WORKSPACE_ARGUMENT_COMPACT_THRESHOLD
+    if (canonical not in WORKSPACE_MUTATION_TOOLS and canonical not in HOST_FILE_MUTATION_TOOLS) or len(raw) <= compact_threshold:
         return False
     compact: dict[str, Any] = {"path": path}
-    if name == "write_file":
+    if canonical == "write_file":
         compact["content"] = "[successful write body omitted from repeated context]"
-    elif name in {"apply_patch", "replace_text"}:
+    elif canonical in {"apply_patch", "replace_text"}:
         compact.update({"old_text": "[omitted]", "new_text": "[omitted]"})
-    elif name == "apply_patch_batch":
+    elif canonical == "apply_patch_batch":
         compact["patches"] = [{"old_text": "[omitted]", "new_text": "[omitted]"}]
-    elif name == "edit_file":
+    elif canonical == "edit_file":
         compact["edits"] = [{"old_text": "[omitted]", "new_text": "[omitted]"}]
     function["arguments"] = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
     return True
@@ -2256,8 +2257,15 @@ async def stream_response(
                         path=step.get("path", ""),
                         succeeded=step["status"] == "completed",
                     )
-                    if compacted_arguments:
-                        result_text += "\n[上下文优化：大型操作参数已执行并从后续重复请求中省略；当前工作区文件是权威状态。]"
+                elif is_extra and (name in HOST_FILE_MUTATION_TOOLS or HOST_LEGACY_TOOL_ALIASES.get(name) in HOST_FILE_MUTATION_TOOLS):
+                    compacted_arguments = _compact_workspace_call_arguments(
+                        function,
+                        name=name,
+                        path=step.get("path", ""),
+                        succeeded=step["status"] == "completed",
+                    )
+                if compacted_arguments:
+                    result_text += "\n[上下文优化：大型操作参数已执行并从后续重复请求中省略；当前工作区文件是权威状态。]"
                 trace_item = {
                     "id": call_id,
                     "name": workspace_name if is_workspace else name,

@@ -91,6 +91,26 @@ class ExecutionPlanTests(unittest.TestCase):
         self.assertEqual(p.revisions[-1]["reason"], "format discovered")
         self.assertEqual(p.active["id"], "s1")
 
+    def test_plan_aliases_and_string_evidence(self):
+        p = ExecutionPlan()
+        p.apply({
+            "steps": [
+                {"step": "step 1", "status": "active"},
+                {"step": "step 2", "status": "todo"},
+            ]
+        })
+        self.assertEqual(p.steps[0]["status"], "in_progress")
+        self.assertEqual(p.steps[1]["status"], "pending")
+        p.record("call_abc", "run_command", "completed", "a.py", "ok")
+        proposed = copy.deepcopy(p.steps)
+        proposed[0].update(status="completed", result="finished step 1", evidence="call_abc")
+        proposed[1]["status"] = "active"
+        p.apply({"steps": proposed})
+        self.assertEqual(p.steps[0]["status"], "done")
+        self.assertEqual(p.steps[0]["outcome"], "finished step 1")
+        self.assertEqual(p.steps[0]["evidence"], ["call_abc"])
+        self.assertEqual(p.steps[1]["status"], "in_progress")
+
     def test_gate_blocked_and_checkpoint_restore(self):
         p = ExecutionPlan()
         for i in range(2):
