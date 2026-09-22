@@ -37,10 +37,6 @@ class ExecutionPlanTests(unittest.TestCase):
         self.assertEqual(p.active["id"], "s2")
         self.assertEqual(p.note, "keep decision")
         proposed[1].update(status="done", outcome="tested", evidence=["write2"])
-        with self.assertRaises(ValueError):
-            p.apply({"steps": proposed})
-        p.record("check", "run_command", "completed", "", "passed")
-        proposed[1]["evidence"] = ["check"]
         p.apply({"steps": proposed})
         self.assertFalse(p.unfinished)
         self.assertTrue(p.needs_plan)
@@ -54,6 +50,31 @@ class ExecutionPlanTests(unittest.TestCase):
         proposed[0].update(status="done",outcome="fixed",evidence=["write2"])
         with self.assertRaises(ValueError):
             p.apply({"steps": proposed})
+        p = ExecutionPlan()
+        p.apply({"steps": [
+            {"id": "client-engine", "step": "write engine", "status": "in_progress"},
+            {"id": "client-verify", "step": "verify", "status": "pending"},
+        ]})
+        self.assertEqual([step["id"] for step in p.steps], ["client-engine", "client-verify"])
+        # A single write can satisfy several deliverables in the same plan.
+        p = ExecutionPlan()
+        p.apply({
+            "steps": [
+                {"id": "s1", "step": "write engine", "status": "in_progress"},
+                {"id": "s2", "step": "write AI", "status": "pending"},
+                {"id": "s3", "step": "write UI", "status": "pending"},
+                {"id": "s4", "step": "verify", "status": "pending"},
+            ]
+        })
+        p.record("write-all", "write_file", "completed", "xiangqi.html", "saved")
+        proposed = copy.deepcopy(p.steps)
+        for item in proposed[:3]:
+            item.update(status="done", outcome="implemented in the same file", evidence=["write-all"])
+        proposed[3]["status"] = "in_progress"
+        p.apply({"steps": proposed})
+        self.assertEqual([step["status"] for step in p.steps], ["done", "done", "done", "in_progress"])
+        self.assertEqual(p.active["id"], "s4")
+        self.assertEqual(p.steps[1]["evidence"], ["write-all"])
 
     def test_replan_and_single_active_contract(self):
         p = ExecutionPlan()

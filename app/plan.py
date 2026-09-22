@@ -302,6 +302,7 @@ class ExecutionPlan(TaskPlan):
         titles = {s["step"]: s for s in self.steps}
         candidate = []
         serial = self.serial
+        initial_plan = not self.steps
         for item in raw:
             if not isinstance(item, dict) or item.get("status") not in STATUSES:
                 self._reject_plan_update(
@@ -315,25 +316,39 @@ class ExecutionPlan(TaskPlan):
                     candidate=candidate, invalid_item=item,
                 )
             old = previous.get(str(item.get("id") or "")) if item.get("id") else titles.get(title)
-            if item.get("id") and not old:
+            # The first plan is often emitted with client-side IDs before the
+            # model has seen a server-rendered plan. Accept those IDs when
+            # establishing the plan; unknown IDs on later updates still mean
+            # that the model is referring to a stale plan.
+            if item.get("id") and not old and not initial_plan:
                 self._reject_plan_update(
                     "未知步骤 ID；新增步骤请省略 id", arguments, before, context=debug_context,
                     candidate=candidate, invalid_id=item.get("id"), known_ids=sorted(previous),
                 )
             if not old:
                 serial += 1
-            step = {"id": old["id"] if old else f"s{serial}", "step": title, "status": item["status"],
+            supplied_id = " ".join(str(item.get("id") or "").split())[:64]
+            step_id = old["id"] if old else supplied_id or f"s{serial}"
+            step = {"id": step_id, "step": title, "status": item["status"],
                     "outcome": str(item.get("outcome", (old or {}).get("outcome", ""))).strip()[:1000],
                     "evidence": list((old or {}).get("evidence") or [])}
             status_changed = not old or old["status"] != step["status"]
             if step["status"] == "done" and status_changed:
-                available = {r["id"] for r in self.receipts.get(step["id"], []) if r["status"] == "completed"}
+                available = self._available_evidence()
                 evidence = item.get("evidence") or []
                 evidence_types = [type(item). __name__ for item in evidence] if isinstance(evidence, list) else []
                 invalid_evidence = [e for e in evidence if not isinstance(e, str) or e not in available] if isinstance(evidence, list) else evidence
-                if not old or old["status"] != "in_progress" or old["step"] != title or not step["outcome"] or not isinstance(evidence, list) or not evidence or invalid_evidence:
+                if (
+                    not old
+                    or old["status"] not in {"pending", "in_progress"}
+                    or old["step"] != title
+                    or not step["outcome"]
+                    or not isinstance(evidence, list)
+                    or not evidence
+                    or invalid_evidence
+                ):
                     self._reject_plan_update(
-                        "完成步骤需要先执行该当前步骤，再提供 outcome 和该步骤成功工具调用的 evidence ID",
+                        "完成步骤需要 outcome 和成功工具调用的 evidence ID",
                         arguments, before, context=debug_context, candidate=candidate + [step],
                         validation="done_transition",
                         step_id=step["id"], old_step=old, available_evidence=sorted(available),
@@ -410,13 +425,28 @@ class ExecutionPlan(TaskPlan):
             receipts.append({"id": call_id, "tool": name, "status": status, "path": path[:300],
                              "result": result[:200]})
 
+    def _available_evidence(self) -> set[str]:
+        """Return successful operation IDs from the whole current plan.
+
+        One operation can complete more than one planned deliverable (for
+        example, a single write_file can create an entire self-contained
+        application). Evidence therefore belongs to the task, not exclusively
+        to whichever step happened to be active when the operation ran.
+        """
+        return {
+            receipt["id"]
+            for receipts in self.receipts.values()
+            for receipt in receipts
+            if receipt.get("status") == "completed" and receipt.get("id")
+        }
+
     def runtime_note(self) -> str:
         if not self.steps:
             return ("规划阶段：已完成初步探索。若任务仍需工具，先用 update_plan 建立具体交付步骤和验证步骤，"
                     "其中一个为 in_progress；若两次操作已足够，可直接回答。") if self.needs_plan else ""
         receipts = self.receipts.get((self.active or {}).get("id", ""), [])
         state = {"steps": self.steps, "note": self.note, "recent_results": receipts[-3:],
-                 "eligible_evidence_ids": [r["id"] for r in receipts if r["status"] == "completed"]}
+                 "eligible_evidence_ids": sorted(self._available_evidence())}
         return ("服务端执行状态（权威）：" + json.dumps(state, ensure_ascii=False) +
                 "\n只推进当前步骤；达到该步骤结果后，用 update_plan 提交 outcome 和成功调用的 evidence ID，激活下一步。"
                 "遇到新事实可用 replan_reason 调整；无法继续则标记 blocked 并说明原因。所有步骤完成后再给最终交付。")
