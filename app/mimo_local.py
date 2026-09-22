@@ -144,6 +144,11 @@ READ_ONLY_TOOL_NAMES = {
     "read_file", "list_files", "search_files", "web_search", "fetch_webpage",
     "host_read_file", "host_list_files", "host_search_files", "frontend_read_page", "frontend_list_pages",
 }
+PREFETCHABLE_READ_TOOLS = {
+    "read_file", "list_files", "search_files",
+    "host_read_file", "host_list_files", "host_search_files",
+    "conversation_list", "conversation_read", "skill_list", "skill_read",
+}
 _WRITING_COMMAND_RE = re.compile(
     r"(>|\btee\b|\bcp\b|\bmv\b|\bmkdir\b|\brm\b|\bsed\s+-i|\bgit\s+(clone|checkout|apply|pull|init)\b|\bunzip\b|\btar\b|"
     r"\bcurl\b|\bwget\b|\bpip3?\b|\bapt(-get)?\b|\bnpm\b|\bnpx\b|\bmake\b|\bcmake\b|\binstall\b|\bchmod\b|\bchown\b|"
@@ -1109,7 +1114,7 @@ async def stream_response(
                     # Stays listed after loading, so the tool list changes
                     # once per loaded group and not again.
                     round_tools.append(load_tools_definition(deferrable_groups))
-                if plan_tool_expected and plan.needs_plan:
+                if plan_tool_expected and agent_mode and plan.needs_plan:
                     # Planning is an actual scheduler phase, not an optional
                     # checklist. Execution resumes as soon as a valid step is active.
                     round_tools = [UPDATE_PLAN_TOOL]
@@ -1647,6 +1652,44 @@ async def stream_response(
             conversation.append(assistant_message)
             tool_results_start = len(conversation)
             tool_rounds_used += 1
+            prefetched_tasks: dict[str, asyncio.Task[str]] = {}
+            if len(calls) > 1 and not plan.needs_plan:
+                for c in calls:
+                    c_func = c.get("function") or {}
+                    c_name = str(c_func.get("name") or "")
+                    c_ws_name, c_bound_path = inkling_patch_bindings.get(c_name, (c_name, ""))
+                    c_is_extra = extra_tools_expected and (
+                        c_name in extra_tool_names or HOST_LEGACY_TOOL_ALIASES.get(c_name) in extra_tool_names
+                    )
+                    c_is_ws = workspace_tools_expected and not c_is_extra and c_ws_name in WORKSPACE_TOOL_NAMES
+                    target_tool = c_ws_name if c_is_ws else c_name
+                    if target_tool not in PREFETCHABLE_READ_TOOLS:
+                        break
+                    try:
+                        c_raw = str(c_func.get("arguments") or "")
+                        c_args = json.loads(c_raw or "{}")
+                        if not isinstance(c_args, dict):
+                            break
+                        c_args = normalize_file_tool_arguments(c_ws_name if c_is_ws else c_name, c_args)
+                        if c_is_ws and workspace is not None:
+                            if c_ws_name not in allowed_workspace_tools:
+                                break
+                            if c_bound_path:
+                                c_args["path"] = c_bound_path
+                            prefetched_tasks[c["id"]] = asyncio.create_task(
+                                asyncio.to_thread(workspace.execute, c_ws_name, c_args)
+                            )
+                        elif c_is_extra and extra_tool_handler is not None:
+                            if inspect.iscoroutinefunction(extra_tool_handler):
+                                prefetched_tasks[c["id"]] = asyncio.create_task(
+                                    extra_tool_handler(c_name, c_args)
+                                )
+                            else:
+                                prefetched_tasks[c["id"]] = asyncio.create_task(
+                                    asyncio.to_thread(extra_tool_handler, c_name, c_args)
+                                )
+                    except Exception:
+                        break
             for call in calls:
                 call_id = call["id"]
                 function = call.get("function") or {}
@@ -1697,7 +1740,7 @@ async def stream_response(
                 target_url = ""
                 execution_allowed = True
                 try:
-                    if not is_plan and not is_load and (is_workspace or is_extra or plan.steps):
+                    if not is_plan and not is_load and (is_extra or (agent_mode and is_workspace) or plan.steps):
                         execution_allowed = not plan.needs_plan
                         plan.require_execution()
                     # Quota errors must take precedence over argument validation. If
@@ -1886,7 +1929,10 @@ async def stream_response(
                                 )
                             else:
                                 workspace_searches.add(search_key)
-                                result_text = await asyncio.to_thread(workspace.execute, workspace_name, arguments)
+                                if call_id in prefetched_tasks:
+                                    result_text = await prefetched_tasks[call_id]
+                                else:
+                                    result_text = await asyncio.to_thread(workspace.execute, workspace_name, arguments)
                         elif (
                             workspace_name in {"run_python", "run_command", "check_web_syntax"}
                             and (workspace_generation, validation_key) in workspace_validations
@@ -1901,7 +1947,10 @@ async def stream_response(
                                 ensure_ascii=False,
                             )
                         else:
-                            result_text = await asyncio.to_thread(workspace.execute, workspace_name, arguments)
+                            if call_id in prefetched_tasks:
+                                result_text = await prefetched_tasks[call_id]
+                            else:
+                                result_text = await asyncio.to_thread(workspace.execute, workspace_name, arguments)
                             if workspace_name == "list_files":
                                 workspace_list_generations.add(workspace_generation)
                             elif workspace_name == "read_file":
@@ -2132,7 +2181,9 @@ async def stream_response(
                     elif is_extra:
                         if extra_tool_handler is None:
                             raise ValueError("当前 Agent 没有可用的主机工具处理器")
-                        if inspect.iscoroutinefunction(extra_tool_handler):
+                        if call_id in prefetched_tasks:
+                            result_text = await prefetched_tasks[call_id]
+                        elif inspect.iscoroutinefunction(extra_tool_handler):
                             result_text = await extra_tool_handler(name, arguments)
                         else:
                             result_text = await asyncio.to_thread(extra_tool_handler, name, arguments)
@@ -2296,7 +2347,7 @@ async def stream_response(
                 # The latest result carries authoritative progress even without
                 # compaction or visible reasoning. Added before Responses pending
                 # is built, so stateful and stateless protocols see the same state.
-                if call is calls[-1] and (plan.steps or plan.needs_plan):
+                if call is calls[-1] and (plan.steps or (agent_mode and plan.needs_plan)):
                     _append_runtime_note(conversation, plan.runtime_note())
                 await update(
                     {
@@ -2311,6 +2362,9 @@ async def stream_response(
                         "round_stats": round_stats,
                     }
                 )
+            for t in prefetched_tasks.values():
+                if not t.done():
+                    t.cancel()
             if stall_refusals >= STALL_REFUSALS_BEFORE_ANSWER:
                 # It keeps asking to look around after being told to write or
                 # answer: end the tool loop and take the answer it can give.

@@ -59,8 +59,33 @@ WEB_EVIDENCE_PER_SOURCE_MAX_CHARS = 6_000
 job_slots: Optional[asyncio.Semaphore] = None
 attachment_cleanup_task: Optional[asyncio.Task[Any]] = None
 attachment_upload_locks: dict[int, asyncio.Lock] = {}
-attachment_processing_lock = asyncio.Lock()
-attachment_job_lock = asyncio.Lock()
+class _LazyLock:
+    def __init__(self) -> None:
+        self._lock: Optional[asyncio.Lock] = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def acquire(self) -> bool:
+        return await self._get_lock().acquire()
+
+    def release(self) -> None:
+        self._get_lock().release()
+
+    def locked(self) -> bool:
+        return self._get_lock().locked()
+
+    async def __aenter__(self) -> asyncio.Lock:
+        return await self._get_lock().__aenter__()
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+        return await self._get_lock().__aexit__(exc_type, exc, tb)
+
+
+attachment_processing_lock = _LazyLock()
+attachment_job_lock = _LazyLock()
 SUPPORTED_MODELS = {
     # Custom providers advertise their own model IDs through /models or a
     # manually entered model name, so there is no static allow-list here.

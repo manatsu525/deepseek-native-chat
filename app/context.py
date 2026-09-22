@@ -222,14 +222,15 @@ def compact_request(
     previous = checkpoint_payload(base)
 
     snapshots = knowledge.snapshots(min(int(budget * SNAPSHOT_BUDGET_RATIO), SNAPSHOT_MAX_CHARS)) if knowledge is not None else []
+    base_instruction = (
+        "Older tool results were replaced by one-line stubs to fit the context budget; your own messages and "
+        "tool calls are intact. file_snapshots hold the exact current content of files you read or wrote "
+        "(numbered lines, including your own edits): use them instead of reading those files again. "
+        "plan is your task plan; continue from it and keep it updated. Do not repeat completed operations."
+    )
     checkpoint: dict[str, Any] = {
         "context_checkpoint": True,
-        "instruction": (
-            "Older tool results were replaced by one-line stubs to fit the context budget; your own messages and "
-            "tool calls are intact. file_snapshots hold the exact current content of files you read or wrote "
-            "(numbered lines, including your own edits): use them instead of reading those files again. "
-            "plan is your task plan; continue from it and keep it updated. Do not repeat completed operations."
-        ),
+        "instruction": base_instruction,
         "file_snapshots": snapshots,
         "sources": [
             {"url": item.get("url", ""), "title": item.get("title", ""), "summary": str(item.get("summary") or "")[:200]}
@@ -245,11 +246,13 @@ def compact_request(
     def attach(notes_now: list[str]) -> None:
         if notes_now:
             checkpoint["progress_notes"] = notes_now[-PROGRESS_NOTE_COUNT:]
-            checkpoint["instruction"] += (
+            checkpoint["instruction"] = (
+                base_instruction +
                 " progress_notes are your own earlier statements from rounds that were removed entirely, oldest first."
             )
         else:
             checkpoint.pop("progress_notes", None)
+            checkpoint["instruction"] = base_instruction
         text = json.dumps(checkpoint, ensure_ascii=False, separators=(",", ":"))
         if base and base[-1].get("role") == "user":
             base[-1] = with_message_block(conversation[base_message_count - 1], CONTEXT_CHECKPOINT_MARKER, text)

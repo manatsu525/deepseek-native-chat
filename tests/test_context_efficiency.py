@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import tempfile
+import asyncio
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -360,6 +363,234 @@ class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [item["name"] for item in result["tool_trace"]],
             ["write_file", "write_file"],
+        )
+
+    async def test_multiple_read_calls_run_concurrently_and_preserve_order(self) -> None:
+        active_concurrent = 0
+        max_concurrent = 0
+        lock = threading.Lock()
+
+        class ConcurrencyTrackingWorkspace(ConversationWorkspace):
+            def execute(self, name: str, arguments: dict) -> str:
+                nonlocal active_concurrent, max_concurrent
+                with lock:
+                    active_concurrent += 1
+                    if active_concurrent > max_concurrent:
+                        max_concurrent = active_concurrent
+                time.sleep(0.04)
+                with lock:
+                    active_concurrent -= 1
+                return super().execute(name, arguments)
+
+        def tool_response(calls: list[tuple[str, str, dict]]) -> list[str]:
+            event_calls = []
+            for index, (call_id, name, arguments) in enumerate(calls):
+                event_calls.append(
+                    {
+                        "index": index,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(arguments)},
+                    }
+                )
+            event = {"choices": [{"delta": {"tool_calls": event_calls}}]}
+            return ["data: " + json.dumps(event), "data: [DONE]"]
+
+        class FakeResponse:
+            status_code = 200
+
+            def __init__(self, lines: list[str]) -> None:
+                self.lines = lines
+
+            async def aiter_lines(self):
+                for line in self.lines:
+                    yield line
+
+            async def aread(self) -> bytes:
+                return b""
+
+        class FakeStreamContext:
+            def __init__(self, lines: list[str]) -> None:
+                self.response = FakeResponse(lines)
+
+            async def __aenter__(self):
+                return self.response
+
+            async def __aexit__(self, *_):
+                return False
+
+        responses = [
+            tool_response(
+                [
+                    ("read-1", "read_file", {"path": "one.txt"}),
+                    ("read-2", "read_file", {"path": "two.txt"}),
+                    ("read-3", "read_file", {"path": "three.txt"}),
+                ]
+            ),
+            ["data: " + json.dumps({"choices": [{"delta": {"content": "完成"}}]}), "data: [DONE]"],
+        ]
+
+        class FakeAsyncClient:
+            def __init__(self, **_):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            def stream(self, *_args, **_kwargs):
+                return FakeStreamContext(responses.pop(0))
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = ConcurrencyTrackingWorkspace(1, "multi-read")
+            workspace.root = Path(directory)
+            (workspace.root / "one.txt").write_text("content 1\n")
+            (workspace.root / "two.txt").write_text("content 2\n")
+            (workspace.root / "three.txt").write_text("content 3\n")
+
+            async def update(_):
+                return None
+
+            start = time.perf_counter()
+            with patch.object(mimo_local.httpx, "AsyncClient", FakeAsyncClient):
+                result = await stream_response(
+                    base_url="https://example.test/v1",
+                    api_key="test-key",
+                    model="test-model",
+                    messages=[{"role": "user", "content": "读取三个文件"}],
+                    timeout=30,
+                    stopped=lambda: False,
+                    update=update,
+                    settings={"thinking": "disabled", "max_completion_tokens": 1024},
+                    conversation_id="multi-read",
+                    workspace=workspace,
+                    web_enabled=False,
+                )
+            elapsed = time.perf_counter() - start
+
+        self.assertGreater(max_concurrent, 1)
+        self.assertLess(elapsed, 0.10)
+        self.assertEqual(result["answer"], "完成")
+        self.assertEqual(
+            [item["id"] for item in result["tool_trace"]],
+            ["read-1", "read-2", "read-3"],
+        )
+        self.assertEqual(
+            [item["status"] for item in result["tool_trace"]],
+            ["completed", "completed", "completed"],
+        )
+
+    async def test_agent_mode_multiple_read_calls_run_concurrently(self) -> None:
+        active_concurrent = 0
+        max_concurrent = 0
+        lock = threading.Lock()
+
+        async def fake_extra_handler(name: str, arguments: dict) -> str:
+            nonlocal active_concurrent, max_concurrent
+            with lock:
+                active_concurrent += 1
+                if active_concurrent > max_concurrent:
+                    max_concurrent = active_concurrent
+            await asyncio.sleep(0.04)
+            with lock:
+                active_concurrent -= 1
+            return json.dumps({"ok": True, "path": arguments.get("path", ""), "content": "data"})
+
+        def tool_response(calls: list[tuple[str, str, dict]]) -> list[str]:
+            event_calls = []
+            for index, (call_id, name, arguments) in enumerate(calls):
+                event_calls.append(
+                    {
+                        "index": index,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(arguments)},
+                    }
+                )
+            event = {"choices": [{"delta": {"tool_calls": event_calls}}]}
+            return ["data: " + json.dumps(event), "data: [DONE]"]
+
+        class FakeResponse:
+            status_code = 200
+
+            def __init__(self, lines: list[str]) -> None:
+                self.lines = lines
+
+            async def aiter_lines(self):
+                for line in self.lines:
+                    yield line
+
+            async def aread(self) -> bytes:
+                return b""
+
+        class FakeStreamContext:
+            def __init__(self, lines: list[str]) -> None:
+                self.response = FakeResponse(lines)
+
+            async def __aenter__(self):
+                return self.response
+
+            async def __aexit__(self, *_):
+                return False
+
+        responses = [
+            tool_response(
+                [
+                    ("hread-1", "read_file", {"path": "/home/share/a.txt"}),
+                    ("hread-2", "read_file", {"path": "/home/share/b.txt"}),
+                ]
+            ),
+            ["data: " + json.dumps({"choices": [{"delta": {"content": "读取完毕"}}]}), "data: [DONE]"],
+        ]
+
+        class FakeAsyncClient:
+            def __init__(self, **_):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            def stream(self, *_args, **_kwargs):
+                return FakeStreamContext(responses.pop(0))
+
+        extra_tool_defs = [
+            {"type": "function", "function": {"name": "read_file", "description": "read", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}},
+        ]
+
+        start = time.perf_counter()
+        with patch.object(mimo_local.httpx, "AsyncClient", FakeAsyncClient):
+            result = await stream_response(
+                base_url="https://example.test/v1",
+                api_key="test-key",
+                model="test-model",
+                messages=[{"role": "user", "content": "检查主机文件"}],
+                timeout=30,
+                stopped=lambda: False,
+                update=lambda _: asyncio.sleep(0),
+                settings={"thinking": "disabled", "max_completion_tokens": 1024},
+                agent_mode=True,
+                workspace_access="none",
+                extra_tools=extra_tool_defs,
+                extra_tool_handler=fake_extra_handler,
+                web_enabled=False,
+            )
+        elapsed = time.perf_counter() - start
+
+        self.assertGreater(max_concurrent, 1)
+        self.assertLess(elapsed, 0.07)
+        self.assertEqual(result["answer"], "读取完毕")
+        self.assertEqual(
+            [item["id"] for item in result["tool_trace"]],
+            ["hread-1", "hread-2"],
+        )
+        self.assertEqual(
+            [item["status"] for item in result["tool_trace"]],
+            ["completed", "completed"],
         )
 
 if __name__ == "__main__":
