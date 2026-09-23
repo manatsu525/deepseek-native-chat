@@ -111,13 +111,13 @@ class ExecutionPlanTests(unittest.TestCase):
         self.assertEqual(p.steps[0]["evidence"], ["call_abc"])
         self.assertEqual(p.steps[1]["status"], "in_progress")
 
-    def test_gate_blocked_and_checkpoint_restore(self):
+    def test_plan_state_and_checkpoint_restore(self):
         p = ExecutionPlan()
         for i in range(2):
             p.require_execution()
             p.record(str(i), "read_file", "completed", "a", "read")
-        with self.assertRaises(ValueError):
-            p.require_execution()
+        self.assertFalse(p.needs_plan)
+        p.require_execution()
         p.apply({"steps": [{"step": "inspect", "status": "in_progress"}]})
         p.record("read", "read_file", "completed", "a", "read")
         saved = p.export()
@@ -209,14 +209,14 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
                 final = copy.deepcopy(second)
                 final[1].update(status="done",outcome="passed",evidence=["check"])
                 result, payloads, executed, updates = await self.run_loop([
-                    [("a","run_command",{"command":"inspect a"}),("b","run_command",{"command":"inspect b"}), ("denied","run_command",{"command":"should not run"})],
+                    [("a","run_command",{"command":"inspect a"}),("b","run_command",{"command":"inspect b"}), ("batch-third","run_command",{"command":"should run"})],
                     [("p","update_plan",{"steps":first})],
                     [("write","run_command",{"command":"implement"})],
                     [("p2","update_plan",{"steps":second}), ("check","run_command",{"command":"verify"})],
                     [("p3","update_plan",{"steps":final})], ["done"]], protocol)
-                self.assertEqual(executed, ["inspect a","inspect b","implement","verify"])
+                self.assertEqual(executed, ["inspect a","inspect b","should run","implement","verify"])
                 names = [t.get("name", t.get("function",{}).get("name")) for t in payloads[1]["tools"]]
-                self.assertEqual(names,["update_plan"])
+                self.assertEqual(names,["run_command","update_plan"])
                 self.assertFalse(result["incomplete"])
                 self.assertEqual(result["plan"]["steps"][1]["evidence"],["check"])
                 self.assertTrue(any(u.get("plan",{}).get("steps") for u in updates))

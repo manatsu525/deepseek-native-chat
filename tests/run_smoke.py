@@ -17,14 +17,13 @@ import unittest
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 TESTS_ROOT = PROJECT_ROOT / "tests"
-MAX_SMOKE_TESTS = 55
+MAX_SMOKE_TESTS = 50
 
 # Keep this balanced across the persistent workspace, context/tool loop,
 # custom protocol translation, web evidence, prompts, and code execution.
 SMOKE_SPECS = (
     "test_workspace.FileViewRewriteTests",
     "test_workspace.WorkspaceTests",
-    "test_context.CompactRequestTests.test_under_budget_is_untouched",
     "test_context.CompactRequestTests.test_old_results_become_stubs_and_recent_ones_survive",
     "test_context.CompactRequestTests.test_whole_rounds_are_dropped_only_as_a_last_resort",
     "test_context.CompactRequestTests.test_checkpoint_carries_files_plan_and_sources",

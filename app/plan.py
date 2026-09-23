@@ -217,7 +217,10 @@ class ExecutionPlan(TaskPlan):
 
     @property
     def needs_plan(self) -> bool:
-        return (not self.steps and self.operations >= 2) or bool(self.steps and not self.active)
+        # A plan is required only after the model has explicitly established
+        # one and left no active step.  Operation count alone must not revoke
+        # permission in the middle of an otherwise valid Agent workflow.
+        return bool(self.steps and not self.active)
 
     @property
     def unfinished(self) -> bool:

@@ -181,17 +181,6 @@ def _read_only_call(name: str, arguments: dict[str, Any]) -> bool:
     return False
 
 
-def _is_analysis_active_step(plan: Any) -> bool:
-    """Whether the current active plan step is an inspection, review, or analysis step."""
-    if not plan or not getattr(plan, "active", None):
-        return False
-    step_desc = str((plan.active or {}).get("step") or "").lower()
-    analysis_keywords = (
-        "inspect", "review", "analyze", "analysis", "investigate", "audit", "diagnose",
-        "read", "search", "explore",
-        "排查", "分析", "审查", "查看", "调研", "定位", "诊断", "阅读", "了解", "搜索", "确认",
-    )
-    return any(k in step_desc for k in analysis_keywords)
 RUNTIME_NOTE_MARKER = "\n\n[Runtime note] "
 USER_CONTEXT_MARKER = "\n\n---\n[Context supplied by the application, not written by the user]\n"
 FINAL_ANSWER_PROMPT = (
@@ -1670,6 +1659,12 @@ async def stream_response(
             conversation.append(assistant_message)
             tool_results_start = len(conversation)
             tool_rounds_used += 1
+            # A model response is one scheduling boundary.  Decide whether
+            # execution is currently allowed before consuming any call in the
+            # batch; do not revoke permission after an earlier call increments
+            # the plan's operation count.  If a plan is needed, the next model
+            # round will be advertised with update_plan only.
+            batch_needs_plan = plan.needs_plan
             prefetched_tasks: dict[str, asyncio.Task[str]] = {}
             if len(calls) > 1 and not plan.needs_plan:
                 for c in calls:
@@ -1759,8 +1754,9 @@ async def stream_response(
                 execution_allowed = True
                 try:
                     if not is_plan and not is_load and (is_extra or (agent_mode and is_workspace) or plan.steps):
-                        execution_allowed = not plan.needs_plan
-                        plan.require_execution()
+                        execution_allowed = not batch_needs_plan
+                        if batch_needs_plan:
+                            plan.require_execution()
                     # Quota errors must take precedence over argument validation. If
                     # the model calls an exhausted tool with malformed arguments,
                     # tell it to stop using that tool instead of inviting a retry.
@@ -1827,10 +1823,8 @@ async def stream_response(
                     received_keys = sorted(arguments)
                     arguments = normalize_file_tool_arguments(workspace_name if is_workspace else name, arguments)
                     read_only_mode = workspace_access == "read_only"
-                    analysis_step = _is_analysis_active_step(plan)
                     if (
                         not read_only_mode
-                        and not analysis_step
                         and calls_since_mutation >= MUTATION_STALL_REFUSE_CALLS
                         and (workspace_tools_expected or extra_tools_expected)
                         and _read_only_call(workspace_name if is_workspace else name, arguments)
@@ -2302,11 +2296,9 @@ async def stream_response(
                 ):
                     files_changed += 1
                 read_only_mode = workspace_access == "read_only"
-                analysis_step = _is_analysis_active_step(plan)
                 if (
                     not is_plan and not is_load
                     and not read_only_mode
-                    and not analysis_step
                     and calls_since_mutation >= MUTATION_STALL_CALLS
                     and (calls_since_mutation - MUTATION_STALL_CALLS) % MUTATION_STALL_EVERY == 0
                     and (workspace_tools_expected or extra_tools_expected)
@@ -2328,7 +2320,7 @@ async def stream_response(
                         result_text += "\n当前计划：\n" + plan.render()
                 elif (
                     not is_plan and not is_load
-                    and (read_only_mode or analysis_step)
+                    and read_only_mode
                     and calls_since_mutation >= MUTATION_STALL_REFUSE_CALLS
                     and (calls_since_mutation - MUTATION_STALL_REFUSE_CALLS) % MUTATION_STALL_EVERY == 0
                     and (workspace_tools_expected or extra_tools_expected)
