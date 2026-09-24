@@ -137,7 +137,7 @@ class ExecutionPlanTests(unittest.TestCase):
 
 
 class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
-    async def run_loop(self, rounds, protocol="chat_completions", status_sequence=None):
+    async def run_loop(self, rounds, protocol="chat_completions", status_sequence=None, settings=None):
         payloads, executed, updates = [], [], []
         statuses = list(status_sequence or [])
         def event(obj):
@@ -194,7 +194,7 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
             result = await mimo_local.stream_response(
                 base_url="https://example.invalid/v1", api_key="test", model="test", messages=[{"role":"user","content":"edit files"}],
                 timeout=5, stopped=lambda:False, update=update, web_enabled=False, agent_mode=True,
-                max_tool_rounds=15, api_protocol=protocol,
+                max_tool_rounds=15, api_protocol=protocol, settings=settings,
                 extra_tools=[{"type":"function","function":{"name":"run_command","description":"run","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}],
                 extra_tool_handler=execute)
         self.assertFalse(rounds)
@@ -252,3 +252,17 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["retry_status"]["status"], "recovered")
         self.assertEqual(result["retry_status"]["attempt"], 2)
         self.assertTrue(any(item.get("retry_status", {}).get("active") for item in updates))
+
+    async def test_configured_http_status_retries_with_same_policy(self):
+        delays = []
+        async def fake_sleep(seconds):
+            delays.append(seconds)
+        with patch.object(mimo_local.asyncio, "sleep", fake_sleep):
+            result, payloads, _, updates = await self.run_loop(
+                [["hello"]], status_sequence=[429, 429], settings={"retry_status_codes": [429]}
+            )
+        self.assertEqual(len(payloads), 3)
+        self.assertEqual(delays, [5, 5])
+        self.assertEqual(result["retry_status"]["status"], "recovered")
+        self.assertEqual(result["retry_status"]["status_code"], 429)
+        self.assertTrue(any("HTTP 429" in item.get("retry_status", {}).get("message", "") for item in updates))

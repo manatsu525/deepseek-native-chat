@@ -93,6 +93,10 @@ DEFAULT_SETTINGS = {
     "reasoning_effort_enabled": True,
     "lowest_price_aggregators": [],
     "max_completion_tokens": 65536,
+    # HTTP status codes that should use the shared upstream retry policy.
+    # Keep 503 enabled by default for existing configurations; an empty list
+    # explicitly disables automatic retries for a model.
+    "retry_status_codes": [503],
     "context_budget_chars": 240_000,
     "temperature_enabled": False,
     "temperature": 1.0,

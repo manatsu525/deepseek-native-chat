@@ -530,7 +530,8 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
   const searches = meta.searches || [];
   const planSteps = (meta.plan && meta.plan.steps) || [];
   const retryStatus = meta.retry_status || {};
-  const retryMessage = retryStatus.message || (retryStatus.active ? `上游返回 503，5 秒后重试（第 ${retryStatus.attempt || 0}/${retryStatus.max_attempts || 60} 次）` : '');
+  const retryCode = retryStatus.status_code || retryStatus.code || '';
+  const retryMessage = retryStatus.message || (retryStatus.active ? `上游返回 HTTP ${retryCode || '错误'}，5 秒后重试（第 ${retryStatus.attempt || 0}/${retryStatus.max_attempts || 60} 次）` : '');
   const retryHtml = retryMessage ? `<div class="retry-status ${retryStatus.status === 'recovered' ? 'recovered' : retryStatus.status === 'failed' ? 'failed' : ''}">${escapeHtml(retryMessage)}</div>` : '';
   const planLabels = {pending:'待处理',in_progress:'执行中',done:'已完成',blocked:'受阻'};
   const planHtml = planSteps.length ? `<div class="search-step"><strong>执行计划</strong><ol>${planSteps.map(s=>`<li>${escapeHtml(planLabels[s.status]||s.status)} · ${escapeHtml(s.step)}${s.outcome?`<div>${escapeHtml(s.outcome)}</div>`:''}</li>`).join('')}</ol></div>` : '';
@@ -931,10 +932,10 @@ function renderProviderList(){
 
 function providerType(){return $('#providerType').value||'custom'}
 function manualModelList(){return $('#manualModel').value.split(/[\n,]+/).map(item=>item.trim()).filter(Boolean).filter((item,index,array)=>array.indexOf(item)===index)}
-function renderCustomModels(models=[], selected=[]){
-  const list=$('#customModelList'), selectedSet=new Set(selected), values=[...new Set((models||[]).map(String).filter(Boolean))];
-  list.innerHTML=values.length?values.map(model=>`<label class="custom-model-option" data-model="${escapeHtml(model.toLowerCase())}"><input type="checkbox" value="${escapeHtml(model)}" ${selectedSet.has(model)?'checked':''}><span title="${escapeHtml(model)}">${escapeHtml(model)}</span></label>`).join(''):'<p class="custom-model-empty">测试 API 后显示可勾选模型。</p>';
-  $('#customModelCount').textContent=values.length?`共 ${values.length} 个，可勾选保存`:'请先测试 API';
+function renderCustomModels(models=[], selected=[], stale=[]){
+  const list=$('#customModelList'), selectedSet=new Set(selected), staleSet=new Set(stale), values=[...new Set((models||[]).map(String).filter(Boolean))];
+  list.innerHTML=values.length?values.map(model=>{const isStale=staleSet.has(model);return `<label class="custom-model-option${isStale?' stale-model':''}" data-model="${escapeHtml(model.toLowerCase())}"${isStale?' title="上游当前未返回，可能已下架；取消勾选后保存即可移除"':''}><input type="checkbox" value="${escapeHtml(model)}" ${selectedSet.has(model)?'checked':''}><span title="${escapeHtml(model)}">${escapeHtml(model)}${isStale?'（已下架）':''}</span></label>`}).join(''):'<p class="custom-model-empty">测试 API 后显示可勾选模型。</p>';
+  $('#customModelCount').textContent=values.length?`共 ${values.length} 个，可勾选保存${staleSet.size?` · ${staleSet.size} 个红色删除线模型可能已下架`:''}`:'请先测试 API';
   $('#customModelsPanel').classList.toggle('hidden',!isCustomProviderType(providerType())||!values.length);
 }
 function syncProviderForm(){
@@ -983,8 +984,12 @@ async function testProvider(){
       ? await api(`/api/providers/${editing.id}/test`,{method:'POST',body})
       : await api('/api/providers/test',{method:'POST',body});
     const selected=[...new Set([...before,...manualModelList()])];
-    const available=[...new Set([...(result.models||[]),...(editing?providerModels(editing):[]),...manualModelList()])];
-    renderCustomModels(available,selected.length?selected:(editing?providerModels(editing):available.slice(0,1)));
+    const fresh=[...new Set((result.models||[]).map(String).filter(Boolean))];
+    const existing=editing?providerModels(editing):[];
+    const manual=manualModelList();
+    const available=[...new Set([...fresh,...existing,...manual])];
+    const stale=editing?existing.filter(model=>!fresh.includes(model)&&!manual.includes(model)):[];
+    renderCustomModels(available,selected.length?selected:(editing?existing:available.slice(0,1)),stale);
     $('#providerStatus').textContent=`连接成功，读取 ${(result.models||[]).length} 个模型${(result.manual_tested||[]).length?`，手填模型验证 ${result.manual_tested.length} 个`:''}${result.models_warning?'（/models 不可用，已使用手填模型验证）':''}。请勾选后保存。`;
   }catch(err){
     const manual=manualModelList();
@@ -999,7 +1004,7 @@ function checkedCustomModels(){return $$('#customModelList input[type="checkbox"
 function providerFormData(){const manual=manualModelList(),selected=[...new Set([...checkedCustomModels(),...manual])];return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:selected[0]||'',selected_models:selected,manual_models:manual}}
 
 function customSettings(provider,model=selectedModel()){
-  const defaults={thinking:'enabled',reasoning_effort:'high',reasoning_effort_enabled:true,lowest_price_aggregators:[],max_completion_tokens:65536,context_budget_chars:240000,temperature_enabled:false,temperature:1,top_p_enabled:false,top_p:.95,web_tool_backend:'parallel',request_overrides:{},advanced_enabled:false,advanced_request:{}};
+  const defaults={thinking:'enabled',reasoning_effort:'high',reasoning_effort_enabled:true,lowest_price_aggregators:[],max_completion_tokens:65536,retry_status_codes:[503],context_budget_chars:240000,temperature_enabled:false,temperature:1,top_p_enabled:false,top_p:.95,web_tool_backend:'parallel',request_overrides:{},advanced_enabled:false,advanced_request:{}};
   const byModel=provider&&provider.model_settings;
   const saved=byModel&&typeof byModel==='object'&&byModel[model]&&typeof byModel[model]==='object'
     ?byModel[model]
@@ -1007,8 +1012,9 @@ function customSettings(provider,model=selectedModel()){
   return {...defaults,...saved};
 }
 const customEditor={draft:null,preview:null,previewSignature:null,requestId:0,timer:null,providerId:null,model:''};
+function parseRetryStatusCodes(value){return [...new Set(String(value||'').split(/[,，\s]+/).map(item=>item.trim()).filter(Boolean).map(Number).filter(code=>Number.isInteger(code)&&code>=400&&code<=599))]}
 function customFormValues(){
-  return {model:customEditor.model,thinking:$('#customThinking').value,reasoning_effort:$('#customReasoningEffort').value,reasoning_effort_enabled:$('#customReasoningEffortEnabled').checked,lowest_price_aggregators:[$('#customLowestPriceOpenRouter').checked?'openrouter':'',$('#customLowestPriceVercel').checked?'vercel':''].filter(Boolean),max_completion_tokens:Number($('#customMaxCompletion').value),context_budget_chars:Number($('#customContextBudget').value)||240000,temperature_enabled:$('#customTemperatureEnabled').checked,temperature:Number($('#customTemperature').value),top_p_enabled:$('#customTopPEnabled').checked,top_p:Number($('#customTopP').value),web_tool_backend:$('#customWebToolBackend').value,request_overrides:{},advanced_enabled:false,advanced_request:{}};
+  return {model:customEditor.model,thinking:$('#customThinking').value,reasoning_effort:$('#customReasoningEffort').value,reasoning_effort_enabled:$('#customReasoningEffortEnabled').checked,lowest_price_aggregators:[$('#customLowestPriceOpenRouter').checked?'openrouter':'',$('#customLowestPriceVercel').checked?'vercel':''].filter(Boolean),max_completion_tokens:Number($('#customMaxCompletion').value),retry_status_codes:parseRetryStatusCodes($('#customRetryStatusCodes').value),context_budget_chars:Number($('#customContextBudget').value)||240000,temperature_enabled:$('#customTemperatureEnabled').checked,temperature:Number($('#customTemperature').value),top_p_enabled:$('#customTopPEnabled').checked,top_p:Number($('#customTopP').value),web_tool_backend:$('#customWebToolBackend').value,request_overrides:{},advanced_enabled:false,advanced_request:{}};
 }
 function syncAdvancedEditor(){
   const enabled=$('#customAdvancedEnabled').checked;
@@ -1064,7 +1070,7 @@ async function fillCustomSettings(){
   clearTimeout(customEditor.timer);++customEditor.requestId;
   customEditor.providerId=selectedProvider().id;customEditor.model=model;customEditor.preview=null;customEditor.previewSignature=null;
   customEditor.draft=config.advanced_enabled?JSON.stringify(config.advanced_request||{},null,2):null;
-  $('#customThinking').value=config.thinking;$('#customReasoningEffort').value=config.reasoning_effort||'high';$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customLowestPriceOpenRouter').checked=aggregators.has('openrouter');$('#customLowestPriceVercel').checked=aggregators.has('vercel');$('#customMaxCompletion').value=config.max_completion_tokens;$('#customContextBudget').value=config.context_budget_chars||240000;$('#customTemperatureEnabled').checked=!!config.temperature_enabled;$('#customTemperature').value=config.temperature;$('#customTopPEnabled').checked=!!config.top_p_enabled;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
+  $('#customThinking').value=config.thinking;$('#customReasoningEffort').value=config.reasoning_effort||'high';$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customLowestPriceOpenRouter').checked=aggregators.has('openrouter');$('#customLowestPriceVercel').checked=aggregators.has('vercel');$('#customMaxCompletion').value=config.max_completion_tokens;$('#customRetryStatusCodes').value=(Array.isArray(config.retry_status_codes)?config.retry_status_codes:[503]).join(', ');$('#customContextBudget').value=config.context_budget_chars||240000;$('#customTemperatureEnabled').checked=!!config.temperature_enabled;$('#customTemperature').value=config.temperature;$('#customTopPEnabled').checked=!!config.top_p_enabled;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
   $('#customAdvancedEnabled').checked=!!config.advanced_enabled;$('#customAdvancedEnabled').disabled=false;
   syncCustomThinkingFields();syncCustomToolFields();
   syncAdvancedEditor();
@@ -1078,6 +1084,8 @@ async function saveCustomSettings(event){
   const model=customEditor.model;
   try{
     const enabled=$('#customAdvancedEnabled').checked;
+    const retryTokens=String($('#customRetryStatusCodes').value||'').split(/[,，\s]+/).filter(Boolean);
+    if(retryTokens.some(token=>!/^[0-9]+$/.test(token)||Number(token)<400||Number(token)>599))throw new Error('自动重试状态码必须是 400-599 的 HTTP 状态码，多个值用逗号分隔');
     let document={};
     if(enabled){
       document=JSON.parse($('#customRequestOverrides').value);

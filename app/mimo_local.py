@@ -102,8 +102,12 @@ class ToolQuotaExceeded(RuntimeError):
 FINAL_ANSWER_ATTEMPTS = 2
 MAX_AGENT_TOOL_ROUNDS = 40
 AGENT_HOST_TOOL_ROUNDS = 96
-MAX_503_RETRIES = 60
-HTTP_503_RETRY_DELAY_SECONDS = 5
+MAX_HTTP_RETRIES = 60
+HTTP_RETRY_DELAY_SECONDS = 5
+# Compatibility aliases for older tests/integrations. The implementation is
+# now status-code agnostic and reads the enabled codes from Custom settings.
+MAX_503_RETRIES = MAX_HTTP_RETRIES
+HTTP_503_RETRY_DELAY_SECONDS = HTTP_RETRY_DELAY_SECONDS
 PARALLEL_MAX_SEARCH_EXCERPT_CHARS = 1200
 WORKSPACE_ARGUMENT_COMPACT_THRESHOLD = 4096
 # Keep ordinary freshly-created files in the next requests so the model can
@@ -165,6 +169,26 @@ def _join_round_text(answer: str, text: str) -> str:
     if answer and text and not answer.endswith("\n") and not text.startswith("\n"):
         return answer + "\n\n" + text
     return answer + text
+
+
+def _retry_status_codes(config: dict[str, Any]) -> set[int]:
+    """Return the configured HTTP statuses eligible for automatic retry."""
+    raw = config.get("retry_status_codes", [503])
+    if isinstance(raw, str):
+        raw = re.split(r"[,，\s]+", raw)
+    elif isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple, set)):
+        return set()
+    codes: set[int] = set()
+    for value in raw:
+        try:
+            code = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 400 <= code <= 599:
+            codes.add(code)
+    return codes
 
 
 _DISCARD_REDIRECT_RE = re.compile(r"\d?&?>\s*/dev/null|2>&1|&>\s*/dev/null")
@@ -867,6 +891,7 @@ async def stream_response(
     to the model instead of requiring an exact search-result URL match.
     """
     config = _settings(settings)
+    retry_status_codes = _retry_status_codes(config)
     response_chain = ResponsesState(responses_state)
     cached_web_evidence = dict(cached_web_evidence or {})
     extra_tools = list(extra_tools or [])
@@ -1012,25 +1037,27 @@ async def stream_response(
     # A web budget that is empty from the start never lists the tools at all.
     web_tools_offered = web_enabled and web_round_limit > 0 and (search_limit > 0 or fetch_limit > 0)
 
-    async def publish_503_retry(attempt: int, status: str, error: str = "") -> None:
-        """Persist a visible status while the upstream is temporarily unavailable."""
+    async def publish_http_retry(attempt: int, status: str, error: str = "", status_code: int = 0) -> None:
+        """Persist a visible status while a configured HTTP error is retried."""
         nonlocal retry_status
         if status == "retrying":
-            message = f"上游返回 503，{HTTP_503_RETRY_DELAY_SECONDS} 秒后重试（第 {attempt}/{MAX_503_RETRIES} 次）"
+            message = f"上游返回 HTTP {status_code}，{HTTP_RETRY_DELAY_SECONDS} 秒后重试（第 {attempt}/{MAX_HTTP_RETRIES} 次）"
             active = True
         elif status == "recovered":
-            message = f"上游已恢复（已重试 {attempt} 次）"
+            message = f"上游已恢复（HTTP {status_code}，已重试 {attempt} 次）" if status_code else f"上游已恢复（已重试 {attempt} 次）"
             active = False
         else:
-            message = f"上游连续返回 503，已重试 {MAX_503_RETRIES} 次，任务失败"
+            message = f"上游连续返回 HTTP {status_code or '错误'}，已重试 {MAX_HTTP_RETRIES} 次，任务失败"
             active = False
         retry_status = {
             "active": active,
             "status": status,
             "attempt": int(attempt),
-            "max_attempts": MAX_503_RETRIES,
+            "max_attempts": MAX_HTTP_RETRIES,
             "message": message,
         }
+        if status_code:
+            retry_status["status_code"] = int(status_code)
         if error:
             retry_status["error"] = str(error)[:500]
         await update(
@@ -1257,7 +1284,8 @@ async def stream_response(
             endpoint = "/responses" if responses_protocol else "/messages" if messages_protocol else "/chat/completions"
             @asynccontextmanager
             async def open_model_stream():
-                for retry_index in range(MAX_503_RETRIES + 1):
+                last_retry_code = 0
+                for retry_index in range(MAX_HTTP_RETRIES + 1):
                     if stopped():
                         raise asyncio.CancelledError
                     stream_context = (
@@ -1273,18 +1301,19 @@ async def stream_response(
                         api_client.stream("POST", _url(base_url, endpoint), headers=headers, json=payload)
                     )
                     async with stream_context as candidate:
-                        if candidate.status_code == 503:
+                        if candidate.status_code in retry_status_codes:
+                            last_retry_code = int(candidate.status_code)
                             body = (await candidate.aread()).decode(errors="replace")[:1000]
-                            if retry_index >= MAX_503_RETRIES:
-                                await publish_503_retry(MAX_503_RETRIES, "failed", body)
+                            if retry_index >= MAX_HTTP_RETRIES:
+                                await publish_http_retry(MAX_HTTP_RETRIES, "failed", body, last_retry_code)
                                 raise RuntimeError(
-                                    f"Custom API 503: 已重试 {MAX_503_RETRIES} 次仍失败：{body}"
+                                    f"Custom API {last_retry_code}: 已重试 {MAX_HTTP_RETRIES} 次仍失败：{body}"
                                 )
-                            await publish_503_retry(retry_index + 1, "retrying", body)
-                            await asyncio.sleep(HTTP_503_RETRY_DELAY_SECONDS)
+                            await publish_http_retry(retry_index + 1, "retrying", body, last_retry_code)
+                            await asyncio.sleep(HTTP_RETRY_DELAY_SECONDS)
                             continue
                         if retry_index:
-                            await publish_503_retry(retry_index, "recovered")
+                            await publish_http_retry(retry_index, "recovered", status_code=last_retry_code)
                         yield candidate
                         return
 

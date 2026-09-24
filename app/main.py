@@ -150,6 +150,7 @@ class CustomSettingsBody(BaseModel):
     reasoning_effort_enabled: bool = True
     lowest_price_aggregators: list[Literal["openrouter", "vercel"]] = Field(default_factory=list, max_length=2)
     max_completion_tokens: int = Field(default=65536, ge=256, le=MIMO_MAX_COMPLETION_TOKENS)
+    retry_status_codes: list[int] = Field(default_factory=lambda: [503], max_length=20)
     context_budget_chars: int = Field(default=DEFAULT_CONTEXT_BUDGET_CHARS, ge=MIN_CONTEXT_BUDGET_CHARS, le=MAX_CONTEXT_BUDGET_CHARS)
     temperature_enabled: bool = False
     temperature: float = Field(default=1.0, ge=0, le=1.5)
@@ -169,6 +170,15 @@ class CustomSettingsBody(BaseModel):
     @classmethod
     def validate_request_overrides_field(cls, value: dict[str, Any]) -> dict[str, Any]:
         return validate_request_overrides(value)
+
+    @field_validator("retry_status_codes")
+    @classmethod
+    def validate_retry_status_codes_field(cls, value: list[int]) -> list[int]:
+        codes = sorted({int(code) for code in value})
+        invalid = [code for code in codes if code < 400 or code > 599]
+        if invalid:
+            raise ValueError("HTTP 重试状态码必须是 400-599")
+        return codes
 
 
 class CustomModelSettingsBody(CustomSettingsBody):
@@ -223,6 +233,17 @@ def normalize_custom_settings(value: Any = None) -> dict[str, Any]:
     data["lowest_price_aggregators"] = [
         name for name in LOWEST_PRICE_AGGREGATORS if name in selected_aggregators
     ]
+    # The UI sends a list, while older/manual integrations may have stored a
+    # comma-separated string. Normalize both forms before Pydantic validates
+    # the per-model setting.
+    raw_retry_codes = data.get("retry_status_codes", [503])
+    if isinstance(raw_retry_codes, str):
+        raw_retry_codes = [part for part in re.split(r"[,，\s]+", raw_retry_codes) if part]
+    elif isinstance(raw_retry_codes, (int, float)) and not isinstance(raw_retry_codes, bool):
+        raw_retry_codes = [raw_retry_codes]
+    elif raw_retry_codes is None:
+        raw_retry_codes = []
+    data["retry_status_codes"] = raw_retry_codes
     if data.get("reasoning_effort") not in REASONING_EFFORT_LEVELS:
         data["reasoning_effort"] = DEFAULT_REASONING_EFFORT
     return CustomSettingsBody(**data).model_dump()

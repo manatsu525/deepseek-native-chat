@@ -63,6 +63,7 @@
     @media (prefers-color-scheme:dark){.message-content a,.search-detail a{color:#83a9ff}.message-content a:hover,.search-detail a:hover{color:#b1c8ff}.message-content blockquote{color:#b4bfd1;background:#202b3d;border-left-color:#718ab9}.md-callout-note{color:#a9ceff;border-color:#4d87c5;background:#172b43}.md-callout-note .md-callout-title{background:#1d3b5e}.md-callout-tip{color:#a8e1b8;border-color:#4f9a68;background:#172d22}.md-callout-tip .md-callout-title{background:#1d4930}.md-callout-important{color:#d2bfff;border-color:#8363be;background:#281d3d}.md-callout-important .md-callout-title{background:#3a2a59}.md-callout-warning{color:#f4cf78;border-color:#ae7e26;background:#3b2e12}.md-callout-warning .md-callout-title{background:#574316}.md-callout-danger{color:#ffb0b0;border-color:#b96464;background:#3c2023}.md-callout-danger .md-callout-title{background:#572b30}}
     @media (prefers-color-scheme:dark){.location-grid input,.custom-model-filter{background:#121925;color:var(--ink)}}
     @media (max-width:760px){.message{max-width:100%;padding:11px 12px;margin-bottom:14px}.message.user{max-width:92%;margin-left:auto}.message.assistant{margin-right:0}.message-content th,.message-content td{min-width:6.25rem;max-width:min(19rem,76vw);padding:.44rem .5rem}.location-grid{grid-template-columns:1fr}.custom-model-list{grid-template-columns:1fr}.top-actions{flex-wrap:wrap;justify-content:flex-end}.skill-item{display:block}.skill-item-actions{margin-top:8px}.skill-item-actions button{flex:1}.skill-detail pre{max-height:210px}}
+    .custom-model-option.stale-model span{color:var(--danger);text-decoration:line-through}
   </style>
 </head>
 <body>
@@ -196,6 +197,8 @@
         <p class="muted custom-cost-note">只勾选当前模型所在的聚合商；未勾选时不会改写模型名或请求路由。</p>
       </div>
       <label>最大生成 Token<input id="customMaxCompletion" type="number" min="256" max="131072" step="256" value="65536"></label>
+      <label>自动重试 HTTP 状态码<input id="customRetryStatusCodes" type="text" inputmode="numeric" placeholder="503, 429, 500" value="503"></label>
+      <p class="wide muted custom-cost-note">填写 400-599 状态码，多个用逗号分隔；命中后统一每 5 秒重试，最多 60 次。默认只重试 503，清空可关闭自动重试。</p>
       <label>上下文预算（字符，超出后压缩旧工具结果；保持默认值 240000 时按模型上下文窗口自动决定）<input id="customContextBudget" type="number" min="40000" max="4000000" step="10000" value="240000"></label>
       <label class="check"><input id="customTemperatureEnabled" type="checkbox"> 发送 temperature</label>
       <label>temperature<input id="customTemperature" type="number" min="0" max="1.5" step="0.05" value="1"></label>

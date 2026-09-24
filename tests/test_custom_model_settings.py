@@ -102,6 +102,7 @@ class CustomModelSettingsTests(unittest.TestCase):
         effort: str = "high",
         aggregators: tuple[str, ...] = (),
         request_overrides: dict | None = None,
+        retry_status_codes: list[int] | None = None,
     ) -> dict:
         return {
             "model": model,
@@ -110,6 +111,7 @@ class CustomModelSettingsTests(unittest.TestCase):
             "reasoning_effort_enabled": True,
             "lowest_price_aggregators": list(aggregators),
             "max_completion_tokens": 8192,
+            "retry_status_codes": [503] if retry_status_codes is None else retry_status_codes,
             "temperature_enabled": True,
             "temperature": temperature,
             "top_p_enabled": True,
@@ -216,6 +218,32 @@ class CustomModelSettingsTests(unittest.TestCase):
         self.assertEqual(calls[0]["settings"]["lowest_price_aggregators"], ["vercel"])
         self.assertEqual(calls[0]["effort"], "low")
         self.assertNotEqual(calls[0]["settings"]["temperature"], 1.1)
+
+    def test_retry_status_codes_are_independent_and_validated(self) -> None:
+        provider_id = self.add_legacy_provider()
+        main.migrate_custom_provider_settings()
+
+        response = self.client.put(
+            f"/api/providers/{provider_id}/settings",
+            json=self.settings_body("model-a", temperature=0.8, backend="parallel", retry_status_codes=[429, 503, 429]),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        provider = response.json()
+        self.assertEqual(provider["model_settings"]["model-a"]["retry_status_codes"], [429, 503])
+        self.assertEqual(provider["model_settings"]["model-b"]["retry_status_codes"], [503])
+
+        response = self.client.put(
+            f"/api/providers/{provider_id}/settings",
+            json=self.settings_body("model-a", temperature=0.8, backend="parallel", retry_status_codes=[]),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["model_settings"]["model-a"]["retry_status_codes"], [])
+
+        response = self.client.put(
+            f"/api/providers/{provider_id}/settings",
+            json=self.settings_body("model-a", temperature=0.8, backend="parallel", retry_status_codes=[399]),
+        )
+        self.assertEqual(response.status_code, 422, response.text)
 
     def test_settings_reject_a_model_not_enabled_for_the_api(self) -> None:
         provider_id = self.add_legacy_provider()
