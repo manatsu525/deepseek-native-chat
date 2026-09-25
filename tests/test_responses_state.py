@@ -270,6 +270,25 @@ class ResponsesStateTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["answer"], "完成")
                 self.assertEqual(result["retry_status"]["status"], "recovered")
 
+    async def test_configured_chat_stream_error_code_retries(self):
+        delays = []
+
+        async def fake_sleep(seconds):
+            delays.append(seconds)
+
+        chat_final = [{"choices": [{"delta": {"content": "完成"}}]}]
+        transport = Transport([[{"error": {"code": 503, "message": "overloaded"}}], chat_final])
+        with patch("app.mimo_local.asyncio.sleep", fake_sleep):
+            result = await self.run_stream(
+                transport,
+                api_protocol="chat_completions",
+                settings={"thinking": "disabled", "retry_status_codes": [503]},
+            )
+        self.assertEqual(len(transport.payloads), 2)
+        self.assertEqual(delays, [5])
+        self.assertEqual(result["answer"], "完成")
+        self.assertEqual(result["retry_status"]["status_code"], 503)
+
     async def test_unexecuted_calls_are_not_left_in_stored_chain(self):
         transport = Transport([call("resp_bad", ("fetch_webpage", "host_check")), final()])
         result = await self.run_stream(transport)
