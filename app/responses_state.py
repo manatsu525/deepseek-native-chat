@@ -87,15 +87,27 @@ class ResponsesState:
                 "fallback_reason": self.reason, "chained_requests": self.chained_requests}
 
     @asynccontextmanager
-    async def stream(self, client, method, url, *, headers, json, full_input):
+    async def stream(
+        self,
+        client,
+        method,
+        url,
+        *,
+        headers,
+        json,
+        full_input,
+        retry_status_codes: set[int] | None = None,
+    ):
         # Retry once only for explicit state-field rejection, before consuming
-        # any generated output. 503/429/auth errors are never auto-retried.
+        # any generated output. Configured HTTP statuses are yielded to the
+        # shared retry controller so Responses does not swallow them first.
+        retry_status_codes = set(retry_status_codes or ())
         for attempt in range(2):
             async with client.stream(method, url, headers=headers, json=json) as response:
-                # Let the shared retry controller observe 503. Other HTTP
-                # errors remain handled here because Responses state fallback
-                # needs to inspect their body.
-                if response.status_code == 503:
+                # Let the shared retry controller observe every configured
+                # status. Other HTTP errors remain handled here because
+                # Responses state fallback needs to inspect their body.
+                if response.status_code in retry_status_codes:
                     yield response
                     return
                 if response.status_code >= 400:

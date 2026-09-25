@@ -7,7 +7,6 @@ import json
 import logging
 import re
 import uuid
-from contextlib import asynccontextmanager
 from pathlib import Path
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -189,6 +188,50 @@ def _retry_status_codes(config: dict[str, Any]) -> set[int]:
         if 400 <= code <= 599:
             codes.add(code)
     return codes
+
+
+def _stream_error_info(data: Any) -> tuple[int, str] | None:
+    """Extract a numeric upstream error code from a streamed event.
+
+    A few OpenAI-compatible gateways return HTTP 200 and put rate-limit or
+    overload errors inside an SSE event instead of using the HTTP status. The
+    retry controller needs to see those codes before the normal parser turns
+    the event into a terminal RuntimeError.
+    """
+    if not isinstance(data, dict):
+        return None
+    payload: Any = data.get("error")
+    event_type = str(data.get("type") or "")
+    if payload is None and event_type == "response.failed":
+        response = data.get("response")
+        payload = response.get("error") if isinstance(response, dict) else None
+        if payload is None:
+            payload = data
+    if payload is None and isinstance(data.get("response"), dict):
+        response_error = data["response"].get("error")
+        if response_error is not None:
+            payload = response_error
+    if payload is None:
+        # Some gateways omit the `error` wrapper and put the status directly
+        # on the event. Do not treat ordinary events as errors unless a
+        # recognized numeric status field is present.
+        if not any(key in data for key in ("code", "status_code", "http_status", "status")):
+            return None
+        payload = data
+    if not isinstance(payload, dict):
+        return None
+    raw_code = next(
+        (payload.get(key) for key in ("code", "status_code", "http_status", "status")
+         if payload.get(key) is not None),
+        None,
+    )
+    try:
+        code = int(raw_code)
+    except (TypeError, ValueError):
+        return None
+    if not 400 <= code <= 599:
+        return None
+    return code, json.dumps(data, ensure_ascii=False)[:2000]
 
 
 _DISCARD_REDIRECT_RE = re.compile(r"\d?&?>\s*/dev/null|2>&1|&>\s*/dev/null")
@@ -1282,8 +1325,34 @@ async def stream_response(
             if before_model_call is not None:
                 before_model_call()
             endpoint = "/responses" if responses_protocol else "/messages" if messages_protocol else "/chat/completions"
-            @asynccontextmanager
-            async def open_model_stream():
+            async def reset_round_for_retry() -> None:
+                """Discard partial output before replaying the same request."""
+                nonlocal round_answer, round_preview, round_reasoning, round_finish
+                nonlocal round_usage, anthropic_usage, anthropic_thinking_blocks
+                nonlocal round_tools_by_index, responses_output_items_by_index, markup_stream
+                round_answer = ""
+                round_preview = ""
+                round_reasoning = ""
+                round_finish = ""
+                round_usage = {}
+                anthropic_usage = {}
+                anthropic_thinking_blocks = {}
+                round_tools_by_index = {}
+                responses_output_items_by_index = {}
+                markup_stream = (
+                    InklingStreamBuffer()
+                    if inkling_compat_active
+                    else MiniMaxStreamBuffer()
+                    if minimax_fallback_active
+                    else None
+                )
+                # A failed stream cannot establish a reusable Responses item.
+                # Keep the previous response ID, but discard any candidate
+                # that may have been observed before the error event.
+                response_chain.candidate = ""
+                response_chain.candidate_stored = True
+
+            async def iter_model_lines():
                 last_retry_code = 0
                 for retry_index in range(MAX_HTTP_RETRIES + 1):
                     if stopped():
@@ -1296,6 +1365,7 @@ async def stream_response(
                             headers=headers,
                             json=payload,
                             full_input=full_response_input,
+                            retry_status_codes=retry_status_codes,
                         )
                         if responses_protocol else
                         api_client.stream("POST", _url(base_url, endpoint), headers=headers, json=payload)
@@ -1312,17 +1382,54 @@ async def stream_response(
                             await publish_http_retry(retry_index + 1, "retrying", body, last_retry_code)
                             await asyncio.sleep(HTTP_RETRY_DELAY_SECONDS)
                             continue
+                        if candidate.status_code >= 400:
+                            body = (await candidate.aread()).decode(errors="replace")[:2000]
+                            raise RuntimeError(f"Custom API {candidate.status_code}: {body}")
+                        retryable_stream_error = False
+                        async for line in candidate.aiter_lines():
+                            if line and line.startswith("data:"):
+                                raw = line[5:].strip()
+                                if raw == "[DONE]":
+                                    # Do not yield the sentinel: returning here
+                                    # lets the response context close even when
+                                    # the caller stops at the end marker.
+                                    if retry_index:
+                                        await publish_http_retry(
+                                            retry_index, "recovered", status_code=last_retry_code
+                                        )
+                                    return
+                                if raw:
+                                    try:
+                                        event = json.loads(raw)
+                                    except json.JSONDecodeError:
+                                        event = None
+                                    stream_error = _stream_error_info(event)
+                                    if stream_error and stream_error[0] in retry_status_codes:
+                                        last_retry_code = stream_error[0]
+                                        body = stream_error[1]
+                                        await reset_round_for_retry()
+                                        if retry_index >= MAX_HTTP_RETRIES:
+                                            await publish_http_retry(
+                                                MAX_HTTP_RETRIES, "failed", body, last_retry_code
+                                            )
+                                            raise RuntimeError(
+                                                f"Custom API {last_retry_code}: 已重试 "
+                                                f"{MAX_HTTP_RETRIES} 次仍失败：{body}"
+                                            )
+                                        await publish_http_retry(
+                                            retry_index + 1, "retrying", body, last_retry_code
+                                        )
+                                        await asyncio.sleep(HTTP_RETRY_DELAY_SECONDS)
+                                        retryable_stream_error = True
+                                        break
+                            yield line
+                        if retryable_stream_error:
+                            continue
                         if retry_index:
                             await publish_http_retry(retry_index, "recovered", status_code=last_retry_code)
-                        yield candidate
                         return
 
-            stream_context = open_model_stream()
-            async with stream_context as response:
-                if response.status_code >= 400:
-                    body = (await response.aread()).decode(errors="replace")[:2000]
-                    raise RuntimeError(f"Custom API {response.status_code}: {body}")
-                async for line in response.aiter_lines():
+            async for line in iter_model_lines():
                     if stopped():
                         raise asyncio.CancelledError
                     if not line or not line.startswith("data:"):

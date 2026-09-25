@@ -226,8 +226,49 @@ class ResponsesStateTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(error=error):
                 transport = Transport([error])
                 with self.assertRaises(RuntimeError):
-                    await self.run_stream(transport)
+                    await self.run_stream(transport, settings={"thinking": "disabled", "retry_status_codes": []})
                 self.assertEqual(len(transport.payloads), 1)
+
+    async def test_configured_responses_http_status_retries(self):
+        delays = []
+
+        async def fake_sleep(seconds):
+            delays.append(seconds)
+
+        transport = Transport([(429, "rate limited"), final()])
+        with patch("app.mimo_local.asyncio.sleep", fake_sleep):
+            result = await self.run_stream(
+                transport,
+                settings={"thinking": "disabled", "retry_status_codes": [429]},
+            )
+        self.assertEqual(len(transport.payloads), 2)
+        self.assertEqual(delays, [5])
+        self.assertEqual(result["answer"], "完成")
+        self.assertEqual(result["retry_status"]["status"], "recovered")
+        self.assertEqual(result["retry_status"]["status_code"], 429)
+
+    async def test_configured_stream_error_codes_retry_before_parser(self):
+        delays = []
+
+        async def fake_sleep(seconds):
+            delays.append(seconds)
+
+        for error_event in (
+            {"error": {"code": 503, "message": "overloaded"}},
+            {"type": "response.failed", "response": {"error": {"code": 429, "message": "limited"}}},
+        ):
+            with self.subTest(error_event=error_event):
+                delays.clear()
+                transport = Transport([[error_event], final()])
+                with patch("app.mimo_local.asyncio.sleep", fake_sleep):
+                    result = await self.run_stream(
+                        transport,
+                        settings={"thinking": "disabled", "retry_status_codes": [429, 503]},
+                    )
+                self.assertEqual(len(transport.payloads), 2)
+                self.assertEqual(delays, [5])
+                self.assertEqual(result["answer"], "完成")
+                self.assertEqual(result["retry_status"]["status"], "recovered")
 
     async def test_unexecuted_calls_are_not_left_in_stored_chain(self):
         transport = Transport([call("resp_bad", ("fetch_webpage", "host_check")), final()])
