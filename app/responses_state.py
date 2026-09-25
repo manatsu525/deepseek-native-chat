@@ -101,7 +101,10 @@ class ResponsesState:
         # Retry once only for explicit state-field rejection, before consuming
         # any generated output. Configured HTTP statuses are yielded to the
         # shared retry controller so Responses does not swallow them first.
-        retry_status_codes = set(retry_status_codes or ())
+        # Keep the old direct-call behavior when no policy is supplied; the
+        # application always passes the model's explicit set (including an
+        # empty set when the user disabled retries).
+        retry_status_codes = {503} if retry_status_codes is None else set(retry_status_codes)
         for attempt in range(2):
             async with client.stream(method, url, headers=headers, json=json) as response:
                 # Let the shared retry controller observe every configured
