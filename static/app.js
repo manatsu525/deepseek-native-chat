@@ -533,7 +533,7 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
   const retryCode = retryStatus.status_code || retryStatus.code || '';
   const retryMessage = retryStatus.message || (retryStatus.active ? `上游返回 HTTP ${retryCode || '错误'}，5 秒后重试（第 ${retryStatus.attempt || 0}/${retryStatus.max_attempts || 60} 次）` : '');
   const retryHtml = retryMessage ? `<div class="retry-status ${retryStatus.status === 'recovered' ? 'recovered' : retryStatus.status === 'failed' ? 'failed' : ''}">${escapeHtml(retryMessage)}</div>` : '';
-  const planLabels = {pending:'待处理',in_progress:'执行中',done:'已完成',blocked:'受阻'};
+  const planLabels = {pending:'待处理',in_progress:'执行中',completed:'已完成',done:'已完成',blocked:'受阻'};
   const planHtml = planSteps.length ? `<div class="search-step"><strong>执行计划</strong><ol>${planSteps.map(s=>`<li>${escapeHtml(planLabels[s.status]||s.status)} · ${escapeHtml(s.step)}${s.outcome?`<div>${escapeHtml(s.outcome)}</div>`:''}</li>`).join('')}</ol></div>` : '';
   if (!reasoning && !searches.length && !active && !planSteps.length && !retryHtml) return '';
   const status = active ? '进行中' : (meta.stopped ? '已停止' : '已完成');

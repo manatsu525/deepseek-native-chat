@@ -93,6 +93,15 @@ class Database:
                     updated_at INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS agent_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_events_job ON agent_events(job_id, id);
                 CREATE TABLE IF NOT EXISTS conversation_web_evidence (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,

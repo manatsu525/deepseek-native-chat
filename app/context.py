@@ -211,6 +211,7 @@ def compact_request(
     workspace_files: Callable[[], list[dict[str, Any]]] | None = None,
     sources: dict[str, dict[str, str]] | None = None,
     plan: dict[str, Any] | None = None,
+    preserve_user_messages: bool = False,
 ) -> dict[str, Any] | None:
     """Bring the request under ``budget`` chars; return what was done, or None.
 
@@ -294,7 +295,12 @@ def compact_request(
                 text = " ".join(str(message.get("content") or "").split())
                 if text:
                     notes.append(text[:PROGRESS_NOTE_CHARS])
-        del internal[start:end]
+        if preserve_user_messages:
+            # Cross-turn Agent replay contains user requests between tool
+            # exchanges. Never drop those requests together with old tools.
+            internal[start:end] = [message for message in internal[start:end] if message.get("role") == "user"]
+        else:
+            del internal[start:end]
         dropped_rounds += 1
     if dropped_rounds:
         attach(notes)
