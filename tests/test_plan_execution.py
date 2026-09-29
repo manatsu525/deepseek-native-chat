@@ -137,7 +137,8 @@ class ExecutionPlanTests(unittest.TestCase):
 
 
 class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
-    async def run_loop(self, rounds, protocol="chat_completions", status_sequence=None, settings=None):
+    async def run_loop(self, rounds, protocol="chat_completions", status_sequence=None, settings=None,
+                       record_event=None, messages=None):
         payloads, executed, updates = [], [], []
         statuses = list(status_sequence or [])
         def event(obj):
@@ -192,45 +193,47 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
             return json.dumps({"exit_code": 0, "stdout": "ok"})
         with patch.object(mimo_local.httpx, "AsyncClient", Client):
             result = await mimo_local.stream_response(
-                base_url="https://example.invalid/v1", api_key="test", model="test", messages=[{"role":"user","content":"edit files"}],
+                base_url="https://example.invalid/v1", api_key="test", model="test", messages=messages or [{"role":"user","content":"edit files"}],
                 timeout=5, stopped=lambda:False, update=update, web_enabled=False, agent_mode=True,
                 max_tool_rounds=15, api_protocol=protocol, settings=settings,
                 extra_tools=[{"type":"function","function":{"name":"run_command","description":"run","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}],
-                extra_tool_handler=execute)
+                extra_tool_handler=execute, record_event=record_event)
         self.assertFalse(rounds)
         return result, payloads, executed, updates
 
     async def test_gate_execute_verify_and_finish_all_protocols(self):
         for protocol in ("chat_completions", "responses", "messages"):
             with self.subTest(protocol=protocol):
-                first = steps()
-                second = [{"id":"s1","step":"implement","status":"done","outcome":"saved","evidence":["write"]},
-                          {"id":"s2","step":"verify","status":"in_progress"}]
+                first = [{"content": "implement", "status": "in_progress"},
+                         {"content": "verify", "status": "in_progress"}]
+                second = [{"content":"implement","status":"completed"},
+                          {"content":"verify","status":"in_progress"}]
                 final = copy.deepcopy(second)
-                final[1].update(status="done",outcome="passed",evidence=["check"])
+                final[1].update(status="completed")
                 result, payloads, executed, updates = await self.run_loop([
                     [("a","run_command",{"command":"inspect a"}),("b","run_command",{"command":"inspect b"}), ("batch-third","run_command",{"command":"should run"})],
-                    [("p","update_plan",{"steps":first})],
+                    [("p","update_plan",{"todos":first})],
                     [("write","run_command",{"command":"implement"})],
-                    [("p2","update_plan",{"steps":second}), ("check","run_command",{"command":"verify"})],
-                    [("p3","update_plan",{"steps":final})], ["done"]], protocol)
+                    [("p2","update_plan",{"todos":second}), ("check","run_command",{"command":"verify"})],
+                    [("p3","update_plan",{"todos":final})], ["done"]], protocol)
                 self.assertEqual(executed, ["inspect a","inspect b","should run","implement","verify"])
                 names = [t.get("name", t.get("function",{}).get("name")) for t in payloads[1]["tools"]]
                 self.assertEqual(names,["run_command","update_plan"])
                 self.assertFalse(result["incomplete"])
-                self.assertEqual(result["plan"]["steps"][1]["evidence"],["check"])
-                self.assertTrue(any(u.get("plan",{}).get("steps") for u in updates))
+                self.assertEqual(result["plan"]["steps"][1]["status"], "completed")
+                self.assertNotIn("evidence", result["plan"]["steps"][1])
+                self.assertTrue(any((u.get("plan") or {}).get("steps") for u in updates))
                 self.assertIn("write", json.dumps(payloads[3]))
                 if protocol == "responses":
                     self.assertIn("previous_response_id",payloads[2])
-                    self.assertIn("服务端执行状态",json.dumps(payloads[3],ensure_ascii=False))
+                    self.assertNotIn("服务端执行状态",json.dumps(payloads[3],ensure_ascii=False))
 
-    async def test_unfinished_final_is_reconciled_and_bounded(self):
+    async def test_unfinished_checklist_does_not_force_extra_rounds(self):
         result, payloads, executed, _ = await self.run_loop([
-            [("p","update_plan",{"steps":steps()})], ["done"], ["done"], ["done"]])
-        self.assertTrue(result["incomplete"])
-        self.assertEqual(result["incomplete_reason"], "plan_unfinished")
-        self.assertEqual(len(payloads),4)
+            [("p","update_plan",{"todos":[{"content": "inspect", "status": "in_progress"}]})], ["done"]])
+        self.assertFalse(result["incomplete"])
+        self.assertEqual(result["incomplete_reason"], "")
+        self.assertEqual(len(payloads),2)
         self.assertFalse(executed)
 
     async def test_simple_answer_has_no_planning_overhead(self):

@@ -35,7 +35,7 @@ from .context import (
     serialized_chars as _serialized_chars,
     with_message_block as _with_message_block,
 )
-from .plan import UPDATE_PLAN_TOOL, ExecutionPlan
+from .plan import UPDATE_PLAN_TOOL, CHECKLIST_PLAN_TOOL, ChecklistPlan, ExecutionPlan
 from .keyless_web import (
     KEYLESS_FETCH_WEBPAGE_TOOL,
     KEYLESS_SEARCH_WEB_TOOL,
@@ -921,6 +921,7 @@ async def stream_response(
     user_context_addendum: str = "",
     context_window_tokens: int | None = None,
     initial_plan: dict[str, Any] | None = None,
+    record_event: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Run a custom OpenAI-compatible model with local web tools.
 
@@ -934,6 +935,10 @@ async def stream_response(
     to the model instead of requiring an exact search-result URL match.
     """
     config = _settings(settings)
+    def record(kind: str, payload: dict[str, Any]) -> None:
+        if agent_mode and record_event is not None:
+            record_event(kind, payload)
+
     retry_status_codes = _retry_status_codes(config)
     response_chain = ResponsesState(responses_state)
     cached_web_evidence = dict(cached_web_evidence or {})
@@ -1024,10 +1029,10 @@ async def stream_response(
     reader_enabled = bool(known_urls)
     final_answer_attempts = 0
     force_final_answer = False
-    plan = ExecutionPlan(initial_plan)
+    plan = ChecklistPlan(initial_plan) if agent_mode else ExecutionPlan(initial_plan)
     plan_final_retries = 0
     retry_status: dict[str, Any] = {}
-    if initial_plan and plan.steps:
+    if initial_plan and plan.steps and not agent_mode:
         conversation.append({"role": "user", "content": plan.runtime_note()})
         response_chain.reset()
     context_budget_setting = normalize_budget(config.get("context_budget_chars", DEFAULT_CONTEXT_BUDGET_CHARS))
@@ -1040,6 +1045,38 @@ async def stream_response(
     # Host files can also change through shell commands, so their snapshots
     # are revalidated against disk before a checkpoint reuses them.
     knowledge = FileKnowledge(validate=_host_revision if agent_mode else None)
+    if agent_mode:
+        # Restore loaded groups from completed receipts, not just old promises.
+        historical_calls = {
+            call["id"]: call for message in messages for call in message.get("tool_calls") or []
+        }
+        for message in messages:
+            for snapshot in checkpoint_payload([message]).get("file_snapshots") or []:
+                knowledge.record_read(snapshot)
+            call = historical_calls.get(message.get("tool_call_id"), {})
+            function = call.get("function") or {}
+            if function.get("name") == "load_tools" and str(message.get("content", "")).startswith("Loaded tool groups:"):
+                loaded_groups.update(requested_groups(_json_object(function.get("arguments") or "{}"), deferrable_groups))
+            group = group_of_extra_tool(str(function.get("name") or ""))
+            if group and message.get("role") == "tool" and not _tool_result_failure(str(message.get("content") or "")):
+                loaded_groups.add(group)
+            if message.get("role") == "tool" and function.get("name") in HOST_READ_TOOLS:
+                knowledge.record_read(_json_object(str(message.get("content") or "")))
+        # Historic tool transcripts can now be longer than the former final-only
+        # replay. Compact with the existing policy before the first request;
+        # protect the newest user request and retain original events on disk.
+        if _serialized_chars(conversation) > context_budget:
+            latest_user = next((i for i in range(len(conversation) - 1, 0, -1)
+                                if conversation[i].get("role") == "user"), len(conversation))
+            previous = [conversation[0], {"role": "user", "content": "此前执行记录："},
+                        *conversation[1:latest_user]]
+            compact_request(previous, base_message_count=2,
+                            budget=max(40_000, context_budget - _serialized_chars(conversation[latest_user:])),
+                            knowledge=knowledge, preserve_user_messages=True)
+            conversation = [*previous, *conversation[latest_user:]]
+            base_message_count = len(conversation)
+            response_chain.reset()
+        record("history/start", {"messages": conversation[1:]})
     workspace_searches: set[str] = set()
     workspace_validations: set[tuple[int, str]] = set()
     workspace_list_generations: set[int] = set()
@@ -1186,7 +1223,7 @@ async def stream_response(
                         in (None, *loaded_groups)
                     )
                 if plan_tool_expected and files_listed and tool_rounds_used < role_tool_round_limit:
-                    round_tools.append(UPDATE_PLAN_TOOL)
+                    round_tools.append(CHECKLIST_PLAN_TOOL if agent_mode else UPDATE_PLAN_TOOL)
                 if deferrable_groups and tool_rounds_used < role_tool_round_limit:
                     # Stays listed after loading, so the tool list changes
                     # once per loaded group and not again.
@@ -1325,11 +1362,19 @@ async def stream_response(
             if before_model_call is not None:
                 before_model_call()
             endpoint = "/responses" if responses_protocol else "/messages" if messages_protocol else "/chat/completions"
+            record("context/checkpoint", {"messages": conversation[1:]})
+            def record_request(body: dict[str, Any]) -> None:
+                record("model/request", {"round": round_number + 1, "protocol": api_protocol,
+                                         "endpoint": endpoint, "body": body})
+
             async def reset_round_for_retry() -> None:
                 """Discard partial output before replaying the same request."""
                 nonlocal round_answer, round_preview, round_reasoning, round_finish
                 nonlocal round_usage, anthropic_usage, anthropic_thinking_blocks
                 nonlocal round_tools_by_index, responses_output_items_by_index, markup_stream
+                record("model/attempt_failed", {"round": round_number + 1, "content": round_answer,
+                                                "reasoning": round_reasoning,
+                                                "tool_calls": _tool_calls(round_tools_by_index, round_number)})
                 round_answer = ""
                 round_preview = ""
                 round_reasoning = ""
@@ -1357,6 +1402,8 @@ async def stream_response(
                 for retry_index in range(MAX_HTTP_RETRIES + 1):
                     if stopped():
                         raise asyncio.CancelledError
+                    if not responses_protocol:
+                        record_request(payload)
                     stream_context = (
                         response_chain.stream(
                             api_client,
@@ -1366,6 +1413,9 @@ async def stream_response(
                             json=payload,
                             full_input=full_response_input,
                             retry_status_codes=retry_status_codes,
+                            observe_request=record_request,
+                            observe_error=lambda status, body: record("model/error", {"round": round_number + 1,
+                                                                                     "status": status, "body": body}),
                         )
                         if responses_protocol else
                         api_client.stream("POST", _url(base_url, endpoint), headers=headers, json=payload)
@@ -1374,6 +1424,7 @@ async def stream_response(
                         if candidate.status_code in retry_status_codes:
                             last_retry_code = int(candidate.status_code)
                             body = (await candidate.aread()).decode(errors="replace")[:1000]
+                            record("model/error", {"round": round_number + 1, "status": last_retry_code, "body": body})
                             if retry_index >= MAX_HTTP_RETRIES:
                                 await publish_http_retry(MAX_HTTP_RETRIES, "failed", body, last_retry_code)
                                 raise RuntimeError(
@@ -1384,6 +1435,7 @@ async def stream_response(
                             continue
                         if candidate.status_code >= 400:
                             body = (await candidate.aread()).decode(errors="replace")[:2000]
+                            record("model/error", {"round": round_number + 1, "status": candidate.status_code, "body": body})
                             raise RuntimeError(f"Custom API {candidate.status_code}: {body}")
                         retryable_stream_error = False
                         async for line in candidate.aiter_lines():
@@ -1407,6 +1459,7 @@ async def stream_response(
                                     if stream_error and stream_error[0] in retry_status_codes:
                                         last_retry_code = stream_error[0]
                                         body = stream_error[1]
+                                        record("model/error", {"round": round_number + 1, "status": last_retry_code, "body": body})
                                         await reset_round_for_retry()
                                         if retry_index >= MAX_HTTP_RETRIES:
                                             await publish_http_retry(
@@ -1429,7 +1482,17 @@ async def stream_response(
                             await publish_http_retry(retry_index, "recovered", status_code=last_retry_code)
                         return
 
-            async for line in iter_model_lines():
+            async def observed_lines():
+                try:
+                    async for value in iter_model_lines():
+                        yield value
+                except BaseException as exc:
+                    record("model/attempt_failed", {"round": round_number + 1, "error": str(exc),
+                                                    "content": round_answer, "reasoning": round_reasoning,
+                                                    "tool_calls": _tool_calls(round_tools_by_index, round_number)})
+                    raise
+
+            async for line in observed_lines():
                     if stopped():
                         raise asyncio.CancelledError
                     if not line or not line.startswith("data:"):
@@ -1444,6 +1507,8 @@ async def stream_response(
                     except json.JSONDecodeError:
                         continue
                     if data.get("error"):
+                        record("model/error", {"round": round_number + 1, "body": data,
+                                               "content": round_answer, "reasoning": round_reasoning})
                         raise RuntimeError(f"Custom 响应失败: {data['error']}")
                     event_type = str(data.get("type") or "")
                     if responses_protocol:
@@ -1562,6 +1627,11 @@ async def stream_response(
                         for index, call in enumerate(message.get("tool_calls") or []):
                             _merge_tool_call(round_tools_by_index, call, index)
                     preview_usage = _merge_usage(usage, round_usage)
+                    record("model/preview", {"round": round_number + 1, "content": round_answer,
+                                             "reasoning": round_reasoning,
+                                             "tool_calls": _tool_calls(round_tools_by_index, round_number),
+                                             "responses_output_items": list(responses_output_items_by_index.values()),
+                                             "anthropic_thinking_blocks": list(anthropic_thinking_blocks.values())})
                     await update(
                         {
                             "answer": _join_round_text(answer, round_preview if markup_stream is not None else round_answer),
@@ -1586,6 +1656,11 @@ async def stream_response(
                 round_stat["chain_state"] = response_chain.reason
             round_stats.append(round_stat)
             calls = normalize_tool_calls(_tool_calls(round_tools_by_index, round_number))
+            record("model/output", {"round": round_number + 1, "content": round_answer,
+                                    "reasoning": round_reasoning, "tool_calls": calls,
+                                    "responses_output_items": list(responses_output_items_by_index.values()),
+                                    "anthropic_thinking_blocks": list(anthropic_thinking_blocks.values()),
+                                    "usage": round_usage, "finish_reason": round_finish})
             if responses_protocol:
                 # Execution and replay must use the same assembled arguments.
                 # A corrected local transcript cannot continue an uncorrected
@@ -1728,7 +1803,7 @@ async def stream_response(
                     raise RuntimeError("上游连续返回空正文，未生成最终答案")
                 raise RuntimeError("上游在最终回答阶段仍返回工具调用，未生成最终答案")
 
-            if not calls and not final_answer_only and plan.active and plan_final_retries < 2:
+            if not agent_mode and not calls and not final_answer_only and plan.active and plan_final_retries < 2:
                 # Keep the attempted answer visible/history intact, but reconcile
                 # authoritative state before declaring unfinished work complete.
                 plan_final_retries += 1
@@ -1751,6 +1826,14 @@ async def stream_response(
             if responses_protocol:
                 response_chain.accept()
             if not calls or final_answer_only:
+                committed = {"role": "assistant", "content": round_answer}
+                if round_reasoning:
+                    committed["reasoning_content"] = round_reasoning
+                if messages_protocol and anthropic_thinking_blocks:
+                    committed["anthropic_thinking_blocks"] = [anthropic_thinking_blocks[i] for i in sorted(anthropic_thinking_blocks)]
+                if responses_protocol and responses_output_items_by_index:
+                    committed["responses_output_items"] = [responses_output_items_by_index[i] for i in sorted(responses_output_items_by_index)]
+                record("assistant/message", {"message": committed})
                 break
 
             # Execute all workspace calls from this response in emitted order.
@@ -1793,6 +1876,7 @@ async def stream_response(
                     for index in sorted(responses_output_items_by_index)
                 ]
             conversation.append(assistant_message)
+            record("assistant/message", {"message": assistant_message})
             tool_results_start = len(conversation)
             tool_rounds_used += 1
             # A model response is one scheduling boundary.  Decide whether
@@ -1825,10 +1909,12 @@ async def stream_response(
                                 break
                             if c_bound_path:
                                 c_args["path"] = c_bound_path
+                            record("tool/start", {"call_id": c["id"], "name": c_ws_name, "arguments": c_args})
                             prefetched_tasks[c["id"]] = asyncio.create_task(
                                 asyncio.to_thread(workspace.execute, c_ws_name, c_args)
                             )
                         elif c_is_extra and extra_tool_handler is not None:
+                            record("tool/start", {"call_id": c["id"], "name": c_name, "arguments": c_args})
                             if inspect.iscoroutinefunction(extra_tool_handler):
                                 prefetched_tasks[c["id"]] = asyncio.create_task(
                                     extra_tool_handler(c_name, c_args)
@@ -1888,6 +1974,9 @@ async def stream_response(
                 result_text = ""
                 target_url = ""
                 execution_allowed = True
+                if call_id not in prefetched_tasks:
+                    record("tool/start", {"call_id": call_id, "name": name,
+                                          "arguments": function.get("arguments") or "{}"})
                 try:
                     if not is_plan and not is_load and (is_extra or (agent_mode and is_workspace) or plan.steps):
                         execution_allowed = not batch_needs_plan
@@ -2512,10 +2601,12 @@ async def stream_response(
                     plan.record(call_id, trace_item["name"], step["status"], str(step.get("path") or ""), result_text)
                     trace_item["plan_step_id"] = (plan.active or {}).get("id")
                 conversation.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
+                record("tool/result", {"message": conversation[-1], "status": step["status"],
+                                       "name": name, "error": step.get("error") or ""})
                 # The latest result carries authoritative progress even without
                 # compaction or visible reasoning. Added before Responses pending
                 # is built, so stateful and stateless protocols see the same state.
-                if call is calls[-1] and (plan.steps or (agent_mode and plan.needs_plan)):
+                if not agent_mode and call is calls[-1] and (plan.steps or plan.needs_plan):
                     _append_runtime_note(conversation, plan.runtime_note())
                 await update(
                     {
@@ -2557,6 +2648,7 @@ async def stream_response(
                 plan=plan.export(),
             )
             if compacted:
+                record("context/checkpoint", {"messages": conversation[1:], "compaction": compacted})
                 # Content that left the request must not be "already seen".
                 for stub_name, stub_arguments in compacted["stubbed"]:
                     if stub_name == "fetch_webpage":
@@ -2573,6 +2665,9 @@ async def stream_response(
                     }
                 if responses_protocol:
                     response_chain.reset()
+            # Includes executed-argument trimming and other model-visible
+            # projections even when no budget compaction was necessary.
+            record("context/checkpoint", {"messages": conversation[1:]})
     searches = steps
     return {
         "answer": answer,
@@ -2584,8 +2679,8 @@ async def stream_response(
         "tool_trace": tool_trace,
         "round_stats": round_stats,
         "web_evidence": web_evidence,
-        "incomplete": tool_budget_exhausted or plan.unfinished,
-        "incomplete_reason": "plan_unfinished" if plan.unfinished else "",
+        "incomplete": tool_budget_exhausted or (not agent_mode and plan.unfinished),
+        "incomplete_reason": "plan_unfinished" if not agent_mode and plan.unfinished else "",
         "plan": plan.export(),
         "retry_status": retry_status,
         "tool_round_limit": role_tool_round_limit,

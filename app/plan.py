@@ -84,6 +84,92 @@ PLAN_PROMPT = (
     "then update it as steps complete; it is the one place your plan survives context compaction."
 )
 
+# Agent mode uses a log-backed checklist, not an execution permission system.
+CHECKLIST_PLAN_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "update_plan",
+        "description": (
+            "Maintain a visible task checklist for multi-step work. Send the entire todos list on every update; "
+            "it replaces the previous list. Mark progress as pending, in_progress or completed. "
+            "Several tasks may be in_progress. Update the list when your approach or progress changes."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"todos": {
+                "type": "array", "maxItems": MAX_PLAN_ITEMS,
+                "items": {
+                    "type": "object",
+                    "properties": {"content": {"type": "string", "minLength": 1},
+                                   "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}},
+                    "required": ["content", "status"], "additionalProperties": False,
+                },
+            }},
+            "required": ["todos"], "additionalProperties": False,
+        },
+    },
+}
+
+
+class ChecklistPlan:
+    """DSH-style whole-list replacement. Tool execution remains independent."""
+
+    def __init__(self, saved: dict[str, Any] | None = None) -> None:
+        self.initialized = bool(saved)
+        self.steps = []
+        for item in (saved or {}).get("steps") or []:
+            self.steps.append({"step": str(item.get("step") or item.get("content") or ""),
+                               "status": {"done": "completed", "blocked": "pending"}.get(
+                                   item.get("status"), item.get("status", "pending"))})
+
+    @property
+    def active(self) -> dict[str, str] | None:
+        return next((item for item in self.steps if item["status"] == "in_progress"), None)
+
+    @property
+    def needs_plan(self) -> bool:
+        return False
+
+    @property
+    def unfinished(self) -> bool:
+        return any(item["status"] != "completed" for item in self.steps)
+
+    def apply(self, arguments: dict[str, Any], **_: Any) -> str:
+        raw = arguments.get("todos")
+        if set(arguments) != {"todos"} or not isinstance(raw, list) or len(raw) > MAX_PLAN_ITEMS:
+            raise ValueError("todos 必须是完整任务数组（最多 20 项）")
+        candidate = []
+        for item in raw:
+            if not isinstance(item, dict) or set(item) != {"content", "status"}:
+                raise ValueError("每项只包含 content 和 status")
+            content = item["content"]
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("content 必须是非空字符串")
+            if item["status"] not in ("pending", "in_progress", "completed"):
+                raise ValueError("status 必须是 pending、in_progress 或 completed")
+            candidate.append({"step": content.strip(), "status": item["status"]})
+        if len({item["step"] for item in candidate}) != len(candidate):
+            raise ValueError("任务内容不能重复")
+        self.steps = candidate
+        self.initialized = True
+        counts = {status: sum(item["status"] == status for item in candidate)
+                  for status in ("pending", "in_progress", "completed")}
+        return (f"Updated todo list: {counts['pending']} pending, "
+                f"{counts['in_progress']} in progress, {counts['completed']} completed.")
+
+    def record(self, *_: Any) -> None:
+        # Operations are recorded by the session journal, not by plan receipts.
+        pass
+
+    def runtime_note(self) -> str:
+        return ""
+
+    def render(self) -> str:
+        return "\n".join(f"{item['status']}: {item['step']}" for item in self.steps)
+
+    def export(self) -> dict[str, Any] | None:
+        return {"version": 2, "steps": copy.deepcopy(self.steps)} if self.initialized else None
+
 
 _STATUS_KEYS = ("status", "state", "done", "completed", "complete", "finished")
 _NON_TEXT_KEYS = set(_STATUS_KEYS) | {"id", "index", "order", "priority", "number", "no", "n"}

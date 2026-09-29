@@ -46,6 +46,7 @@ from .reasoning_effort import LEVELS as REASONING_EFFORT_LEVELS
 from .security import load_secret, make_token, password_hash, password_ok, read_token
 from .skills import SkillRegistry
 from .work_log import build_work_log, with_work_log
+from .agent_session import AgentJournal
 from .workspace import AgentSharedWorkspace, ConversationWorkspace, WorkspaceError, delete_conversation_workspace, delete_user_workspaces
 
 
@@ -677,7 +678,22 @@ async def _execute_job(job_id: str) -> None:
                 response_state = {"disabled": True, "fallback_reason": RESPONSES_CAPABILITY_CACHED_REASON}
         response_options["responses_state"] = response_state
     history: list[dict[str, Any]] = []
-    for row in reversed(history_rows):
+    journal = AgentJournal(db, job_id, job["conversation_id"]) if agent_job else None
+    journal_scope = state_scope(provider, job, custom_settings_for_model(provider, job["model"])) if agent_job else ""
+    replay_rows = history_rows
+    if agent_job:
+        # The newest durable projection already contains preceding history.
+        # Load it once, not every older job and its diagnostic request bodies.
+        for index, row in enumerate(history_rows):
+            meta = db.decode(row.get("meta_json", "{}"), {})
+            if row["role"] != "assistant" or not meta.get("job_id"):
+                continue
+            projected = AgentJournal(db, meta["job_id"], job["conversation_id"]).history(scope=journal_scope)
+            if projected is not None:
+                history = projected
+                replay_rows = history_rows[:index]
+                break
+    for row in reversed(replay_rows):
         meta = db.decode(row.get("meta_json", "{}"), {})
         # Failed answers are kept for the user to inspect, but an incomplete
         # status sentence must not pollute the next model request's context.
@@ -709,6 +725,15 @@ async def _execute_job(job_id: str) -> None:
             message["content"] += "\n\n[本轮执行计划记录]\n" + json.dumps(
                 {"steps": prior_plan["steps"], "note": prior_plan.get("note", "")}, ensure_ascii=False)
         history.append(message)
+    resumed_execution = journal.history(scope=journal_scope) if journal else None
+    if resumed_execution is not None:
+        history = resumed_execution
+        # Resume from committed local operations, not an earlier server chain.
+        if kind == "custom_response":
+            response_options["responses_state"] = {}
+    if journal:
+        journal.append("turn/start", {"scope": journal_scope, "model": job["model"],
+                                      "provider_type": kind, "resumed": resumed_execution is not None})
     prior_web_evidence = db.web_evidence_for_conversation(
         job["user_id"],
         job["conversation_id"],
@@ -779,7 +804,7 @@ async def _execute_job(job_id: str) -> None:
         )
 
     try:
-        if attachment_records:
+        if attachment_records and resumed_execution is None:
             await attachment_job_lock.acquire()
             attachment_lock_acquired = True
             history = await asyncio.to_thread(
@@ -825,6 +850,7 @@ async def _execute_job(job_id: str) -> None:
                 **response_options,
                 system_addendum=build_agent_skills_prompt(),
                 user_context_addendum=web_evidence_context,
+                record_event=journal.append,
             )
         elif is_custom_provider(kind):
             provider_settings = custom_settings_for_model(provider, job["model"])
@@ -975,6 +1001,8 @@ async def _execute_job(job_id: str) -> None:
     finally:
         if attachment_lock_acquired:
             attachment_job_lock.release()
+        if journal:
+            journal.flush_preview()
 
 
 async def run_job(job_id: str) -> None:
@@ -987,6 +1015,12 @@ async def run_job(job_id: str) -> None:
             async with slots:
                 await _execute_job(job_id)
     finally:
+        current = db.one("SELECT * FROM jobs WHERE id=?", (job_id,))
+        if current and current.get("chat_mode") == "agent":
+            AgentJournal(db, job_id, current["conversation_id"]).append("turn/end", {
+                "status": current["status"], "error": current.get("error") or "",
+                "preview": current.get("answer") or "", "reasoning": current.get("reasoning") or "",
+            })
         tasks.pop(job_id, None)
 
 
@@ -1884,6 +1918,17 @@ def get_job(job_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[s
     if not job:
         raise HTTPException(404, "任务不存在")
     return public_job(job)
+
+
+@app.get("/api/jobs/{job_id}/execution")
+def get_execution(job_id: str, after: int = 0, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    job = db.one("SELECT conversation_id FROM jobs WHERE id=? AND user_id=?", (job_id, user["id"]))
+    if not job:
+        raise HTTPException(404, "任务不存在")
+    rows = db.all("SELECT * FROM agent_events WHERE job_id=? AND id>? ORDER BY id LIMIT 100", (job_id, after))
+    events = [{"id": row["id"], "kind": row["kind"], "payload": db.decode(row["payload_json"], {}),
+               "created_at": row["created_at"]} for row in rows]
+    return {"events": events, "next_after": events[-1]["id"] if events else after}
 
 
 @app.post("/api/jobs/{job_id}/stop")

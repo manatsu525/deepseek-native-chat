@@ -27,9 +27,13 @@ SMOKE_SPECS = (
     "test_context.CompactRequestTests.test_old_results_become_stubs_and_recent_ones_survive",
     "test_context.CompactRequestTests.test_whole_rounds_are_dropped_only_as_a_last_resort",
     "test_context.CompactRequestTests.test_checkpoint_carries_files_plan_and_sources",
-    "test_plan_execution.ExecutionPlanTests",
+    "test_plan_execution.ExecutionPlanTests.test_plan_state_and_checkpoint_restore",
+    "test_agent_session.AgentSessionTests",
+    "test_agent_session.AgentSessionLoopTests.test_committed_tools_replay_all_protocols",
+    "test_agent_session.AgentSessionLoopTests.test_main_cross_turn_and_restart_use_committed_history",
+    "test_agent_session.AgentSessionLoopTests.test_restored_history_compacts_without_losing_user_requests",
     "test_plan_execution.PlanLoopTests.test_gate_execute_verify_and_finish_all_protocols",
-    "test_plan_execution.PlanLoopTests.test_unfinished_final_is_reconciled_and_bounded",
+    "test_plan_execution.PlanLoopTests.test_unfinished_checklist_does_not_force_extra_rounds",
     "test_plan_execution.PlanLoopTests.test_503_waits_five_seconds_and_reports_recovery",
     "test_plan_execution.PlanLoopTests.test_configured_http_status_retries_with_same_policy",
     "test_agent_tools.AgentToolTests",
@@ -37,7 +41,8 @@ SMOKE_SPECS = (
     "test_custom_responses.CustomResponsesConnectionTests",
     "test_web_evidence.WebEvidenceTests",
     "test_research_prompt.SystemPromptTests",
-    "test_code_runner.CodeRunnerTests",
+    "test_code_runner.CodeRunnerTests.test_rejects_non_python_and_escaping_paths",
+    "test_code_runner.CodeRunnerTests.test_runs_disposable_copy_with_systemd_limits",
 )
 
 
