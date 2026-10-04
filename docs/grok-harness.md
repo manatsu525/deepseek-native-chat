@@ -78,6 +78,14 @@ the selected body in the upstream `<skill>` envelope. It supports the 25,000-tok
 body cap, zero-based `$0`, `$ARGUMENTS[N]`, `$ARGUMENTS`, `${SKILL_DIR}` and session
 substitutions. Managed installed/enabled skills and the administrator UI remain.
 Native `.grok/skills` and `.agents/skills` directories are discovered as well.
+An enabled list containing only retired application-default IDs is interpreted
+as the obsolete default configuration when none of those IDs still exists;
+the discovered/installed skills then use the normal enabled-by-default policy.
+Explicit empty lists and user selections remain unchanged. Folded YAML skill
+descriptions are read as text rather than the literal `>` marker.
+Enabled is distinct from model-invocable: `disable-model-invocation: true`
+excludes a skill from the model's listing and prevents model tool invocation.
+Upstream CLI slash-command invocation is not implemented in this web application.
 
 All eleven old application-bundled skill files have been removed, so old enabled
 IDs cannot cause their instructions to enter a new context. User-installed

@@ -190,6 +190,24 @@ class GrokToolsTests(unittest.TestCase):
                 registry.set_enabled("test", False)
                 with self.assertRaises(ValueError):
                     registry.invoke("test")
+                config = directory / "config.json"
+                config.write_text(json.dumps({"enabled": ["writing-plans", "executing-plans"]}))
+                self.assertIn("test", registry.enabled_ids())
+                registry.set_enabled("test", False)
+                self.assertNotIn("test", registry.enabled_ids())
+                config.write_text(json.dumps({"enabled": []}))
+                self.assertEqual(registry.enabled_ids(), [])
+                config.write_text(json.dumps({"enabled": ["missing-user-skill"]}))
+                self.assertEqual(registry.enabled_ids(), [])
+                from app.skills import _frontmatter
+                self.assertEqual(_frontmatter("---\nname: folded\ndescription: >\n  Create a skill.\n  Use when asked.\nmetadata:\n  other: text\n---\nBody", "fallback"),
+                                 ("folded", "Create a skill. Use when asked."))
+                (directory / "test/SKILL.md").write_text("---\nname: test\ndescription: manual only\ndisable-model-invocation: true\n---\nBody")
+                registry.set_enabled("test", True)
+                self.assertIn("test", registry.enabled_ids())
+                self.assertNotIn("manual only", registry.prompt())
+                with self.assertRaisesRegex(ValueError, "does not permit model invocation"):
+                    registry.invoke("test")
 
 
 class GrokLoopTests(unittest.IsolatedAsyncioTestCase):
