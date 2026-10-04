@@ -199,7 +199,7 @@
       <label>最大生成 Token<input id="customMaxCompletion" type="number" min="256" max="131072" step="256" value="65536"></label>
       <label>自动重试 HTTP 状态码<input id="customRetryStatusCodes" type="text" inputmode="numeric" placeholder="503, 429, 500" value="503"></label>
       <p class="wide muted custom-cost-note">填写 400-599 状态码，多个用逗号分隔；命中后统一每 5 秒重试，最多 60 次。默认只重试 503，清空可关闭自动重试。</p>
-      <label>上下文预算（字符，超出后压缩旧工具结果；保持默认值 240000 时按模型上下文窗口自动决定）<input id="customContextBudget" type="number" min="40000" max="4000000" step="10000" value="240000"></label>
+      <label>上下文预算（固定字符阈值，超出后压缩旧工具结果；默认 240000）<input id="customContextBudget" type="number" min="40000" max="4000000" step="10000" value="240000"></label>
       <label class="check"><input id="customTemperatureEnabled" type="checkbox"> 发送 temperature</label>
       <label>temperature<input id="customTemperature" type="number" min="0" max="1.5" step="0.05" value="1"></label>
       <label class="check"><input id="customTopPEnabled" type="checkbox"> 发送 top_p</label>

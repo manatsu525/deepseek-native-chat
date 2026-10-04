@@ -20,18 +20,12 @@ from collections.abc import Callable
 from typing import Any
 
 from .file_knowledge import FileKnowledge
+from .response_items import project_response_items
 
-# The settings value. Left at the default it means "size the budget from the
-# model's context window"; any other value is an explicit character budget.
+# Every configured number is a fixed compaction threshold, including default.
 DEFAULT_CONTEXT_BUDGET_CHARS = 240_000
 MIN_CONTEXT_BUDGET_CHARS = 40_000
 MAX_CONTEXT_BUDGET_CHARS = 4_000_000
-# Automatic sizing: this share of the model's window, capped in tokens.
-# Compaction throws away work the model has done, so on large-window models
-# it starts only past 512K tokens; smaller windows stay bounded by the share.
-CONTEXT_WINDOW_SHARE = 0.6
-CONTEXT_TOKEN_CAP = 512_000
-ASSUMED_WINDOW_TOKENS = 128_000
 # Snapshots in the checkpoint never take more than this many characters.
 SNAPSHOT_MAX_CHARS = 200_000
 LOW_WATER_RATIO = 0.6
@@ -62,6 +56,8 @@ def serialized_chars(messages: list[dict[str, Any]]) -> int:
     """
     total = 0
     for message in messages:
+        if message.get("responses_output_items"):
+            message = {**message, "responses_output_items": project_response_items(message)}
         total += len(json.dumps(message, ensure_ascii=False, separators=(",", ":")))
         for item in message.get("responses_output_items") or []:
             blob = item.get("encrypted_content") if isinstance(item, dict) else None
@@ -85,26 +81,13 @@ def effective_context_budget(
     request_chars: int,
     input_tokens: int,
 ) -> int:
-    """The character budget for the next request.
+    """Fixed character threshold; default is a value, not an auto-mode flag.
 
-    A character count is only a proxy for tokens, so the budget is derived from
-    the model's window using the ratio the provider itself reported for the
-    last request (characters sent versus input tokens billed). Before any
-    round has reported usage, or when the user set an explicit budget, the
-    settings value is used as is. A 50K-token budget on a 1M-token model was
-    dropping whole rounds of finished work mid-task.
+    Measurement arguments remain accepted for existing callers/diagnostics,
+    but neither upstream usage nor window metadata can change the setting.
+    This triggers compaction, not truncation of protected recent exchanges.
     """
-    if setting != DEFAULT_CONTEXT_BUDGET_CHARS:
-        return setting
-    if input_tokens <= 0 or request_chars <= 0:
-        if window_tokens and window_tokens > 0:
-            cold_tokens = min(int(window_tokens * CONTEXT_WINDOW_SHARE), CONTEXT_TOKEN_CAP)
-            estimated_chars = int(cold_tokens * 3.0)
-            return int(max(MIN_CONTEXT_BUDGET_CHARS, min(setting, estimated_chars)))
-        return setting
-    ratio = request_chars / input_tokens
-    tokens = min(int((window_tokens or ASSUMED_WINDOW_TOKENS) * CONTEXT_WINDOW_SHARE), CONTEXT_TOKEN_CAP)
-    return int(max(MIN_CONTEXT_BUDGET_CHARS, min(MAX_CONTEXT_BUDGET_CHARS, tokens * ratio)))
+    return normalize_budget(setting)
 
 
 def with_message_block(message: dict[str, Any], marker: str, text: str) -> dict[str, Any]:
