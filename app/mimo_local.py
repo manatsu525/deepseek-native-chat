@@ -20,7 +20,6 @@ from curl_cffi import requests as curl_requests
 from .custom_tool_normalization import normalize_tool_calls
 from .custom_request import apply_request_overrides, expand_advanced_request
 from .responses_state import ResponsesState
-from .response_items import project_response_items
 from .agent import HOST_READ_MAX_CHARS, AgentRuntime
 from .prompts import build_system_prompt, files_group_rules
 from .tool_groups import group_of_extra_tool, load_tools_definition, requested_groups
@@ -419,35 +418,11 @@ def _compact_workspace_call_arguments(
     path: str,
     succeeded: bool,
 ) -> bool:
-    """Remove large mutation bodies before they enter the next request.
+    """Retain original arguments; only whole-context budgeting may drop history.
 
-    The persisted workspace is authoritative after a successful mutation.  A
-    full file body or large exact-replacement pair only needs to cross the
-    provider boundary once, when the model emits it.  Keeping it verbatim in
-    every later tool round multiplies input tokens without adding current
-    state.  Small calls remain untouched for maximum prefix fidelity.
+    Kept as a compatibility hook for callers/tests of the previous policy.
     """
-    raw = str(function.get("arguments") or "")
-    if not succeeded:
-        if len(raw) > WORKSPACE_ARGUMENT_COMPACT_THRESHOLD:
-            function["arguments"] = "{}"
-            return True
-        return False
-    canonical = HOST_LEGACY_TOOL_ALIASES.get(name, name)
-    compact_threshold = FRESH_WRITE_CONTEXT_THRESHOLD if canonical == "write_file" else WORKSPACE_ARGUMENT_COMPACT_THRESHOLD
-    if (canonical not in WORKSPACE_MUTATION_TOOLS and canonical not in HOST_FILE_MUTATION_TOOLS) or len(raw) <= compact_threshold:
-        return False
-    compact: dict[str, Any] = {"path": path}
-    if canonical == "write_file":
-        compact["content"] = "[successful write body omitted from repeated context]"
-    elif canonical in {"apply_patch", "replace_text"}:
-        compact.update({"old_text": "[omitted]", "new_text": "[omitted]"})
-    elif canonical == "apply_patch_batch":
-        compact["patches"] = [{"old_text": "[omitted]", "new_text": "[omitted]"}]
-    elif canonical == "edit_file":
-        compact["edits"] = [{"old_text": "[omitted]", "new_text": "[omitted]"}]
-    function["arguments"] = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
-    return True
+    return False
 
 
 _QUERY_TOKEN_RE = re.compile(r"[a-z0-9]+|[一-鿿]+")
@@ -730,7 +705,11 @@ def _responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         tool_calls = message.get("tool_calls") or []
         content = message.get("content")
-        raw_output_items = project_response_items(message)
+        raw_output_items = [
+            dict(item)
+            for item in message.get("responses_output_items") or []
+            if isinstance(item, dict) and item.get("type")
+        ]
         if raw_output_items:
             result.extend(raw_output_items)
         raw_has_message = any(item.get("type") == "message" for item in raw_output_items)
@@ -2554,30 +2533,6 @@ async def stream_response(
                     )
                     if plan.steps:
                         result_text += "\n当前计划：\n" + plan.render()
-                compacted_arguments = False
-                if is_workspace:
-                    compacted_arguments = _compact_workspace_call_arguments(
-                        function,
-                        name=workspace_name,
-                        path=step.get("path", ""),
-                        succeeded=step["status"] == "completed",
-                    )
-                elif is_extra and (name in HOST_FILE_MUTATION_TOOLS or HOST_LEGACY_TOOL_ALIASES.get(name) in HOST_FILE_MUTATION_TOOLS):
-                    compacted_arguments = _compact_workspace_call_arguments(
-                        function,
-                        name=name,
-                        path=step.get("path", ""),
-                        succeeded=step["status"] == "completed",
-                    )
-                if compacted_arguments:
-                    if responses_protocol:
-                        assistant_message["responses_output_items"] = project_response_items(assistant_message)
-                        # The stored response still contains the original body.
-                        # Rebase once from compacted local history so chaining
-                        # cannot bypass the projection and retain that body.
-                        response_chain.reset()
-                        round_stat["arguments_compacted"] = True
-                    result_text += "\n[上下文优化：大型操作参数已执行并从后续重复请求中省略；当前工作区文件是权威状态。]"
                 trace_item = {
                     "id": call_id,
                     "name": workspace_name if is_workspace else name,

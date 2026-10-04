@@ -20,7 +20,6 @@ from collections.abc import Callable
 from typing import Any
 
 from .file_knowledge import FileKnowledge
-from .response_items import project_response_items
 
 # Every configured number is a fixed compaction threshold, including default.
 DEFAULT_CONTEXT_BUDGET_CHARS = 240_000
@@ -56,8 +55,6 @@ def serialized_chars(messages: list[dict[str, Any]]) -> int:
     """
     total = 0
     for message in messages:
-        if message.get("responses_output_items"):
-            message = {**message, "responses_output_items": project_response_items(message)}
         total += len(json.dumps(message, ensure_ascii=False, separators=(",", ":")))
         for item in message.get("responses_output_items") or []:
             blob = item.get("encrypted_content") if isinstance(item, dict) else None
