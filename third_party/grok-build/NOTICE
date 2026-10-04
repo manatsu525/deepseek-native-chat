@@ -1,0 +1,6 @@
+Portions of app/agent_compaction.py and app/templates/grok_compaction_prompt.txt
+are adapted from xai-org/grok-build, commit
+2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8.
+Copyright 2023-2026 SpaceXAI. Licensed under Apache-2.0 (see LICENSE).
+Rust conversation types and transport/persistence interfaces have been adapted
+to this application's Python types, three Custom API protocols, and journal.

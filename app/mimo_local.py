@@ -24,11 +24,13 @@ from .agent import HOST_READ_MAX_CHARS, AgentRuntime
 from .prompts import build_system_prompt, files_group_rules
 from .tool_groups import group_of_extra_tool, load_tools_definition, requested_groups
 from .file_knowledge import FileKnowledge
+from .agent_compaction import (
+    AgentCompactor, CompactError, SegmentStore, TokenMeter, WALL_CLOCK_SECONDS,
+    overflow_error, image_budget, prune_history,
+)
+from .config import settings as app_settings
 from .context import (
-    CONTEXT_CHECKPOINT_MARKER,
     DEFAULT_CONTEXT_BUDGET_CHARS,
-    checkpoint_payload,
-    checkpoint_present,
     compact_request,
     effective_context_budget,
     normalize_budget,
@@ -866,6 +868,136 @@ def _normalize_anthropic_usage(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _custom_payload(messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+                    parameters: dict[str, Any], protocol: str) -> dict[str, Any]:
+    """Stateless envelope; compaction requests must not advance the live chain."""
+    if protocol == "responses":
+        payload = {"input": _responses_input([m for m in messages if m.get("role") not in {"system", "developer"}]),
+                   "instructions": "\n\n".join(str(m.get("content") or "") for m in messages
+                                                if m.get("role") in {"system", "developer"}), "stream": True}
+        if tools:
+            payload.update(tools=_responses_tools(tools), tool_choice="auto")
+    elif protocol == "messages":
+        system, history = _anthropic_messages(messages)
+        payload = {"system": system, "messages": history, "stream": True}
+        if tools:
+            payload.update(tools=_anthropic_tools(tools), tool_choice={"type": "auto"})
+    else:
+        payload = {"messages": [{k: v for k, v in m.items() if k != "agent_synthetic"} for m in messages], "stream": True}
+        if tools:
+            payload.update(tools=tools, tool_choice="auto")
+    payload.update(parameters)
+    return payload
+
+
+async def _sample_compaction(client: Any, *, base_url: str, headers: dict[str, str],
+                             protocol: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+                             parameters: dict[str, Any], stopped: Callable[[], bool],
+                             record: Callable[[str, dict[str, Any]], None], stage: str,
+                             on_usage: Callable[[dict[str, Any]], None]) -> str:
+    # Grok uses current model/effort, temperature 1, retained tool schemas and
+    # tool_choice auto. Preserve Custom routing/auth options as protocol adapters.
+    summary_parameters = dict(parameters)
+    summary_parameters["temperature"] = 1.0
+    summary_parameters.pop("top_p", None)
+    if protocol != "messages":
+        for field in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+            summary_parameters.pop(field, None)
+    else:
+        # Anthropic requires max_tokens; adaptive thinking disallows temperature.
+        summary_parameters.setdefault("max_tokens", 32768)
+        if (summary_parameters.get("thinking") or {}).get("type") == "adaptive":
+            summary_parameters.pop("temperature", None)
+    payload = _custom_payload(messages, tools, summary_parameters, protocol)
+    for field in ("previous_response_id", "conversation"):
+        payload.pop(field, None)
+    endpoint = "responses" if protocol == "responses" else "messages" if protocol == "messages" else "chat/completions"
+    record("context/model_request", {"stage": stage, "body": payload})
+
+    async def consume() -> str:
+        chunks, latest_usage, anthropic_usage = [], {}, {}
+        complete_text = ""
+        async with client.stream("POST", _url(base_url, endpoint), headers=headers, json=payload) as response:
+            if response.status_code >= 400:
+                body = (await response.aread()).decode(errors="replace")
+                raise CompactError(body, int(response.status_code))
+            iterator = response.aiter_lines().__aiter__()
+            while True:
+                if stopped():
+                    raise asyncio.CancelledError
+                task = asyncio.create_task(iterator.__anext__())
+                try:
+                    idle = 0
+                    while not task.done():
+                        await asyncio.wait({task}, timeout=1)
+                        if stopped():
+                            raise asyncio.CancelledError
+                        idle += 1
+                        if idle >= 600 and not task.done():
+                            raise CompactError("compaction stream idle timeout", deterministic=True)
+                    try:
+                        line = task.result()
+                    except StopAsyncIteration:
+                        break
+                finally:
+                    if not task.done():
+                        task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                if not line.startswith("data:"):
+                    continue
+                raw = line[5:].strip()
+                if raw == "[DONE]":
+                    break
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    continue
+                error = _stream_error_info(data)
+                if error:
+                    on_usage(latest_usage)
+                    raise CompactError(error[1], error[0])
+                kind = data.get("type") or ""
+                if kind in {"error", "response.failed"} or data.get("error"):
+                    error_payload = (data.get("response") or {}).get("error") or data.get("error") or data
+                    code = str(error_payload.get("code") or error_payload.get("type") or "") if isinstance(error_payload, dict) else ""
+                    message = str(error_payload.get("message") or error_payload) if isinstance(error_payload, dict) else str(error_payload)
+                    on_usage(latest_usage)
+                    # Preserve named error codes in the same anchored carrier
+                    # the Grok shared size-error classifier recognizes.
+                    raise CompactError(code + ": " + message, deterministic=code == "invalid_request_error")
+                if protocol == "responses":
+                    if kind == "response.output_text.delta":
+                        chunks.append(str(data.get("delta") or ""))
+                    if kind in {"response.completed", "response.incomplete"}:
+                        result = data.get("response") or {}
+                        latest_usage = _normalize_responses_usage(result.get("usage") or {})
+                        complete_text = "".join(str(part.get("text") or "") for item in result.get("output") or []
+                                                if item.get("type") == "message" for part in item.get("content") or [])
+                elif protocol == "messages":
+                    delta = data.get("delta") or {}
+                    if kind == "content_block_delta" and delta.get("type") == "text_delta":
+                        chunks.append(str(delta.get("text") or ""))
+                    anthropic_usage.update((data.get("message") or {}).get("usage") or data.get("usage") or {})
+                    latest_usage = _normalize_anthropic_usage(anthropic_usage)
+                else:
+                    for choice in data.get("choices") or []:
+                        chunks.append(str((choice.get("delta") or {}).get("content") or ""))
+                    if isinstance(data.get("usage"), dict):
+                        latest_usage = _normalize_usage(data["usage"])
+                # Tools advertised for prefix alignment are NEVER dispatched here.
+        on_usage(latest_usage)
+        record("context/model_response", {"stage": stage, "usage": latest_usage,
+                                          "summary": complete_text or "".join(chunks)})
+        return complete_text or "".join(chunks)
+
+    try:
+        return await asyncio.wait_for(consume(), timeout=WALL_CLOCK_SECONDS)
+    except asyncio.TimeoutError as error:
+        raise CompactError("compaction wall-clock timeout") from error
+    except httpx.HTTPError as error:
+        raise CompactError(str(error)) from error
+
+
 async def stream_response(
     *,
     base_url: str,
@@ -898,6 +1030,7 @@ async def stream_response(
     context_window_tokens: int | None = None,
     initial_plan: dict[str, Any] | None = None,
     record_event: Callable[[str, dict[str, Any]], None] | None = None,
+    agent_context_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run a custom OpenAI-compatible model with local web tools.
 
@@ -1021,14 +1154,26 @@ async def stream_response(
     # Host files can also change through shell commands, so their snapshots
     # are revalidated against disk before a checkpoint reuses them.
     knowledge = FileKnowledge(validate=_host_revision if agent_mode else None)
+    compactor = None
+    edited_paths: set[str] = set()
     if agent_mode:
+        restored_state = dict(agent_context_state or {})
+        if restored_state.get("window") not in {None, context_window_tokens or 256_000}:
+            restored_state = {k: v for k, v in restored_state.items() if k in {"loaded_groups", "plan", "edited_paths"}}
+        loaded_groups.update(restored_state.get("loaded_groups") or [])
+        edited_paths.update(restored_state.get("edited_paths") or [])
+        if not initial_plan and restored_state.get("plan"):
+            plan = ChecklistPlan(restored_state["plan"])
+        compactor = AgentCompactor(SegmentStore(app_settings.data_dir, conversation_id or uuid.uuid4().hex),
+                                  context_window_tokens, api_protocol, TokenMeter(restored_state.get("meter")),
+                                  record, stopped, restored_state)
+        if not compactor.meter.total:
+            compactor.meter.reseed(conversation)
         # Restore loaded groups from completed receipts, not just old promises.
         historical_calls = {
             call["id"]: call for message in messages for call in message.get("tool_calls") or []
         }
         for message in messages:
-            for snapshot in checkpoint_payload([message]).get("file_snapshots") or []:
-                knowledge.record_read(snapshot)
             call = historical_calls.get(message.get("tool_call_id"), {})
             function = call.get("function") or {}
             if function.get("name") == "load_tools" and str(message.get("content", "")).startswith("Loaded tool groups:"):
@@ -1036,23 +1181,13 @@ async def stream_response(
             group = group_of_extra_tool(str(function.get("name") or ""))
             if group and message.get("role") == "tool" and not _tool_result_failure(str(message.get("content") or "")):
                 loaded_groups.add(group)
-            if message.get("role") == "tool" and function.get("name") in HOST_READ_TOOLS:
-                knowledge.record_read(_json_object(str(message.get("content") or "")))
-        # Historic tool transcripts can now be longer than the former final-only
-        # replay. Compact with the existing policy before the first request;
-        # protect the newest user request and retain original events on disk.
-        if _serialized_chars(conversation) > context_budget:
-            latest_user = next((i for i in range(len(conversation) - 1, 0, -1)
-                                if conversation[i].get("role") == "user"), len(conversation))
-            previous = [conversation[0], {"role": "user", "content": "此前执行记录："},
-                        *conversation[1:latest_user]]
-            compact_request(previous, base_message_count=2,
-                            budget=max(40_000, context_budget - _serialized_chars(conversation[latest_user:])),
-                            knowledge=knowledge, preserve_user_messages=True)
-            conversation = [*previous, *conversation[latest_user:]]
-            base_message_count = len(conversation)
-            response_chain.reset()
         record("history/start", {"messages": conversation[1:]})
+        retained = prune_history(conversation, retained=True)
+        if retained != conversation:
+            conversation = retained
+            compactor.meter.reseed(conversation)
+            response_chain.reset()
+            record("context/checkpoint", {"messages": conversation[1:], "policy": "grok-build-retained-prune"})
     workspace_searches: set[str] = set()
     workspace_validations: set[tuple[int, str]] = set()
     workspace_list_generations: set[int] = set()
@@ -1137,7 +1272,58 @@ async def stream_response(
         jina_context as jina_client,
         parallel_context as parallel_client,
         keyless_context as keyless_client,
+        (compactor if compactor is not None else _AsyncNullContext()) as _compaction_scope,
     ):
+        def save_agent_context() -> None:
+            if compactor is not None:
+                compactor.runtime_state = {"loaded_groups": sorted(loaded_groups), "plan": plan.export(),
+                                           "edited_paths": sorted(edited_paths)}
+                record("context/state", compactor.export())
+
+        async def sample_context(history: list[dict[str, Any]], tools: list[dict[str, Any]], stage: str) -> str:
+            nonlocal usage
+            parameter_config = dict(config)
+            if settings and "advanced_enabled" not in settings:
+                parameter_config.pop("advanced_enabled", None)
+            parameters = build_custom_request_parameters(base_url, model, parameter_config,
+                api_protocol=api_protocol, effort=effort, conversation_id=conversation_id)
+            def account(summary_usage: dict[str, Any]) -> None:
+                nonlocal usage
+                usage = _merge_usage(usage, summary_usage)
+            if before_model_call:
+                before_model_call()
+            return await _sample_compaction(api_client, base_url=base_url, headers=headers,
+                protocol=api_protocol, messages=history, tools=tools, parameters=parameters,
+                stopped=stopped, record=record, stage=stage, on_usage=account)
+
+        async def compact_agent_context(tools: list[dict[str, Any]], *, force: bool = False) -> bool:
+            nonlocal conversation, tool_results_start, retry_status
+            if compactor is None or compactor.suppressed or (not force and compactor.meter.used(conversation) * 100 < compactor.window * 85):
+                return False
+            retry_status = {"active": True, "status": "compacting", "message": "正在按 Grok Build 机制压缩 Agent 上下文…"}
+            await update({"answer": answer, "reasoning": reasoning, "searches": steps, "usage": usage,
+                          "sources": list(sources.values()), "retry_status": retry_status})
+            projected = await compactor.compact(conversation, tools, sample_context,
+                {"todos": (plan.export() or {}).get("steps") or [], "loaded_tool_groups": sorted(loaded_groups),
+                 "edited_paths": sorted(edited_paths), "working_directory": "/home/share"}, force=force)
+            if projected is not None:
+                conversation = projected
+                tool_results_start = len(conversation)
+                response_chain.reset()
+                # These sets describe live evidence, not archived evidence.
+                # A recovery request must be allowed after full replacement.
+                attempted_urls.clear()
+                searched_queries.clear()
+                searched_terms.clear()
+                budget_noted_messages.clear()
+                record("context/checkpoint", {"messages": conversation[1:], "policy": "grok-build"})
+            save_agent_context()
+            retry_status = {"active": False, "status": "recovered" if projected is not None else "failed",
+                            "message": "Agent 上下文压缩完成，原始记录已存档。" if projected is not None else
+                                       "Agent 上下文压缩未成功，保留原始记录；详情见执行日志。"}
+            await update({"answer": answer, "reasoning": reasoning, "searches": steps, "usage": usage,
+                          "sources": list(sources.values()), "retry_status": retry_status})
+            return projected is not None
         # Standard mode keeps its existing compact budget. Host Agent mode has
         # a larger transport budget for real multi-file work; the two scheduling
         # rules remain enforced independently of that budget. Two answer-only
@@ -1209,6 +1395,9 @@ async def stream_response(
                     # checklist. Execution resumes as soon as a valid step is active.
                     round_tools = [UPDATE_PLAN_TOOL]
             final_answer_only = force_final_answer or (tools_expected and not round_tools)
+            if compactor is not None:
+                await compact_agent_context(round_tools)
+                compactor.maybe_prefire(conversation, round_tools, sample_context)
             mimo_model = is_mimo_model(model)
             request_messages = conversation
             runtime_note_kind = ""
@@ -1252,6 +1441,15 @@ async def stream_response(
                         ),
                     },
                 ]
+            if compactor is not None:
+                projected_request = image_budget(request_messages, api_protocol)
+                if compactor.meter.total > compactor.window // 2:
+                    projected_request = prune_history(projected_request)
+                if projected_request != request_messages:
+                    # A previous_response_id contains the unpruned server
+                    # history; full input is required for a rewritten prefix.
+                    response_chain.reset()
+                    request_messages = projected_request
             responses_protocol = api_protocol == "responses"
             messages_protocol = api_protocol == "messages"
             parameter_config = dict(config)
@@ -1291,7 +1489,8 @@ async def stream_response(
                     payload["tool_choice"] = {"type": "auto"}
             else:
                 payload = {
-                    "messages": request_messages,
+                    "messages": [{k: v for k, v in m.items() if k != "agent_synthetic"} for m in request_messages]
+                                if agent_mode else request_messages,
                     "stream": True,
                 }
                 if round_tools:
@@ -1317,6 +1516,10 @@ async def stream_response(
                 "request_chars": _serialized_chars(request_messages),
                 "final_only": bool(final_answer_only),
             }
+            if compactor is not None:
+                round_stat["context_tokens_estimate"] = compactor.meter.used(conversation)
+                round_stat["context_window_tokens"] = compactor.window
+                round_stat["context_policy"] = "grok-build"
             if runtime_note_kind:
                 round_stat["note"] = runtime_note_kind
             round_answer = ""
@@ -1374,6 +1577,7 @@ async def stream_response(
                 response_chain.candidate_stored = True
 
             async def iter_model_lines():
+                nonlocal payload, full_response_input, request_messages
                 last_retry_code = 0
                 for retry_index in range(MAX_HTTP_RETRIES + 1):
                     if stopped():
@@ -1397,6 +1601,26 @@ async def stream_response(
                         api_client.stream("POST", _url(base_url, endpoint), headers=headers, json=payload)
                     )
                     async with stream_context as candidate:
+                        if candidate.status_code >= 400 and compactor is not None:
+                            error_body = (await candidate.aread()).decode(errors="replace")
+                            if overflow_error(int(candidate.status_code), error_body):
+                                record("model/error", {"round": round_number + 1, "status": candidate.status_code,
+                                                       "body": error_body[:2000]})
+                                if await compact_agent_context(round_tools, force=True):
+                                    request_messages = conversation
+                                    if final_answer_only:
+                                        request_messages = [*conversation, {"role": "system", "content": _final_answer_prompt(
+                                            web_enabled=web_enabled, workspace_enabled=workspace_tools_expected,
+                                            extra_tools_enabled=extra_tools_expected)}]
+                                    payload = _custom_payload(request_messages, round_tools, parameters, api_protocol)
+                                    if responses_protocol:
+                                        full_response_input = payload["input"]
+                                        response_chain.prepare(payload, full_response_input)
+                                    round_stat["request_chars"] = _serialized_chars(request_messages)
+                                    round_stat["context_tokens_estimate"] = compactor.meter.used(conversation)
+                                    record("context/overflow_resubmit", {"round": round_number + 1})
+                                    continue
+                                raise RuntimeError(f"Custom API {candidate.status_code}: {error_body[:2000]}")
                         if candidate.status_code in retry_status_codes:
                             last_retry_code = int(candidate.status_code)
                             body = (await candidate.aread()).decode(errors="replace")[:1000]
@@ -1810,6 +2034,11 @@ async def stream_response(
                 if responses_protocol and responses_output_items_by_index:
                     committed["responses_output_items"] = [responses_output_items_by_index[i] for i in sorted(responses_output_items_by_index)]
                 record("assistant/message", {"message": committed})
+                if compactor is not None:
+                    conversation.append(committed)
+                    compactor.meter.observe(conversation, round_usage)
+                    compactor.success()
+                    save_agent_context()
                 break
 
             # Execute all workspace calls from this response in emitted order.
@@ -1852,6 +2081,10 @@ async def stream_response(
                     for index in sorted(responses_output_items_by_index)
                 ]
             conversation.append(assistant_message)
+            if compactor is not None:
+                compactor.meter.observe(conversation, round_usage)
+                compactor.success()
+                save_agent_context()
             record("assistant/message", {"message": assistant_message})
             tool_results_start = len(conversation)
             tool_rounds_used += 1
@@ -2392,6 +2625,8 @@ async def stream_response(
                                         "publish_time": source.get("publish_time") or "",
                                     }
                                 )
+                                if agent_mode:
+                                    cached_web_evidence[canonical] = web_evidence[-1]
                             step["status"] = "completed"
                             if fetch_count >= fetch_limit and not cached_content:
                                 reader_enabled = False
@@ -2407,7 +2642,7 @@ async def stream_response(
                         failure = _tool_result_failure(result_text)
                         step["status"] = "failed" if failure else "completed"
                         step["error"] = failure
-                        if name in HOST_READ_TOOLS and not failure:
+                        if name in HOST_READ_TOOLS and not failure and not agent_mode:
                             read_result = _json_object(result_text)
                             replacement = knowledge.record_read(read_result)
                             if replacement is not None:
@@ -2416,7 +2651,10 @@ async def stream_response(
                         elif name in HOST_FILE_MUTATION_TOOLS and not failure:
                             workspace_generation += 1
                             changed_path = str(_json_object(result_text).get("path") or "")
-                            if changed_path and name in HOST_DELETE_TOOLS:
+                            if agent_mode:
+                                if changed_path:
+                                    edited_paths.add(changed_path)
+                            elif changed_path and name in HOST_DELETE_TOOLS:
                                 knowledge.forget(changed_path)
                             elif changed_path:
                                 knowledge.record_own_change(
@@ -2589,7 +2827,7 @@ async def stream_response(
                 force_final_answer = True
             if responses_protocol:
                 response_chain.pending = _responses_input(conversation[tool_results_start:])
-            if round_stats:
+            if round_stats and not agent_mode:
                 context_budget = effective_context_budget(
                     context_budget_setting,
                     window_tokens=context_window_tokens,
@@ -2597,7 +2835,7 @@ async def stream_response(
                     input_tokens=int(round_stats[-1].get("input_tokens") or 0),
                 )
                 round_stats[-1]["context_budget"] = context_budget
-            compacted = compact_request(
+            compacted = None if agent_mode else compact_request(
                 conversation,
                 base_message_count=base_message_count,
                 budget=context_budget,
@@ -2627,6 +2865,7 @@ async def stream_response(
             # Includes executed-argument trimming and other model-visible
             # projections even when no budget compaction was necessary.
             record("context/checkpoint", {"messages": conversation[1:]})
+            save_agent_context()
     searches = steps
     return {
         "answer": answer,

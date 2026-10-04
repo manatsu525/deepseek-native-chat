@@ -24,9 +24,9 @@ MAX_SMOKE_TESTS = 50
 SMOKE_SPECS = (
     "test_workspace.FileViewRewriteTests",
     "test_workspace.WorkspaceTests",
-    "test_context.CompactRequestTests.test_old_results_become_stubs_and_recent_ones_survive",
-    "test_context.CompactRequestTests.test_whole_rounds_are_dropped_only_as_a_last_resort",
-    "test_context.CompactRequestTests.test_checkpoint_carries_files_plan_and_sources",
+    "test_agent_compaction.CompactionParityTests.test_meter_utf8_native_mirrors_and_reseed",
+    "test_agent_compaction.CompactionParityTests.test_summary_cleaning_upstream_vectors",
+    "test_agent_compaction.CompactionLoopTests.test_two_successive_compactions_tool_receipts_and_all_protocols",
     "test_plan_execution.ExecutionPlanTests.test_plan_state_and_checkpoint_restore",
     "test_agent_session.AgentSessionTests",
     "test_agent_session.AgentSessionLoopTests.test_committed_tools_replay_all_protocols",

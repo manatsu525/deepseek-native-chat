@@ -87,6 +87,15 @@ class AgentSessionTests(unittest.TestCase):
             self.assertEqual(reopened.history(scope="same")[-1]["content"], "saved")
             journal.append("context/checkpoint", {"messages": [{"role": "user", "content": "bounded projection"}]})
             self.assertEqual(reopened.history(scope="same"), [{"role": "user", "content": "bounded projection"}])
+            journal.append("context/state", {"meter": {"total": 1000, "baseline": 500}, "window": 256_000,
+                                             "loaded_groups": ["skills"], "plan": {"steps": []},
+                                             "prefire_cache": {"note": "saved note"}})
+            self.assertEqual(reopened.context_state(scope="same")["meter"]["total"], 1000)
+            self.assertNotIn("meter", reopened.context_state(scope="changed"))
+            self.assertEqual(reopened.context_state(scope="changed")["loaded_groups"], ["skills"])
+            raw = next(Path(directory).rglob("updates.jsonl")).read_text()
+            self.assertIn('"content": "saved"', raw)
+            self.assertNotIn("failed draft", raw)
             with patch.object(main, "db", db):
                 self.assertTrue(main.get_execution("one", user={"id": uid})["events"])
                 with self.assertRaises(main.HTTPException):
@@ -143,17 +152,30 @@ class AgentSessionLoopTests(unittest.IsolatedAsyncioTestCase):
         events = []
         def record(kind, payload):
             events.append({"kind": kind, "payload": copy.deepcopy(payload)})
+        # The old 40k character switch no longer applies to Agent.
         _, payloads, _, _ = await loops.PlanLoopTests.run_loop(self, [["done"]], messages=history,
                     settings={"context_budget_chars": 40_000}, record_event=record)
-        sent = payloads[0]["messages"]
-        self.assertLess(len(json.dumps(sent)), 70_000)
-        for index in range(8):
-            self.assertIn(f"requirement {index}", json.dumps(sent))
-        self.assertEqual(sent[-1]["content"], "latest request")
-        self.assertEqual(project_history(events)[:-1], sent[1:])
-        call_ids = {call["id"] for message in sent for call in message.get("tool_calls") or []}
-        result_ids = {message["tool_call_id"] for message in sent if message.get("role") == "tool"}
-        self.assertEqual(call_ids, result_ids)
+        self.assertIn("x" * 15_000, json.dumps(payloads[0]))
+        summary = "<summary>1. Primary Request: original requirements; " + "; ".join(
+            f"requirement {index}" for index in range(8)) + "; latest request. " + "state " * 120 + "</summary>"
+        for protocol in ("chat_completions", "responses", "messages"):
+            with tempfile.TemporaryDirectory() as directory, patch.object(mimo_local, "app_settings") as config:
+                config.data_dir = Path(directory)
+                events.clear()
+                _, payloads, executed, _ = await loops.PlanLoopTests.run_loop(self, [[summary], ["done"]],
+                    protocol=protocol, messages=history, context_window_tokens=32_000, record_event=record)
+                self.assertEqual(executed, [])
+                sent = json.dumps(payloads[1])
+                self.assertLess(len(sent), 20_000)
+                for index in range(8):
+                    self.assertIn(f"requirement {index}", sent)
+                self.assertIn("latest request", sent)
+                self.assertNotIn("previous_response_id", payloads[1])
+                projected = project_history(events)
+                self.assertEqual(projected[-1]["content"], "done")
+                self.assertFalse(any(m.get("tool_calls") or m.get("role") == "tool" for m in projected))
+                archive = next(Path(directory).rglob("segment_000.md"))
+                self.assertIn("x" * 15_000, archive.read_text())
 
     async def test_main_cross_turn_and_restart_use_committed_history(self):
         with tempfile.TemporaryDirectory() as directory:

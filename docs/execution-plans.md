@@ -17,7 +17,8 @@ forced finalization requests in Agent mode. Unfinished checklist items alone
 do not mark an answer failed; the model reports remaining work honestly.
 
 `jobs.plan_json` and message metadata preserve the checklist for the existing
-trace UI. New turns start new checklists; restarted jobs restore their own.
+trace UI. Agent context snapshots retain the active checklist across turns
+and compaction; restarted jobs restore their own.
 Version-1 plans remain readable and convert to minimal lists on Agent restart.
 The frontend's expand/collapse and scroll behavior is unchanged.
 
@@ -42,12 +43,13 @@ repeating a side effect that may have applied. This is not exactly-once
 execution. Restarted jobs resume committed history instead of silently
 starting again from the original question.
 
-Existing deterministic context budgets still bound replay. Context projections
-preserve balanced tool groups and are logged separately; original events stay
-on disk. No additional paid summarization requests are introduced. Native
-reasoning fields are retained only for the same route/configuration scope.
+Agent now uses the [Grok Build context mechanism](agent-context.md): token-based
+85% triggers, background prefire, model summaries and full transcript archives.
+Summarization calls are billed by the selected model. Original events remain
+on disk; projections are logged separately. Native reasoning fields are
+retained only for the same route/configuration scope.
 
-The configured `context_budget_chars` is always a fixed compaction trigger,
+In ordinary chat only, `context_budget_chars` is a fixed compaction trigger,
 including the default 240000. Model window metadata and reported token usage
 do not expand it. Protected recent exchanges are not hard-truncated, so the
 trigger is not a guarantee that every wire request is below that character
@@ -56,7 +58,7 @@ count. Numeric bounds remain 40000–4000000.
 Large write/edit arguments are retained verbatim after execution, including
 failed calls. Responses replays original native items and reasoning signatures;
 parameter size alone does not reset its stored response chain. Whole-context
-compaction remains governed by the fixed configured threshold above.
+compaction follows the protocol-specific policy described above.
 
 ## Diagnosis and verification
 

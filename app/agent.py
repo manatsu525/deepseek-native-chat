@@ -550,6 +550,8 @@ class AgentRuntime:
         self.db.run("DELETE FROM conversations WHERE id=? AND user_id=?", (conversation_id, self.user_id))
         attachments.delete_files(records)
         delete_conversation_workspace(self.user_id, conversation_id)
+        from .agent_compaction import delete_session_archive
+        delete_session_archive(self.db.path.parent, conversation_id)
         return {"ok": True, "conversation_id": conversation_id}
 
     def _skill_list(self, _: dict[str, Any]) -> dict[str, Any]:

@@ -9,6 +9,8 @@ from __future__ import annotations
 import copy
 import json
 import time
+import os
+import hashlib
 from typing import Any
 
 from .db import Database
@@ -71,6 +73,24 @@ class AgentJournal:
             "INSERT INTO agent_events(job_id,conversation_id,kind,payload_json,created_at) VALUES(?,?,?,?,?)",
             (self.job_id, self.conversation_id, kind, json.dumps(payload, ensure_ascii=False), int(time.time())),
         )
+        if kind in {"history/start", "assistant/message", "tool/result"}:
+            # Grok's raw updates.jsonl is the complete out-of-band channel;
+            # request-copy pruning and the 5MiB markdown cap never truncate it.
+            directory = self.db.path.parent / "agent_sessions" / hashlib.sha256(self.conversation_id.encode()).hexdigest()
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(directory, 0o700)
+            transcript = directory / "updates.jsonl"
+            messages = (payload.get("messages") or []) if kind == "history/start" else [payload["message"]]
+            if kind == "history/start" and transcript.exists():
+                # Existing history is already in the raw transcript. A new
+                # prompt adds its most recent real user item only.
+                messages = next(([m] for m in reversed(messages) if m.get("role") == "user" and not m.get("agent_synthetic")), [])
+            fd = os.open(transcript, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                for message in messages:
+                    stream.write(json.dumps(message, ensure_ascii=False) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
 
     def flush_preview(self) -> None:
         if self.pending_preview is not None:
@@ -81,6 +101,21 @@ class AgentJournal:
                  "created_at": row["created_at"]}
                 for row in self.db.all("SELECT * FROM agent_events WHERE job_id=? AND conversation_id=? ORDER BY id",
                                        (self.job_id, self.conversation_id))]
+
+    def context_state(self, *, scope: str) -> dict[str, Any]:
+        """Provider-confirmed context meter and compaction state, route-scoped."""
+        row = self.db.one(
+            "SELECT id,payload_json FROM agent_events WHERE job_id=? AND conversation_id=? AND kind='context/state' "
+            "ORDER BY id DESC LIMIT 1", (self.job_id, self.conversation_id))
+        if not row:
+            return {}
+        source = self.db.one(
+            "SELECT payload_json FROM agent_events WHERE job_id=? AND conversation_id=? AND kind='turn/start' "
+            "AND id<=? ORDER BY id DESC LIMIT 1", (self.job_id, self.conversation_id, row["id"]))
+        if not source or json.loads(source["payload_json"]).get("scope") != scope:
+            state = json.loads(row["payload_json"])
+            return {k: state[k] for k in ("loaded_groups", "plan", "edited_paths") if k in state}
+        return json.loads(row["payload_json"])
 
     def history(self, *, scope: str = "") -> list[dict[str, Any]] | None:
         checkpoint = self.db.one(

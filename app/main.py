@@ -47,6 +47,7 @@ from .security import load_secret, make_token, password_hash, password_ok, read_
 from .skills import SkillRegistry
 from .work_log import build_work_log, with_work_log
 from .agent_session import AgentJournal
+from .agent_compaction import delete_session_archive
 from .workspace import AgentSharedWorkspace, ConversationWorkspace, WorkspaceError, delete_conversation_workspace, delete_user_workspaces
 
 
@@ -431,6 +432,7 @@ def trim_old_conversations(user_id: int) -> None:
         attachments.delete_files(attachment_records)
     for row in rows:
         delete_conversation_workspace(user_id, row["id"])
+        delete_session_archive(db.path.parent, row["id"])
 
 
 def current_user(session: Optional[str] = Cookie(default=None)) -> dict[str, Any]:
@@ -663,8 +665,17 @@ async def _execute_job(job_id: str) -> None:
     if is_custom_provider(kind):
         # Best-effort, cached per process: sizes the context budget to the
         # model instead of a fixed character count.
+        context_model = job["model"]
+        if agent_job:
+            protocol = "responses" if kind == "custom_response" else "messages" if kind == "custom_messages" else "chat_completions"
+            effective_parameters = build_custom_request_parameters(provider["base_url"], job["model"],
+                custom_settings_for_model(provider, job["model"]), api_protocol=protocol,
+                effort=job["effort"], conversation_id=job["conversation_id"])
+            context_model = str(effective_parameters.get("model") or context_model)
+            if context_model.endswith(":floor"):
+                context_model = context_model[:-6]
         response_options["context_window_tokens"] = await asyncio.to_thread(
-            context_window_tokens, provider["base_url"], provider["api_key"], job["model"]
+            context_window_tokens, provider["base_url"], provider["api_key"], context_model
         )
     if kind == "custom_response":
         response_scope = state_scope(provider, job, custom_settings_for_model(provider, job["model"]))
@@ -688,9 +699,11 @@ async def _execute_job(job_id: str) -> None:
             meta = db.decode(row.get("meta_json", "{}"), {})
             if row["role"] != "assistant" or not meta.get("job_id"):
                 continue
-            projected = AgentJournal(db, meta["job_id"], job["conversation_id"]).history(scope=journal_scope)
+            prior_journal = AgentJournal(db, meta["job_id"], job["conversation_id"])
+            projected = prior_journal.history(scope=journal_scope)
             if projected is not None:
                 history = projected
+                response_options["agent_context_state"] = prior_journal.context_state(scope=journal_scope)
                 replay_rows = history_rows[:index]
                 break
     for row in reversed(replay_rows):
@@ -728,6 +741,7 @@ async def _execute_job(job_id: str) -> None:
     resumed_execution = journal.history(scope=journal_scope) if journal else None
     if resumed_execution is not None:
         history = resumed_execution
+        response_options["agent_context_state"] = journal.context_state(scope=journal_scope)
         # Resume from committed local operations, not an earlier server chain.
         if kind == "custom_response":
             response_options["responses_state"] = {}
@@ -745,7 +759,7 @@ async def _execute_job(job_id: str) -> None:
         if item.get("canonical_url") and item.get("content")
     }
     latest_user_text = next(
-        (str(item.get("content") or "") for item in reversed(history) if item.get("role") == "user"),
+        (str(item.get("content") or "") for item in reversed(history) if item.get("role") == "user" and not item.get("agent_synthetic")),
         "",
     )
     web_evidence_context = _build_web_evidence_context(prior_web_evidence, latest_user_text)
@@ -1853,6 +1867,7 @@ def delete_conversation(conversation_id: str, user: dict[str, Any] = Depends(cur
     db.run("DELETE FROM conversations WHERE id=? AND user_id=?", (conversation_id, user["id"]))
     attachments.delete_files(attachment_records)
     delete_conversation_workspace(user["id"], conversation_id)
+    delete_session_archive(db.path.parent, conversation_id)
     return {"ok": True}
 
 
