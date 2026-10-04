@@ -385,9 +385,10 @@ def render_segment(messages: list[dict[str, Any]], summary: str, index: int, tim
 
 
 class SegmentStore:
-    def __init__(self, root: Path, conversation_id: str):
+    def __init__(self, root: Path, conversation_id: str, *, display_directory: str | None = None):
         # User-controlled IDs never become filesystem paths. No shared /home/share.
         self.directory = root / "agent_sessions" / hashlib.sha256(conversation_id.encode()).hexdigest() / "compaction"
+        self.display_directory = display_directory
 
     def save(self, messages: list[dict[str, Any]], summary: str) -> dict[str, Any]:
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -413,7 +414,7 @@ class SegmentStore:
             stream.write(f"| {index:03} | {segment.name} | {len(messages)} | {len(rendered.encode())} | {kw} |\n")
             stream.flush()
             os.fsync(stream.fileno())
-        return {"index": index, "path": str(segment), "directory": str(self.directory)}
+        return {"index": index, "path": str(segment), "directory": self.display_directory or str(self.directory)}
 
 
 def delete_session_archive(root: Path, conversation_id: str) -> None:
@@ -441,8 +442,9 @@ def rebuilt_history(messages: list[dict[str, Any]], summary: str, directory: str
             query["content"] = [{"type": "text", "text": query["content"]}] + [
                 p for p in parts if p.get("type") in {"image", "image_url", "input_image"}]
         result.append(query)
+    lookup = "search_files" if directory.startswith(".context/") else "grep"
     hint = (f"\n\nFull verbatim rollouts of previous segments are available at {directory}/segment_*.md.  "
-            f"See {directory}/INDEX.md for a table of contents.  Use read_file or grep to recover specific "
+            f"See {directory}/INDEX.md for a table of contents.  Use read_file or {lookup} to recover specific "
             "details (exact code, file paths, tool outputs) if this summary is insufficient.  Do NOT modify these files.")
     result.append({"role": "user", "content": CONTINUATION + "\n\n" + clean_summary(summary) + hint,
                    "agent_synthetic": "compaction_summary"})

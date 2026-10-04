@@ -11,6 +11,7 @@ from app import agent_compaction as compact
 from app import mimo_local
 from app.agent import AgentRuntime, HOST_TOOLS
 import test_plan_execution as loops
+from app import workspace as workspaces
 
 
 def history(size=160_000):
@@ -116,6 +117,66 @@ class CompactionParityTests(unittest.TestCase):
 
 
 class CompactionLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ordinary_write_then_compact_then_read_all_protocols(self):
+        for protocol in ("chat_completions", "responses", "messages"):
+            with self.subTest(protocol=protocol), tempfile.TemporaryDirectory() as directory, \
+                 patch.object(mimo_local, "app_settings") as config, \
+                 patch.object(workspaces, "settings") as workspace_config, \
+                 patch.object(workspaces, "WORKSPACES_DIR", Path(directory) / "workspaces"):
+                config.data_dir = workspace_config.data_dir = Path(directory)
+                workspace = workspaces.ConversationWorkspace(1, "coding")
+                content = "BEFORE\n" + "# payload line\n" * 5000
+                events = []
+                result, _, _, _ = await loops.PlanLoopTests.run_loop(self, [
+                    [("load", "load_tools", {"groups": ["files"]})],
+                    [("write", "write_file", {"path": "real.py", "content": content})], [SUMMARY],
+                    [("read", "read_file", {"path": "real.py"})], [SUMMARY], ["done"]],
+                    protocol=protocol, agent_mode=False, workspace=workspace, context_window_tokens=20_000,
+                    record_event=lambda k, p: events.append((k, copy.deepcopy(p))))
+                self.assertEqual(result["answer"], "done")
+                self.assertEqual((workspace.root / "real.py").read_text(), content)
+                read = next(p["message"]["content"] for k, p in events if k == "tool/result" and p["message"].get("tool_call_id") == "read")
+                self.assertIn("BEFORE", read)
+                self.assertNotIn('"skipped": true', read)
+                self.assertEqual(len(list(Path(directory).rglob("segment_*.md"))), 2)
+
+    async def test_ordinary_chat_compacts_and_recovers_private_archive_all_protocols(self):
+        for protocol in ("chat_completions", "responses", "messages"):
+            with self.subTest(protocol=protocol), tempfile.TemporaryDirectory() as directory, \
+                 patch.object(mimo_local, "app_settings") as config, \
+                 patch.object(workspaces, "settings") as workspace_config, \
+                 patch.object(workspaces, "WORKSPACES_DIR", Path(directory) / "workspaces"):
+                config.data_dir = workspace_config.data_dir = Path(directory)
+                workspace = workspaces.ConversationWorkspace(1, "ordinary")
+                events = []
+                messages = history(160_000)[1:]
+                messages[-1]["content"] = "old code\n" + ("x" * 100 + "\n") * 1600
+                result, payloads, _, _ = await loops.PlanLoopTests.run_loop(self, [
+                    [SUMMARY], [("load", "load_tools", {"groups": ["files"]})],
+                    [("recover", "read_file", {"path": ".context/compaction/segment_000.md"})], ["done"]],
+                    protocol=protocol, messages=messages, context_window_tokens=40_000,
+                    agent_mode=False, workspace=workspace, settings={"context_budget_chars": 40_000},
+                    record_event=lambda k, p: events.append((k, copy.deepcopy(p))))
+                self.assertEqual(result["answer"], "done")
+                self.assertEqual(result["round_stats"][0]["context_policy"], "grok-build")
+                self.assertIn(".context/compaction/INDEX.md", json.dumps(payloads[1]))
+                recovered = next(p["message"]["content"] for k, p in events if k == "tool/result" and p["message"].get("tool_call_id") == "recover")
+                self.assertIn("old code", recovered)
+                self.assertNotIn('"agent_synthetic":', json.dumps(payloads))
+                names = {t["function"]["name"] if "function" in t else t["name"] for t in payloads[2]["tools"]}
+                self.assertIn("read_file", names)
+                self.assertFalse(any(n.startswith("host_") for n in names))
+                self.assertEqual(workspace.list_files(), [])
+                matches = workspace.search_files("old code", ".context/compaction")
+                self.assertTrue(matches["matches"])
+                self.assertTrue(matches["matches"][0]["path"].startswith(".context/"))
+                for action in (lambda: workspace.write_file(".context/compaction/INDEX.md", "overwrite"),
+                               lambda: workspace.delete_file(".context/compaction/segment_000.md"),
+                               lambda: workspace.read_file(".context/../other/secret"),
+                               lambda: workspaces.ConversationWorkspace(1, "other").read_file(".context/compaction/segment_000.md")):
+                    with self.assertRaises(workspaces.WorkspaceError):
+                        action()
+
     async def test_failure_does_not_mutate_history_or_execute_tools(self):
         with tempfile.TemporaryDirectory() as directory:
             messages, events = history(), []
@@ -248,12 +309,12 @@ class CompactionLoopTests(unittest.IsolatedAsyncioTestCase):
             messages += [{"role": "assistant", "content": "", "tool_calls": [{"id": str(i), "type": "function",
                 "function": {"name": name, "arguments": json.dumps({"url": "https://example.invalid/" + str(i)})}}]},
                 {"role": "tool", "tool_call_id": str(i), "content": ("SEARCH_EVIDENCE " if i == 0 else "PAGE_BODY ") * 9000}]
-        for protocol in ("chat_completions", "responses", "messages"):
-            with self.subTest(protocol=protocol), tempfile.TemporaryDirectory() as directory, \
+        for protocol, agent_mode in ((p, a) for p in ("chat_completions", "responses", "messages") for a in (True, False)):
+            with self.subTest(protocol=protocol, agent_mode=agent_mode), tempfile.TemporaryDirectory() as directory, \
                  patch.object(mimo_local, "app_settings") as config:
                 config.data_dir = Path(directory)
                 result, payloads, executed, _ = await loops.PlanLoopTests.run_loop(self, [[SUMMARY], ["done"]],
-                    protocol=protocol, context_window_tokens=80_000, messages=messages)
+                    protocol=protocol, agent_mode=agent_mode, context_window_tokens=80_000, messages=messages)
                 self.assertEqual(executed, [])
                 self.assertEqual(result["answer"], "done")
                 self.assertIn("PAGE_BODY " * 100, next(Path(directory).rglob("segment_000.md")).read_text())

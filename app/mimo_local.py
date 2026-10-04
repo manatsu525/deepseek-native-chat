@@ -30,10 +30,6 @@ from .agent_compaction import (
 )
 from .config import settings as app_settings
 from .context import (
-    DEFAULT_CONTEXT_BUDGET_CHARS,
-    compact_request,
-    effective_context_budget,
-    normalize_budget,
     serialized_chars as _serialized_chars,
     with_message_block as _with_message_block,
 )
@@ -1045,7 +1041,7 @@ async def stream_response(
     """
     config = _settings(settings)
     def record(kind: str, payload: dict[str, Any]) -> None:
-        if agent_mode and record_event is not None:
+        if record_event is not None:
             record_event(kind, payload)
 
     retry_status_codes = _retry_status_codes(config)
@@ -1079,6 +1075,7 @@ async def stream_response(
     # files; in Agent mode the conversation and Skill tools wait for load_tools.
     files_deferrable = (
         not agent_mode and workspace is not None and workspace_access == "full" and not workspace.list_files()
+        and not workspace.context_archive.is_dir()
     )
     extra_groups = sorted({
         group for group in (group_of_extra_tool(name) for name in extra_tool_names) if group
@@ -1109,7 +1106,6 @@ async def stream_response(
         # The persisted state belongs to the immediately preceding assistant.
         # Attachment expansion has already happened in main.py.
         response_chain.pending = _responses_input(messages[-1:])
-    base_message_count = len(conversation)
     answer = ""
     reasoning = ""
     usage: dict[str, Any] = {}
@@ -1144,50 +1140,43 @@ async def stream_response(
     if initial_plan and plan.steps and not agent_mode:
         conversation.append({"role": "user", "content": plan.runtime_note()})
         response_chain.reset()
-    context_budget_setting = normalize_budget(config.get("context_budget_chars", DEFAULT_CONTEXT_BUDGET_CHARS))
-    context_budget = effective_context_budget(
-        context_budget_setting,
-        window_tokens=context_window_tokens,
-        request_chars=0,
-        input_tokens=0,
-    )
     # Host files can also change through shell commands, so their snapshots
     # are revalidated against disk before a checkpoint reuses them.
     knowledge = FileKnowledge(validate=_host_revision if agent_mode else None)
-    compactor = None
     edited_paths: set[str] = set()
-    if agent_mode:
-        restored_state = dict(agent_context_state or {})
-        if restored_state.get("window") not in {None, context_window_tokens or 256_000}:
-            restored_state = {k: v for k, v in restored_state.items() if k in {"loaded_groups", "plan", "edited_paths"}}
-        loaded_groups.update(restored_state.get("loaded_groups") or [])
-        edited_paths.update(restored_state.get("edited_paths") or [])
-        if not initial_plan and restored_state.get("plan"):
-            plan = ChecklistPlan(restored_state["plan"])
-        compactor = AgentCompactor(SegmentStore(app_settings.data_dir, conversation_id or uuid.uuid4().hex),
-                                  context_window_tokens, api_protocol, TokenMeter(restored_state.get("meter")),
-                                  record, stopped, restored_state)
-        if not compactor.meter.total:
-            compactor.meter.reseed(conversation)
-        # Restore loaded groups from completed receipts, not just old promises.
-        historical_calls = {
-            call["id"]: call for message in messages for call in message.get("tool_calls") or []
-        }
-        for message in messages:
-            call = historical_calls.get(message.get("tool_call_id"), {})
-            function = call.get("function") or {}
-            if function.get("name") == "load_tools" and str(message.get("content", "")).startswith("Loaded tool groups:"):
-                loaded_groups.update(requested_groups(_json_object(function.get("arguments") or "{}"), deferrable_groups))
-            group = group_of_extra_tool(str(function.get("name") or ""))
-            if group and message.get("role") == "tool" and not _tool_result_failure(str(message.get("content") or "")):
-                loaded_groups.add(group)
-        record("history/start", {"messages": conversation[1:]})
-        retained = prune_history(conversation, retained=True)
-        if retained != conversation:
-            conversation = retained
-            compactor.meter.reseed(conversation)
-            response_chain.reset()
-            record("context/checkpoint", {"messages": conversation[1:], "policy": "grok-build-retained-prune"})
+    restored_state = dict(agent_context_state or {})
+    if restored_state.get("window") not in {None, context_window_tokens or 256_000}:
+        restored_state = {k: v for k, v in restored_state.items() if k in {"loaded_groups", "plan", "edited_paths"}}
+    loaded_groups.update(restored_state.get("loaded_groups") or [])
+    edited_paths.update(restored_state.get("edited_paths") or [])
+    if not initial_plan and restored_state.get("plan"):
+        plan = ChecklistPlan(restored_state["plan"]) if agent_mode else ExecutionPlan(restored_state["plan"])
+    store = SegmentStore(app_settings.data_dir, conversation_id or uuid.uuid4().hex,
+                         display_directory=".context/compaction" if workspace is not None else None)
+    compactor = AgentCompactor(store,
+                              context_window_tokens, api_protocol, TokenMeter(restored_state.get("meter")),
+                              record, stopped, restored_state)
+    if not compactor.meter.total:
+        compactor.meter.reseed(conversation)
+    # Restore loaded groups from completed receipts, not just old promises.
+    historical_calls = {
+        call["id"]: call for message in messages for call in message.get("tool_calls") or []
+    }
+    for message in messages:
+        call = historical_calls.get(message.get("tool_call_id"), {})
+        function = call.get("function") or {}
+        if function.get("name") == "load_tools" and str(message.get("content", "")).startswith("Loaded tool groups:"):
+            loaded_groups.update(requested_groups(_json_object(function.get("arguments") or "{}"), deferrable_groups))
+        group = group_of_extra_tool(str(function.get("name") or ""))
+        if group and message.get("role") == "tool" and not _tool_result_failure(str(message.get("content") or "")):
+            loaded_groups.add(group)
+    record("history/start", {"messages": conversation[1:]})
+    retained = prune_history(conversation, retained=True)
+    if retained != conversation:
+        conversation = retained
+        compactor.meter.reseed(conversation)
+        response_chain.reset()
+        record("context/checkpoint", {"messages": conversation[1:], "policy": "grok-build-retained-prune"})
     workspace_searches: set[str] = set()
     workspace_validations: set[tuple[int, str]] = set()
     workspace_list_generations: set[int] = set()
@@ -1297,15 +1286,15 @@ async def stream_response(
                 stopped=stopped, record=record, stage=stage, on_usage=account)
 
         async def compact_agent_context(tools: list[dict[str, Any]], *, force: bool = False) -> bool:
-            nonlocal conversation, tool_results_start, retry_status
+            nonlocal conversation, tool_results_start, retry_status, knowledge
             if compactor is None or compactor.suppressed or (not force and compactor.meter.used(conversation) * 100 < compactor.window * 85):
                 return False
-            retry_status = {"active": True, "status": "compacting", "message": "正在按 Grok Build 机制压缩 Agent 上下文…"}
+            retry_status = {"active": True, "status": "compacting", "message": "正在按 Grok Build 机制压缩上下文…"}
             await update({"answer": answer, "reasoning": reasoning, "searches": steps, "usage": usage,
                           "sources": list(sources.values()), "retry_status": retry_status})
             projected = await compactor.compact(conversation, tools, sample_context,
                 {"todos": (plan.export() or {}).get("steps") or [], "loaded_tool_groups": sorted(loaded_groups),
-                 "edited_paths": sorted(edited_paths), "working_directory": "/home/share"}, force=force)
+                 "edited_paths": sorted(edited_paths), "working_directory": "/home/share" if agent_mode else "."}, force=force)
             if projected is not None:
                 conversation = projected
                 tool_results_start = len(conversation)
@@ -1316,11 +1305,15 @@ async def stream_response(
                 searched_queries.clear()
                 searched_terms.clear()
                 budget_noted_messages.clear()
+                workspace_searches.clear()
+                workspace_validations.clear()
+                workspace_list_generations.clear()
+                knowledge = FileKnowledge(validate=_host_revision if agent_mode else None)
                 record("context/checkpoint", {"messages": conversation[1:], "policy": "grok-build"})
             save_agent_context()
             retry_status = {"active": False, "status": "recovered" if projected is not None else "failed",
-                            "message": "Agent 上下文压缩完成，原始记录已存档。" if projected is not None else
-                                       "Agent 上下文压缩未成功，保留原始记录；详情见执行日志。"}
+                            "message": "上下文压缩完成，原始记录已存档。" if projected is not None else
+                                       "上下文压缩未成功，保留原始记录；详情见执行日志。"}
             await update({"answer": answer, "reasoning": reasoning, "searches": steps, "usage": usage,
                           "sources": list(sources.values()), "retry_status": retry_status})
             return projected is not None
@@ -1450,6 +1443,10 @@ async def stream_response(
                     # history; full input is required for a rewritten prefix.
                     response_chain.reset()
                     request_messages = projected_request
+                    knowledge = FileKnowledge(validate=_host_revision if agent_mode else None)
+                    workspace_searches.clear()
+                    workspace_validations.clear()
+                    workspace_list_generations.clear()
             responses_protocol = api_protocol == "responses"
             messages_protocol = api_protocol == "messages"
             parameter_config = dict(config)
@@ -1489,8 +1486,7 @@ async def stream_response(
                     payload["tool_choice"] = {"type": "auto"}
             else:
                 payload = {
-                    "messages": [{k: v for k, v in m.items() if k != "agent_synthetic"} for m in request_messages]
-                                if agent_mode else request_messages,
+                    "messages": [{k: v for k, v in m.items() if k != "agent_synthetic"} for m in request_messages],
                     "stream": True,
                 }
                 if round_tools:
@@ -2340,7 +2336,8 @@ async def stream_response(
                             )
                         normalized_path = ""
                         if "path" in arguments:
-                            _, normalized_path = workspace.resolve(arguments["path"], allow_root=workspace_name == "search_files")
+                            resolver = workspace._resolve_read if workspace_name in {"read_file", "search_files"} else workspace.resolve
+                            _, normalized_path = resolver(arguments["path"], allow_root=workspace_name == "search_files")
                         if workspace_name == "read_file":
                             # Persist the request so reading patterns can be
                             # diagnosed after the live context is gone.
@@ -2417,6 +2414,11 @@ async def stream_response(
                             elif workspace_name in WORKSPACE_MUTATION_TOOLS:
                                 workspace_generation += 1
                                 workspace_searches.clear()
+                                if normalized_path:
+                                    if workspace_name == "delete_file":
+                                        edited_paths.discard(normalized_path)
+                                    else:
+                                        edited_paths.add(normalized_path)
                                 if workspace_name == "delete_file":
                                     knowledge.forget(normalized_path)
                                 else:
@@ -2625,8 +2627,7 @@ async def stream_response(
                                         "publish_time": source.get("publish_time") or "",
                                     }
                                 )
-                                if agent_mode:
-                                    cached_web_evidence[canonical] = web_evidence[-1]
+                                cached_web_evidence[canonical] = web_evidence[-1]
                             step["status"] = "completed"
                             if fetch_count >= fetch_limit and not cached_content:
                                 reader_enabled = False
@@ -2827,41 +2828,6 @@ async def stream_response(
                 force_final_answer = True
             if responses_protocol:
                 response_chain.pending = _responses_input(conversation[tool_results_start:])
-            if round_stats and not agent_mode:
-                context_budget = effective_context_budget(
-                    context_budget_setting,
-                    window_tokens=context_window_tokens,
-                    request_chars=int(round_stats[-1].get("request_chars") or 0),
-                    input_tokens=int(round_stats[-1].get("input_tokens") or 0),
-                )
-                round_stats[-1]["context_budget"] = context_budget
-            compacted = None if agent_mode else compact_request(
-                conversation,
-                base_message_count=base_message_count,
-                budget=context_budget,
-                knowledge=knowledge,
-                workspace_files=workspace.list_files if workspace is not None else None,
-                sources=sources,
-                plan=plan.export(),
-            )
-            if compacted:
-                record("context/checkpoint", {"messages": conversation[1:], "compaction": compacted})
-                # Content that left the request must not be "already seen".
-                for stub_name, stub_arguments in compacted["stubbed"]:
-                    if stub_name == "fetch_webpage":
-                        try:
-                            attempted_urls.discard(_canonical_url(_safe_fetch_url(stub_arguments.get("url"))))
-                        except (TypeError, ValueError):
-                            pass
-                if round_stats:
-                    round_stats[-1]["compacted_after"] = True
-                    round_stats[-1]["compaction"] = {
-                        "stubbed": len(compacted["stubbed"]),
-                        "dropped_rounds": compacted["dropped_rounds"],
-                        "request_chars": compacted["request_chars"],
-                    }
-                if responses_protocol:
-                    response_chain.reset()
             # Includes executed-argument trimming and other model-visible
             # projections even when no budget compaction was necessary.
             record("context/checkpoint", {"messages": conversation[1:]})

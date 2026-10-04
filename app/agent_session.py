@@ -2,7 +2,7 @@
 
 Requests and unsuccessful attempts are diagnostic events. Only committed
 messages/results and explicit context projections contribute to model history.
-No credentials/HTTP headers are recorded. Existing ordinary chat is unchanged.
+No credentials/HTTP headers are recorded. Both ordinary chat and Agent use this context journal.
 """
 from __future__ import annotations
 

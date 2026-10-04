@@ -33,9 +33,9 @@ ownership still apply. Complete file bodies are sensitive conversation data.
 
 UI streaming is separate from commits. Unsuccessful drafts are diagnostic
 events, not successful messages in later model requests. Committed tool calls
-and matching results replay together. Later Agent turns use this transcript
+and matching results replay together. Later turns in both modes use this transcript
 instead of final-answer-only history with a short operation summary.
-Ordinary chat does not use the journal.
+Ordinary chat also uses the journal for recoverable context and committed tool history.
 
 Interrupted calls without results are distinguished as not started or started
 with unknown outcome. Unknown is not failure: inspect current state before
@@ -43,17 +43,14 @@ repeating a side effect that may have applied. This is not exactly-once
 execution. Restarted jobs resume committed history instead of silently
 starting again from the original question.
 
-Agent now uses the [Grok Build context mechanism](agent-context.md): token-based
+Both modes now use the [Grok Build context mechanism](agent-context.md): token-based
 85% triggers, background prefire, model summaries and full transcript archives.
 Summarization calls are billed by the selected model. Original events remain
 on disk; projections are logged separately. Native reasoning fields are
 retained only for the same route/configuration scope.
 
-In ordinary chat only, `context_budget_chars` is a fixed compaction trigger,
-including the default 240000. Model window metadata and reported token usage
-do not expand it. Protected recent exchanges are not hard-truncated, so the
-trigger is not a guarantee that every wire request is below that character
-count. Numeric bounds remain 40000–4000000.
+The legacy `context_budget_chars` setting is ignored in both modes; the model
+context window determines compaction timing.
 
 Large write/edit arguments are retained verbatim after execution, including
 failed calls. Responses replays original native items and reasoning signatures;

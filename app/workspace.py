@@ -536,6 +536,7 @@ class ConversationWorkspace:
         if not str(user_id).isdigit() or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conversation_id or ""):
             raise WorkspaceError("无效的工作区标识")
         self.root = WORKSPACES_DIR / str(user_id) / conversation_id
+        self.context_archive = settings.data_dir / "agent_sessions" / hashlib.sha256(conversation_id.encode()).hexdigest()
 
     @staticmethod
     def _clean_path(value: Any, *, allow_root: bool = False) -> PurePosixPath:
@@ -554,12 +555,25 @@ class ConversationWorkspace:
 
     def resolve(self, value: Any, *, allow_root: bool = False) -> tuple[Path, str]:
         relative = self._clean_path(value, allow_root=allow_root)
+        if relative.parts and relative.parts[0] == ".context":
+            raise WorkspaceError("上下文存档只支持 read_file / search_files 读取")
         candidate = self.root if relative == PurePosixPath(".") else self.root.joinpath(*relative.parts)
         root_resolved = self.root.resolve(strict=False)
         resolved = candidate.resolve(strict=False)
         if resolved != root_resolved and root_resolved not in resolved.parents:
             raise WorkspaceError("文件路径越过了工作区边界")
         return candidate, "" if relative == PurePosixPath(".") else relative.as_posix()
+
+    def _resolve_read(self, value: Any, *, allow_root: bool = False) -> tuple[Path, str]:
+        relative = self._clean_path(value, allow_root=allow_root)
+        if not relative.parts or relative.parts[0] != ".context":
+            return self.resolve(value, allow_root=allow_root)
+        candidate = self.context_archive.joinpath(*relative.parts[1:])
+        root = self.context_archive.resolve(strict=False)
+        resolved = candidate.resolve(strict=False)
+        if resolved != root and root not in resolved.parents:
+            raise WorkspaceError("文件路径越过了存档边界")
+        return candidate, relative.as_posix()
 
     def _files(self) -> list[Path]:
         if not self.root.is_dir():
@@ -593,10 +607,10 @@ class ConversationWorkspace:
         return deepcopy(tools)
 
     def _read_text(self, path: Any) -> tuple[str, str]:
-        target, relative = self.resolve(path)
+        target, relative = self._resolve_read(path)
         if not target.is_file() or target.is_symlink():
             raise WorkspaceError(f"文件不存在：{relative}")
-        if target.stat().st_size > MAX_FILE_BYTES:
+        if target.stat().st_size > MAX_FILE_BYTES and not relative.startswith(".context/"):
             raise WorkspaceError("文件过大，无法读取")
         try:
             content = target.read_text(encoding="utf-8")
@@ -685,14 +699,14 @@ class ConversationWorkspace:
         needle = str(query or "")
         if not needle:
             raise WorkspaceError("搜索内容不能为空")
-        target, relative = self.resolve(path, allow_root=True)
+        target, relative = self._resolve_read(path, allow_root=True)
         if target.is_symlink() or not target.exists():
             raise WorkspaceError(f"搜索路径不存在：{relative or '.'}")
         candidates = [target] if target.is_file() else [item for item in target.rglob("*") if item.is_file() and not item.is_symlink()]
         matches: list[dict[str, Any]] = []
         folded = needle.casefold()
         for file_path in sorted(candidates):
-            if file_path.stat().st_size > MAX_FILE_BYTES:
+            if file_path.stat().st_size > MAX_FILE_BYTES and not relative.startswith(".context"):
                 continue
             try:
                 lines = file_path.read_text(encoding="utf-8").splitlines()
@@ -700,7 +714,9 @@ class ConversationWorkspace:
                 continue
             for number, line in enumerate(lines, 1):
                 if folded in line.casefold():
-                    matches.append({"path": file_path.relative_to(self.root).as_posix(), "line": number, "text": line[:300]})
+                    name = (".context/" + file_path.relative_to(self.context_archive).as_posix()
+                            if relative.startswith(".context") else file_path.relative_to(self.root).as_posix())
+                    matches.append({"path": name, "line": number, "text": line[:300]})
                     if len(matches) >= MAX_SEARCH_RESULTS:
                         return {"matches": matches, "truncated": True}
         return {"matches": matches, "truncated": False}

@@ -215,3 +215,46 @@ class AgentSessionLoopTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("结果未知", captured[2][-1]["content"])
                 self.assertEqual(captured[2][0]["content"], "restart")
                 self.assertEqual(AgentJournal(db, "restart", "chat").events()[-1]["kind"], "turn/end")
+
+    async def test_ordinary_main_cross_turn_and_restart_use_committed_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Database(Path(directory) / "test.db")
+            uid, pid = seed(db)
+            captured = []
+            async def stream(**kwargs):
+                self.assertFalse(kwargs.get("agent_mode", False))
+                self.assertIsNotNone(kwargs.get("workspace"))
+                captured.append(copy.deepcopy(kwargs["messages"]))
+                record = kwargs["record_event"]
+                record("history/start", {"messages": kwargs["messages"]})
+                if len(captured) == 1:
+                    record("assistant/message", {"message": assistant()})
+                    record("tool/start", {"call_id": "write"})
+                    record("tool/result", {"message": {"role": "tool", "tool_call_id": "write", "content": "real result"}})
+                record("assistant/message", {"message": {"role": "assistant", "content": "done"}})
+                return {"answer": "done", "reasoning": "", "searches": [], "sources": [], "usage": {}}
+            with patch.object(main, "db", db), patch.object(main, "custom_stream_response", stream), \
+                 patch.object(main, "AgentRuntime"), patch.object(main, "AgentSharedWorkspace") as workspace, \
+                 patch.object(main, "context_window_tokens", return_value=120_000), \
+                 patch.object(main, "build_agent_skills_prompt", return_value=""):
+                workspace.return_value.list_files.return_value = []
+                for ident in ("first", "second"):
+                    job(db, uid, pid, ident)
+                    db.run("UPDATE jobs SET chat_mode='standard' WHERE id=?", (ident,))
+                    db.run("INSERT INTO messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)", ("chat", "user", ident, 1))
+                    await main.run_job(ident)
+                    self.assertEqual(db.one("SELECT status FROM jobs WHERE id=?", (ident,))["status"], "completed")
+                self.assertEqual(captured[1][-1]["content"], "second")
+                self.assertIn("real result", json.dumps(captured[1]))
+                # A restarted job resumes its own committed operation even before
+                # an assistant message has been added to the UI history.
+                job(db, uid, pid, "restart")
+                db.run("UPDATE jobs SET chat_mode='standard' WHERE id='restart'")
+                journal = AgentJournal(db, "restart", "chat")
+                journal.append("history/start", {"messages": [{"role": "user", "content": "restart"}]})
+                journal.append("assistant/message", {"message": assistant("unknown")})
+                journal.append("tool/start", {"call_id": "unknown"})
+                await main.run_job("restart")
+                self.assertIn("结果未知", captured[2][-1]["content"])
+                self.assertEqual(captured[2][0]["content"], "restart")
+                self.assertEqual(AgentJournal(db, "restart", "chat").events()[-1]["kind"], "turn/end")

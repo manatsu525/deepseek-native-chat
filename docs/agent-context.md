@@ -1,9 +1,13 @@
-# Agent context: Grok Build source port
+# Chat and Agent context: Grok Build source port
 
 Reference: [xai-org/grok-build, 2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8](https://github.com/xai-org/grok-build/tree/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8).
 The port targets the regular, non-Cursor session defaults, not just an
-approximate summary/archive pattern. Ordinary chat retains its existing
-character-budget compactor, workspace and tool behavior.
+approximate summary/archive pattern. Both ordinary chat and Agent use this
+context lifecycle. Their existing workspace permissions, tools and plan types
+remain separate. The legacy character-budget setting is no longer used.
+Ordinary chat accesses its own private archives through read-only `.context/`
+paths in `read_file` and `search_files`; archives do not count against workspace
+file quotas or appear among generated/downloadable workspace files.
 
 ## Source mapping
 

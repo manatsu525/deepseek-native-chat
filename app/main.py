@@ -666,7 +666,7 @@ async def _execute_job(job_id: str) -> None:
         # Best-effort, cached per process: sizes the context budget to the
         # model instead of a fixed character count.
         context_model = job["model"]
-        if agent_job:
+        if is_custom_provider(kind):
             protocol = "responses" if kind == "custom_response" else "messages" if kind == "custom_messages" else "chat_completions"
             effective_parameters = build_custom_request_parameters(provider["base_url"], job["model"],
                 custom_settings_for_model(provider, job["model"]), api_protocol=protocol,
@@ -689,10 +689,10 @@ async def _execute_job(job_id: str) -> None:
                 response_state = {"disabled": True, "fallback_reason": RESPONSES_CAPABILITY_CACHED_REASON}
         response_options["responses_state"] = response_state
     history: list[dict[str, Any]] = []
-    journal = AgentJournal(db, job_id, job["conversation_id"]) if agent_job else None
-    journal_scope = state_scope(provider, job, custom_settings_for_model(provider, job["model"])) if agent_job else ""
+    journal = AgentJournal(db, job_id, job["conversation_id"]) if is_custom_provider(kind) else None
+    journal_scope = state_scope(provider, job, custom_settings_for_model(provider, job["model"])) if journal else ""
     replay_rows = history_rows
-    if agent_job:
+    if journal:
         # The newest durable projection already contains preceding history.
         # Load it once, not every older job and its diagnostic request bodies.
         for index, row in enumerate(history_rows):
@@ -885,6 +885,7 @@ async def _execute_job(job_id: str) -> None:
                 workspace=job_workspace,
                 cached_web_evidence=cached_web_evidence,
                 user_context_addendum=web_evidence_context,
+                record_event=journal.append,
                 **response_options,
             )
         else:
@@ -1030,7 +1031,7 @@ async def run_job(job_id: str) -> None:
                 await _execute_job(job_id)
     finally:
         current = db.one("SELECT * FROM jobs WHERE id=?", (job_id,))
-        if current and current.get("chat_mode") == "agent":
+        if current:
             AgentJournal(db, job_id, current["conversation_id"]).append("turn/end", {
                 "status": current["status"], "error": current.get("error") or "",
                 "preview": current.get("answer") or "", "reasoning": current.get("reasoning") or "",
