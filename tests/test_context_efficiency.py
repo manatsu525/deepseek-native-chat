@@ -669,7 +669,7 @@ class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("只读操作已暂停", item["error"])
         self.assertEqual(result["answer"], "审查完成")
 
-    def test_cold_start_budget_adapts_to_small_context_window(self) -> None:
+    def test_fixed_budget_is_not_reinterpreted_for_small_context_window(self) -> None:
         from app.context import DEFAULT_CONTEXT_BUDGET_CHARS, effective_context_budget
         # 32K token model cold start (no request_chars or input_tokens yet)
         cold_budget_32k = effective_context_budget(
@@ -678,7 +678,7 @@ class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
             request_chars=0,
             input_tokens=0,
         )
-        self.assertEqual(cold_budget_32k, 57_600)
+        self.assertEqual(cold_budget_32k, DEFAULT_CONTEXT_BUDGET_CHARS)
 
         # 64K token model cold start
         cold_budget_64k = effective_context_budget(
@@ -687,9 +687,9 @@ class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
             request_chars=0,
             input_tokens=0,
         )
-        self.assertEqual(cold_budget_64k, 115_200)
+        self.assertEqual(cold_budget_64k, DEFAULT_CONTEXT_BUDGET_CHARS)
 
-        # Explicit user budget setting overrides automatic window sizing
+        # Every numeric setting is an explicit threshold.
         user_budget = effective_context_budget(
             80_000,
             window_tokens=32_000,

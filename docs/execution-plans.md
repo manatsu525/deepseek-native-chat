@@ -47,6 +47,18 @@ preserve balanced tool groups and are logged separately; original events stay
 on disk. No additional paid summarization requests are introduced. Native
 reasoning fields are retained only for the same route/configuration scope.
 
+The configured `context_budget_chars` is always a fixed compaction trigger,
+including the default 240000. Model window metadata and reported token usage
+do not expand it. Protected recent exchanges are not hard-truncated, so the
+trigger is not a guarantee that every wire request is below that character
+count. Numeric bounds remain 40000–4000000.
+
+Responses function-call replay and request-size measurement use canonical
+execution arguments, including their post-execution compacted projection.
+Native reasoning items and signatures remain intact. When arguments are
+compacted during a stateful turn, the next request rebuilds the stored chain
+from compacted local history; tools already executed are not run again.
+
 ## Diagnosis and verification
 
 Authenticated `GET /api/jobs/{job_id}/execution?after=0` returns up to 100 events

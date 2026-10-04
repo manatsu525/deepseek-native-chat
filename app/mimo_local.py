@@ -20,6 +20,7 @@ from curl_cffi import requests as curl_requests
 from .custom_tool_normalization import normalize_tool_calls
 from .custom_request import apply_request_overrides, expand_advanced_request
 from .responses_state import ResponsesState
+from .response_items import project_response_items
 from .agent import HOST_READ_MAX_CHARS, AgentRuntime
 from .prompts import build_system_prompt, files_group_rules
 from .tool_groups import group_of_extra_tool, load_tools_definition, requested_groups
@@ -729,11 +730,7 @@ def _responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         tool_calls = message.get("tool_calls") or []
         content = message.get("content")
-        raw_output_items = [
-            dict(item)
-            for item in message.get("responses_output_items") or []
-            if isinstance(item, dict) and item.get("type")
-        ]
+        raw_output_items = project_response_items(message)
         if raw_output_items:
             result.extend(raw_output_items)
         raw_has_message = any(item.get("type") == "message" for item in raw_output_items)
@@ -2573,6 +2570,13 @@ async def stream_response(
                         succeeded=step["status"] == "completed",
                     )
                 if compacted_arguments:
+                    if responses_protocol:
+                        assistant_message["responses_output_items"] = project_response_items(assistant_message)
+                        # The stored response still contains the original body.
+                        # Rebase once from compacted local history so chaining
+                        # cannot bypass the projection and retain that body.
+                        response_chain.reset()
+                        round_stat["arguments_compacted"] = True
                     result_text += "\n[上下文优化：大型操作参数已执行并从后续重复请求中省略；当前工作区文件是权威状态。]"
                 trace_item = {
                     "id": call_id,
