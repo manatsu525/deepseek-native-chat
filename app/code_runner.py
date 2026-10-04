@@ -149,6 +149,41 @@ def _run_isolated(run_root: Path, executable: str, args: list[str], timeout: int
     }
 
 
+def persistent_bash_command(root: Path, archive: Path, command: str, task_id: str) -> list[str]:
+    """Bind only this workspace into a DynamicUser command namespace.
+
+    Parent account directories stay private. Bind mounts let the command read
+    and write its workspace without granting traversal into other accounts.
+    Recovery archives are mounted read-only; they are never copied per command.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    root.parent.chmod(0o700)
+    root.chmod(0o777)
+    archive.mkdir(parents=True, exist_ok=True, mode=0o700)
+    archive.parent.chmod(0o700)
+    archive.chmod(0o755)
+    for path in archive.rglob("*"):
+        if not path.is_symlink():
+            path.chmod(0o755 if path.is_dir() else 0o644)
+    for path in root.rglob("*"):
+        if not path.is_symlink():
+            path.chmod(0o777 if path.is_dir() else (path.stat().st_mode & 0o111) | 0o666)
+    argv = _isolated_command(Path("/workspace"), "/bin/bash", ["-lc", command], timeout=86400)
+    # Bind paths are resolved by PID 1 before DynamicUser loses access to the
+    # private parents. ReadOnlyPaths protects the archive even for newly saved files.
+    argv[1:1] = ["--unit=custom-bash-" + task_id,
+                  "-p", f"BindPaths={root.resolve()}:/workspace",
+                  "-p", f"BindReadOnlyPaths={archive.resolve()}:/workspace/.context",
+                  "-p", "UMask=0000"]
+    return argv
+
+
+def stop_persistent_bash(task_id: str) -> None:
+    subprocess.run(["systemctl", "stop", "custom-bash-" + task_id],
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=10, check=False)
+
+
 def _relative_path(value: str, label: str) -> Path:
     path = Path(str(value or ""))
     if not str(value or "").strip() or "\\" in str(value) or path.is_absolute() or ".." in path.parts:

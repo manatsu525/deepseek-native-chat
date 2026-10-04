@@ -28,9 +28,18 @@ class GrokToolsTests(unittest.TestCase):
         self.assertEqual(result["next_start_line"], 1001)
         self.assertTrue(result["content"].startswith("1→x\nx\n"))
         self.assertIn("10→x", result["content"])
+        self.assertEqual(read_window("a\nb\n")["line_count"], 3)
+        self.assertEqual(read_window("a\nb\n", 3)["content"], "3→")
+        self.assertEqual(read_window("x\n" * 1100, 900, 1, path="AGENTS.md")["from_line"], 1)
+        self.assertEqual(read_window("x\n" * 1100, 900, 1, path="AGENTS.md")["through_line"], 1101)
+        with self.assertRaisesRegex(ValueError, "single very long line"):
+            read_window("x" * 100001)
 
     def test_utf8_window_is_byte_bounded(self):
-        result = read_window(("中文" * 100 + "\n") * 1000)
+        body = ("中文" * 100 + "\n") * 1000
+        with self.assertRaisesRegex(ValueError, "exceeds maximum"):
+            read_window(body)
+        result = read_window(body, 1, 100)
         self.assertLessEqual(len(result["content"].encode()), 100_100)
         self.assertNotIn("�", result["content"])
         self.assertTrue(result["truncated"])
@@ -74,13 +83,27 @@ class GrokToolsTests(unittest.TestCase):
             workspace.write_file("visible.txt", "visible")
             artifact = next(archive.rglob("*.md"))
             path = ".context/web_fetch/" + artifact.name
-            result = json.loads(workspace.execute("read_file", {"target_file": path, "offset": 12001}))
-            self.assertIn("TAIL EVIDENCE", result["content"])
+            result = workspace.execute("read_file", {"target_file": path, "offset": 12001})
+            self.assertIn("TAIL EVIDENCE", result)
             command = "python3 -c 'from pathlib import Path; print(Path(\"" + path + "\").read_text()[-13:])'"
-            queried = json.loads(workspace.execute("bash", {"command": command, "description": "query saved content"}))
-            self.assertTrue(queried["ok"], queried)
-            self.assertIn("TAIL EVIDENCE", queried["stdout"])
-            self.assertNotIn(".context", json.loads(workspace.execute("list_dir", {"target_directory": "."}))["content"])
+            queried = workspace.execute("bash", {"command": command, "description": "query saved content"})
+            self.assertTrue(queried.startswith("exit: 0"), queried)
+            self.assertIn("TAIL EVIDENCE", queried)
+            self.assertNotIn(".context", workspace.execute("list_dir", {"target_directory": "."}))
+            # Bash is persistent, including subsequent turns, while other
+            # conversations and the recovery mount remain isolated.
+            saved = workspace.execute("bash", {"command": "printf persisted > saved.txt; printf '%s' \"$PWD\"", "description": "save a file"})
+            self.assertTrue(saved.startswith("exit: 0"), saved)
+            self.assertIn("/workspace", saved)
+            self.assertEqual((workspace.root / "saved.txt").read_text(), "persisted")
+            self.assertIn("persisted", workspace.execute("read_file", {"target_file": "/workspace/saved.txt"}))
+            denied = workspace.execute("bash", {"command": "printf bad > .context/web_fetch/1.md", "description": "check archive isolation"})
+            self.assertFalse(denied.startswith("exit: 0"), denied)
+            self.assertEqual(artifact.read_text(), body)
+            background = workspace.bash_tasks.run({"command": "sleep .1; printf background > background.txt", "block_until_ms": 0}, workspace.root)
+            followup = ConversationWorkspace(1, convo)
+            self.assertIn("Exit Code: 0", followup.execute("get_task_output", {"task_ids": [background["task_id"]], "timeout_ms": 2000}))
+            self.assertEqual((workspace.root / "background.txt").read_text(), "background")
             with self.assertRaises(ValueError):
                 workspace.execute("search_replace", {"file_path": path, "old_string": "", "new_string": "bad"})
             web_preview(body, root=archive, conversation_id=convo, ordinary=True)
@@ -93,6 +116,16 @@ class GrokToolsTests(unittest.TestCase):
             result = grep_content(path, {"pattern": r"value=\d+", "-A": 1}, cwd=path)
             self.assertIn("value=12", result["content"])
             self.assertIn("last", result["content"])
+            self.assertTrue(result["content"].startswith("<workspace_result"))
+            self.assertIn("Found 1 matching lines", result["content"])
+            for mode, expected in (("files_with_matches", "Found 1 files"), ("count", "Found 1 across 1 files")):
+                self.assertIn(expected, grep_content(path, {"pattern": "value", "output_mode": mode}, cwd=path)["content"])
+            (path / "empty/deeper").mkdir(parents=True)
+            from app.grok_tools import list_directory
+            listing = list_directory(path)["content"]
+            self.assertTrue(listing.startswith(f"- {path}/"))
+            self.assertIn("example.py", listing)
+            self.assertIn("empty/", listing)
 
     def test_todo_merge_ids_partial_updates_and_atomic_validation(self):
         todo = GrokTodo()
@@ -138,6 +171,9 @@ class GrokToolsTests(unittest.TestCase):
             for removed in ("never with cat", "never re-read", "exactly one in_progress", "do not read an engine", "${"):
                 self.assertNotIn(removed, prompt)
             self.assertNotIn("released by xAI", prompt)
+            self.assertNotIn("<user_info>", prompt)
+            self.assertNotIn("Available skills", prompt)
+            self.assertNotIn("There is no human operator", prompt)
 
     def test_skill_loader_uses_metadata_then_zero_based_arguments(self):
         with tempfile.TemporaryDirectory() as root:
@@ -151,6 +187,9 @@ class GrokToolsTests(unittest.TestCase):
                 body = registry.invoke("test", "alpha beta")
                 self.assertIn("alpha / beta / alpha beta", body)
                 self.assertIn('<skill name="test"', body)
+                registry.set_enabled("test", False)
+                with self.assertRaises(ValueError):
+                    registry.invoke("test")
 
 
 class GrokLoopTests(unittest.IsolatedAsyncioTestCase):
@@ -193,14 +232,15 @@ class GrokLoopTests(unittest.IsolatedAsyncioTestCase):
                         custom_tools=[READ_TOOL] if agent else None, custom_handler=read if agent else None,
                         record_event=lambda kind, value: events.append((kind, value)))
                     self.assertEqual(result["answer"], "done")
-                    self.assertEqual([name for name, _ in calls], ["web_search", "web_fetch"])
+                    self.assertEqual([name for name, _ in calls], ["web_search", "web_fetch", "web_fetch"])
                     self.assertTrue(calls[-1][1]["full_content"])
                     self.assertEqual(artifact.read_text(), body)
                     results = {value["message"].get("tool_call_id"): value["message"]["content"]
                                for kind, value in events if kind == "tool/result"}
-                    search = json.loads(results["search"])
-                    self.assertEqual(len(search["citations"]), 25)
-                    self.assertIn("SOURCE-24-" + "x" * 2000 + "-END", search["content"])
+                    search = results["search"]
+                    self.assertEqual(search.count("https://example.test/"), 25)
+                    self.assertTrue(search.startswith("Web search results for:"))
+                    self.assertIn("SOURCE-24-" + "x" * 2000 + "-END", search)
                     self.assertEqual(results["fetch"].split("Full content saved to:")[0], results["cached"].split("Full content saved to:")[0])
                     self.assertIn("TAIL FACT", results["tail"])
                     self.assertEqual(result["web_evidence"][0]["content"], body)
@@ -227,6 +267,14 @@ class GrokLoopTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(all(item["status"] == "completed" for item in result["tool_trace"]))
                 self.assertNotIn("只读操作已暂停", json.dumps(payloads, ensure_ascii=False))
                 self.assertIn("2→second", json.dumps(payloads, ensure_ascii=False))
+                self.assertIn("<user_info>", json.dumps(payloads, ensure_ascii=False))
+                self.assertIn("<user_query>", json.dumps(payloads, ensure_ascii=False))
+                long_rounds = [[(f"loop{n}", "read_file", {"target_file": "code.py", "limit": 1})] for n in range(45)]
+                continued, _, _, _ = await helper.run_loop([*long_rounds, ["finished"]], protocol=protocol,
+                                                          workspace=workspace, agent_mode=False, max_tool_rounds=None)
+                self.assertEqual(len(continued["tool_trace"]), 45)
+                self.assertEqual(continued["answer"], "finished")
+                self.assertIsNone(continued["tool_round_limit"])
 
     async def test_native_todo_does_not_require_execution_evidence_all_protocols(self):
         for protocol in ("chat_completions", "responses", "messages"):

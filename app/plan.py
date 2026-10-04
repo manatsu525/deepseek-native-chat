@@ -187,11 +187,14 @@ class GrokTodo(ChecklistPlan):
         updates = arguments.get("todos")
         if not isinstance(updates, list):
             raise ValueError("todos must be an array")
-        ids = [str(item.get("id") or "") for item in updates if isinstance(item, dict)]
-        if len(ids) != len(updates) or not all(ids) or len(ids) != len(set(ids)):
-            raise ValueError("Each task needs a unique nonempty id")
-        candidate = copy.deepcopy(self.steps) if arguments.get("merge", True) else []
+        from .grok_tools import bool_arg
+        ids = [item["id"] for item in updates if isinstance(item, dict) and isinstance(item.get("id"), str)]
+        if len(ids) != len(updates) or len(ids) != len(set(ids)):
+            raise ValueError("Each task needs a unique string id")
+        candidate = copy.deepcopy(self.steps) if bool_arg(arguments.get("merge"), True) else []
         for item, task_id in zip(updates, ids):
+            if item.get("content") is not None and not isinstance(item["content"], str):
+                raise ValueError("content must be a string")
             status = item.get("status")
             if status is not None and status not in {"pending", "in_progress", "completed", "cancelled"}:
                 raise ValueError("Invalid task status")
@@ -207,7 +210,7 @@ class GrokTodo(ChecklistPlan):
                     existing["status"] = status
         self.steps = candidate
         self.initialized = True
-        return self.render() or "No tasks currently tracked."
+        return self.render() + "\n" if self.steps else "No tasks currently tracked."
 
     def render(self) -> str:
         return "\n".join(f"- [{item['status']}] {item['id']}: {item['step']}" for item in self.steps)

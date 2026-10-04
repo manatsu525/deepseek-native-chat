@@ -50,16 +50,19 @@ class AgentToolTests(unittest.TestCase):
         registry = SkillRegistry()
         self.assertTrue(set(DEFAULT_SKILLS).issubset({item.skill_id for item in registry.all()}))
         names = {item["function"]["name"] for item in self.runtime.tool_definitions}
-        self.assertIn("skill_install", names)
-        self.assertIn("conversation_create", names)
-        self.assertIn("check_web_syntax", names)
+        self.assertIn("search_replace", names)
+        self.assertIn("bash", names)
+        self.assertIn("get_task_output", names)
+        self.assertNotIn("skill_install", names)
+        self.assertNotIn("conversation_create", names)
+        self.assertNotIn("check_web_syntax", names)
         self.assertNotIn("host_read_file", names)
 
     def test_non_admin_can_read_but_cannot_mutate_shared_skills(self) -> None:
         runtime = AgentRuntime(self.db, self.user_id, self.conversation_id, is_admin=False)
         names = {item["function"]["name"] for item in runtime.tool_definitions}
-        self.assertIn("skill_list", names)
-        self.assertIn("skill_read", names)
+        self.assertNotIn("skill_list", names)
+        self.assertNotIn("skill_read", names)
         self.assertNotIn("skill_install", names)
         self.assertNotIn("skill_enable", names)
         self.assertNotIn("skill_remove", names)

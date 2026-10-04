@@ -199,7 +199,7 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
                 context_window_tokens=context_window_tokens,
                 workspace=workspace,
                 conversation_id=workspace.root.name if workspace is not None else None,
-                max_tool_rounds=15, api_protocol=protocol, settings=settings,
+                max_tool_rounds=response_kwargs.pop("max_tool_rounds", 15), api_protocol=protocol, settings=settings,
                 extra_tools=custom_tools or [{"type":"function","function":{"name":"run_command","description":"run","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}],
                 extra_tool_handler=custom_handler or execute, record_event=record_event, **response_kwargs)
         self.assertFalse(rounds)

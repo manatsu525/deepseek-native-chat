@@ -261,10 +261,7 @@ class AgentRuntime:
 
     @property
     def tool_definitions(self) -> list[dict[str, Any]]:
-        tools = [*HOST_TOOLS, *CONVERSATION_TOOLS, *SKILL_TOOLS, *FRONTEND_TOOLS]
-        if not self.is_admin:
-            mutation_tools = {"skill_install", "skill_enable", "skill_remove"}
-            tools = [item for item in tools if item.get("function", {}).get("name") not in mutation_tools]
+        tools = [tool for tool in HOST_TOOLS if tool["function"]["name"] != "skill" or self.skills.enabled_ids()]
         return tools
 
     def _require_admin(self) -> None:
@@ -345,12 +342,13 @@ class AgentRuntime:
         path = self._path(arguments.get("target_file") or arguments.get("path"))
         if not path.is_file():
             raise ValueError(f"文件不存在：{path}")
-        if path.stat().st_size > HOST_READ_MAX_BYTES:
+        if "target_file" not in arguments and path.stat().st_size > HOST_READ_MAX_BYTES:
             raise ValueError(f"文件过大（上限 {HOST_READ_MAX_BYTES // 1024 // 1024}MB）：{path}")
-        content = self._read_host_text(path)
+        from .grok_tools import document_text
+        content = document_text(path, arguments) if "target_file" in arguments else self._read_host_text(path)
         if "target_file" in arguments or "offset" in arguments or "limit" in arguments:
             return {"path": str(path), "revision": hashlib.sha256(content.encode()).hexdigest(),
-                    **read_window(content, arguments.get("offset"), arguments.get("limit"))}
+                    **read_window(content, arguments.get("offset"), arguments.get("limit"), path=str(path))}
         # Whole file in one result unless it exceeds the per-read bound; only
         # then does start_line continue from next_start_line.
         return {
@@ -707,6 +705,9 @@ class AgentRuntime:
             raise ValueError(f"不支持的 Agent 工具：{name}")
         try:
             result = handler(arguments)
+            if name in {"list_dir", "grep", "search_replace", "bash", "get_task_output", "kill_task"} or (name == "read_file" and "target_file" in arguments):
+                from .grok_tools import model_tool_output
+                return model_tool_output(name, result)
             return result if isinstance(result, str) else _json(result)
         except Exception as exc:
             return _json({"ok": False, "error": str(exc)[:4_000]})
@@ -717,7 +718,8 @@ class AgentRuntime:
         if not isinstance(old, str) or not isinstance(new, str):
             raise ValueError("old_string and new_string must be strings")
         content = self._read_host_text(path) if path.exists() else ""
-        updated = replace_string(content, old, new, bool(arguments.get("replace_all")))
+        from .grok_tools import bool_arg
+        updated = replace_string(content, old, new, bool_arg(arguments.get("replace_all")))
         result = self._host_write_file({"path": str(path), "content": updated})
         result["message"] = f"The file {path} has been {'created' if not old else 'updated'} successfully."
         return result

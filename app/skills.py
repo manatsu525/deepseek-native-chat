@@ -24,19 +24,7 @@ BUILTIN_SKILLS_ROOT = Path(__file__).resolve().parent.parent / "skills"
 USER_SKILLS_ROOT = settings.data_dir / "skills"
 SKILL_CONFIG_PATH = settings.data_dir / "agent-skills.json"
 
-DEFAULT_SKILLS = (
-    "writing-plans",
-    "executing-plans",
-    "systematic-debugging",
-    "verification-before-completion",
-    "requesting-code-review",
-    "test-driven-development",
-    "react-best-practices",
-    "web-design-guidelines",
-    "conversation-management",
-    "frontend-page-management",
-    "skill-management",
-)
+DEFAULT_SKILLS = ()
 
 
 @dataclass(frozen=True)
@@ -170,13 +158,15 @@ class SkillRegistry:
             skill = self.find(skill_id)
             if skill is None:
                 continue
-            description = " ".join(str(skill.description or "").split())
-            sections.append(f"- {skill.skill_id}: {description} (path: {skill.markdown_path})")
+            from .grok_tools import utf8_prefix
+            description = utf8_prefix(" ".join(str(skill.description or "").split()), 400)
+            sections.append(f'<agent_skill fullPath="{escape(str(skill.markdown_path), quote=True)}">{escape(description, quote=False)}</agent_skill>')
         if not sections:
             return ""
         return (
-            "Available skills (load with the skill tool when applicable):\n"
+            "<agent_skills>\nThe following skills are available for use. Load the applicable skill with the skill tool.\n\n"
             + "\n".join(sections)
+            + "\n</agent_skills>"
         )
 
     def invoke(self, name: str, args: str = "", session_id: str = "") -> str:

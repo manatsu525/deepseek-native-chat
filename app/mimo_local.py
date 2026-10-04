@@ -7,6 +7,9 @@ import json
 import logging
 import re
 import uuid
+import time
+from itertools import count
+from copy import deepcopy
 from pathlib import Path
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -21,7 +24,7 @@ from .custom_tool_normalization import normalize_tool_calls
 from .custom_request import apply_request_overrides, expand_advanced_request
 from .responses_state import ResponsesState
 from .agent import HOST_READ_MAX_CHARS, AgentRuntime
-from .prompts import build_system_prompt, files_group_rules
+from .prompts import build_system_prompt, files_group_rules, user_message_prefix
 from .grok_tools import web_preview, clean_web_content, function as grok_function
 from .tool_groups import group_of_extra_tool, load_tools_definition, requested_groups
 from .file_knowledge import FileKnowledge
@@ -93,11 +96,11 @@ from .workspace import (
 )
 
 
-GROK_TODO_TOOL = grok_function("todo_write", "Update the task list. merge=true updates tasks by ID; merge=false replaces the list. Several tasks may be in progress.", {
-    "merge": {"type": "boolean", "default": True},
-    "todos": {"type": "array", "items": {"type": "object", "properties": {
-        "id": {"type": "string"}, "content": {"type": "string"},
-        "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"]}},
+GROK_TODO_TOOL = grok_function("todo_write", "Create and manage a structured task list. The user sees this list live — it is your primary way to show progress.\n\nUse for any task with 3+ steps. Skip for trivial single-step work.", {
+    "merge": {"type": "boolean", "default": True, "description": "Optional. When true (default), merges the provided todos into the existing list by id — send only the items you are changing, and to flip status without changing content send just id + status. When false, the provided todos replace the existing list."},
+    "todos": {"type": "array", "description": "Array of todo items to write to the workspace", "items": {"type": "object", "properties": {
+        "id": {"type": "string", "description": "Unique identifier for the todo item"}, "content": {"type": "string", "description": "The description/content of the todo item"},
+        "status": {"type": "string", "description": "The status of the todo item: pending, in_progress, completed, or cancelled", "enum": ["pending", "in_progress", "completed", "cancelled"]}},
         "required": ["id"], "additionalProperties": False}}}, ["todos"])
 
 
@@ -512,7 +515,11 @@ def _host_revision(path: str) -> str | None:
     return str(snapshot["revision"]) if snapshot else None
 
 
-def _tool_result_failure(result: str) -> str:
+def _tool_result_failure(result: str, name: str = "") -> str:
+    if name == "bash":
+        match = re.match(r"^exit: (-?\d+|killed[^\n]*)", result)
+        if match and match[1] != "0":
+            return result[:1000]
     try:
         data = json.loads(result)
     except (TypeError, ValueError):
@@ -1025,7 +1032,7 @@ async def stream_response(
     web_enabled: bool = True,
     workspace_access: str = "full",
     system_addendum: str = "",
-    max_tool_rounds: int = MAX_AGENT_TOOL_ROUNDS,
+    max_tool_rounds: int | None = None,
     web_search_limit: int | None = None,
     web_fetch_limit: int | None = None,
     web_tool_round_limit: int | None = None,
@@ -1060,7 +1067,17 @@ async def stream_response(
 
     retry_status_codes = _retry_status_codes(config)
     response_chain = ResponsesState(responses_state)
-    cached_web_evidence = dict(cached_web_evidence or {})
+    inline_fetch_bytes = min(int((context_window_tokens or 128_000) * 4 * .03), 100_000)
+    # Upstream caches only self-contained, untruncated text (max 128 entries).
+    cached_web_evidence = {key: value for key, value in list((cached_web_evidence or {}).items())[-128:]
+                           if len(str(value.get("content") or "").encode()) <= inline_fetch_bytes}
+    for value in cached_web_evidence.values():
+        value.setdefault("_cache_inserted", value.get("fetched_at") or time.time())
+    def cached_fetch(canonical: str) -> dict | None:
+        cached = cached_web_evidence.get(canonical)
+        if cached and time.time() - float(cached["_cache_inserted"]) < 900:
+            return cached
+        return None
     extra_tools = list(extra_tools or [])
     extra_tool_names = {
         str((item.get("function") or {}).get("name") or "")
@@ -1088,9 +1105,7 @@ async def stream_response(
     # tools are sent from the start only once the conversation's workspace has
     # files; in Agent mode the conversation and Skill tools wait for load_tools.
     files_deferrable = False
-    extra_groups = sorted({
-        group for group in (group_of_extra_tool(name) for name in extra_tool_names) if group
-    }) if agent_mode else []
+    extra_groups = []
     deferrable_groups = (["files"] if files_deferrable else []) + extra_groups
     loaded_groups: set[str] = set()
     system_prompt = _apply_model_system_prompt(
@@ -1108,6 +1123,29 @@ async def stream_response(
     # URLs the user actually wrote gate the reader; application context must not.
     known_urls = _user_urls(messages)
     messages = [dict(message) for message in messages]
+    workspace_path = "/home/share" if agent_mode else "/workspace"
+    rules = []
+    if agent_mode or workspace is not None:
+        root = Path(workspace_path) if agent_mode else workspace.root
+        for rule_path in [root / "AGENTS.md", *sorted((root / ".grok/rules").glob("*.md"))]:
+            if rule_path.is_file() and not rule_path.is_symlink():
+                rules.append((workspace_path + "/" + rule_path.relative_to(root).as_posix(), rule_path.read_text(encoding="utf-8")))
+    skill_listing = system_addendum if agent_mode else (workspace.skills.prompt() if workspace is not None else "")
+    first_user = True
+    for index, message in enumerate(messages):
+        if message.get("role") != "user" or message.get("agent_synthetic"):
+            continue
+        content = message.get("content", "")
+        prefix = user_message_prefix(workspace_path=workspace_path, user_timezone=user_timezone,
+                                     skills_prompt=skill_listing, rules=rules) if first_user else ""
+        if isinstance(content, str):
+            if "<user_info>" not in content and "<user_query>" not in content:
+                messages[index] = {**message, "content": (prefix + "\n\n" if prefix else "") + "<user_query>\n" + content + "\n</user_query>"}
+        elif isinstance(content, list):
+            # Preserve image parts in place; only text is wrapped.
+            if not any("<user_query>" in str(part.get("text", "")) for part in content if isinstance(part, dict)):
+                messages[index] = {**message, "content": ([{"type": "text", "text": prefix + "\n\n<user_query>"}] if prefix else [{"type": "text", "text": "<user_query>"}]) + content + [{"type": "text", "text": "</user_query>"}]}
+        first_user = False
     if user_context_addendum.strip() and messages and messages[-1].get("role") == "user":
         messages[-1] = _with_message_block(messages[-1], USER_CONTEXT_MARKER, user_context_addendum.strip())
     elif user_context_addendum.strip():
@@ -1149,7 +1187,7 @@ async def stream_response(
     loaded_groups.update(restored_state.get("loaded_groups") or [])
     edited_paths.update(restored_state.get("edited_paths") or [])
     if not initial_plan and restored_state.get("plan"):
-        plan = ChecklistPlan(restored_state["plan"]) if agent_mode else ExecutionPlan(restored_state["plan"])
+        plan = GrokTodo(restored_state["plan"])
     store = SegmentStore(app_settings.data_dir, conversation_id or uuid.uuid4().hex,
                          display_directory=".context/compaction" if workspace is not None else None)
     compactor = AgentCompactor(store,
@@ -1204,8 +1242,8 @@ async def stream_response(
         if workspace_access == "edit"
         else WORKSPACE_TOOL_NAMES
     )
-    round_cap = AGENT_HOST_TOOL_ROUNDS if agent_mode else MAX_AGENT_TOOL_ROUNDS
-    role_tool_round_limit = max(0, min(round_cap, int(max_tool_rounds)))
+    # Upstream max_turns defaults to None. Explicit callers can still choose a cap.
+    role_tool_round_limit = max(0, int(max_tool_rounds)) if max_tool_rounds is not None else float("inf")
     search_limit = role_tool_round_limit if web_search_limit is None else max(0, int(web_search_limit))
     fetch_limit = role_tool_round_limit if web_fetch_limit is None else max(0, int(web_fetch_limit))
     web_round_limit = role_tool_round_limit if web_tool_round_limit is None else max(0, int(web_tool_round_limit))
@@ -1289,7 +1327,7 @@ async def stream_response(
                           "sources": list(sources.values()), "retry_status": retry_status})
             projected = await compactor.compact(conversation, tools, sample_context,
                 {"todos": (plan.export() or {}).get("steps") or [], "loaded_tool_groups": sorted(loaded_groups),
-                 "edited_paths": sorted(edited_paths), "working_directory": "/home/share" if agent_mode else "."}, force=force)
+                 "edited_paths": sorted(edited_paths), "working_directory": "/home/share" if agent_mode else "/workspace"}, force=force)
             if projected is not None:
                 conversation = projected
                 tool_results_start = len(conversation)
@@ -1307,7 +1345,7 @@ async def stream_response(
         # a larger transport budget for real multi-file work; the two scheduling
         # rules remain enforced independently of that budget. Two answer-only
         # attempts remain reserved after all tools have been removed.
-        for round_number in range(role_tool_round_limit + FINAL_ANSWER_ATTEMPTS):
+        for round_number in count():
             if stopped():
                 raise asyncio.CancelledError
             if round_number >= role_tool_round_limit:
@@ -1342,12 +1380,10 @@ async def stream_response(
                     else:
                         round_tools.append(KEYLESS_SEARCH_WEB_TOOL)
                 if list_web_tools:
-                    if parallel_mode:
-                        round_tools.append(PARALLEL_FETCH_WEBPAGE_TOOL)
-                    elif legacy_mode:
-                        round_tools.append(FETCH_WEBPAGE_TOOL)
-                    else:
-                        round_tools.append(KEYLESS_FETCH_WEBPAGE_TOOL)
+                    fetch_tool = deepcopy(PARALLEL_FETCH_WEBPAGE_TOOL if parallel_mode else FETCH_WEBPAGE_TOOL if legacy_mode else KEYLESS_FETCH_WEBPAGE_TOOL)
+                    fetch_tool["function"]["name"] = "web_fetch"
+                    fetch_tool["function"]["description"] = "Fetch the content of a specific URL and return it as markdown.\n\nIMPORTANT: web_fetch WILL FAIL for authenticated or private URLs (e.g. Google Docs, Confluence, Jira, GitHub private repos).\n\nUsage notes:\n  - Long pages will be truncated to fit your context window; the full received content is saved locally."
+                    round_tools.append(fetch_tool)
                 files_listed = not files_deferrable or "files" in loaded_groups
                 if (workspace is not None and workspace_access != "none" and files_listed
                         and tool_rounds_used < role_tool_round_limit):
@@ -1904,7 +1940,7 @@ async def stream_response(
             for call in calls:
                 function = call.get("function") or {}
                 name = str(function.get("name") or "")
-                if name in {"web_search", "fetch_webpage"} and name not in advertised_tool_names:
+                if name in {"web_search", "web_fetch", "fetch_webpage"} and name not in advertised_tool_names and not (name == "fetch_webpage" and "web_fetch" in advertised_tool_names):
                     stale_web_calls.append(call)
                     continue
                 filtered_calls.append(call)
@@ -2067,9 +2103,7 @@ async def stream_response(
                             if c_bound_path:
                                 c_args["path"] = c_bound_path
                             record("tool/start", {"call_id": c["id"], "name": c_ws_name, "arguments": c_args})
-                            prefetched_tasks[c["id"]] = asyncio.create_task(
-                                asyncio.to_thread(workspace.execute, c_ws_name, c_args)
-                            )
+                            prefetched_tasks[c["id"]] = asyncio.create_task(workspace.execute_async(c_ws_name, c_args))
                         elif c_is_extra and extra_tool_handler is not None:
                             record("tool/start", {"call_id": c["id"], "name": c_name, "arguments": c_args})
                             if inspect.iscoroutinefunction(extra_tool_handler):
@@ -2135,7 +2169,7 @@ async def stream_response(
                     record("tool/start", {"call_id": call_id, "name": name,
                                           "arguments": function.get("arguments") or "{}"})
                 try:
-                    if (is_search or name == "fetch_webpage") and tool_rounds_used > web_round_limit:
+                    if (is_search or name in {"web_fetch", "fetch_webpage"}) and tool_rounds_used > web_round_limit:
                         raise ToolQuotaExceeded(
                             f"联网工具（web_search / fetch_webpage）的轮次额度已用完（最多 {web_round_limit} 轮），"
                             "本回答中不能再调用；列表中的其他工具仍可继续使用，资料足够时请直接回答。"
@@ -2153,7 +2187,7 @@ async def stream_response(
                                 fetch_limit=fetch_limit,
                             )
                         )
-                    if name == "fetch_webpage" and fetch_count >= fetch_limit:
+                    if name in {"web_fetch", "fetch_webpage"} and fetch_count >= fetch_limit:
                         # Reusing an already fetched page is local work and must
                         # remain possible after the upstream fetch quota is
                         # exhausted. Invalid or genuinely new URLs still get
@@ -2163,7 +2197,7 @@ async def stream_response(
                             quota_arguments = json.loads(str(function.get("arguments") or "{}"))
                             quota_url = _canonical_url(quota_arguments.get("url"))
                             cached_fetch = (
-                                bool((cached_web_evidence.get(quota_url) or {}).get("content"))
+                                bool((cached_fetch(quota_url) or {}).get("content"))
                             )
                         except (TypeError, ValueError, json.JSONDecodeError):
                             cached_fetch = False
@@ -2238,14 +2272,9 @@ async def stream_response(
                             step["received_argument_keys"] = received_keys[:20]
                             step["received_argument_chars"] = len(raw_arguments_text)
                             received = "、".join(received_keys[:20]) if received_keys else "无（参数为空）"
-                            hint = (
-                                "参数为空，通常是一次调用内容过长被截断；请把修改拆成更小的 edit_file 调用，每次只包含必要的片段。"
-                                if not received_keys
-                                else "请严格按工具 JSON Schema 使用字段名重新调用，不要省略字段。"
-                            )
                             raise ValueError(
                                 f"{workspace_name} 缺少必填参数：{', '.join(missing)}（收到的字段：{received}；"
-                                f"参数长度 {len(raw_arguments_text)} 字符）。{hint}"
+                                f"参数长度 {len(raw_arguments_text)} 字符）。"
                             )
                         normalized_path = ""
                         if "path" in arguments:
@@ -2258,8 +2287,8 @@ async def stream_response(
                         if call_id in prefetched_tasks:
                             result_text = await prefetched_tasks[call_id]
                         else:
-                            result_text = await asyncio.to_thread(workspace.execute, workspace_name, arguments)
-                        failure = _tool_result_failure(result_text)
+                            result_text = await workspace.execute_async(workspace_name, arguments)
+                        failure = _tool_result_failure(result_text, workspace_name)
                         if failure:
                             raise ValueError(failure)
                         if workspace_name == "read_file":
@@ -2322,19 +2351,16 @@ async def stream_response(
                                     "site_name": urlsplit(item["url"]).netloc.removeprefix("www."),
                                     "publish_time": item.get("publish_date") or "", "logo_url": ""})
                             reader_enabled = bool(known_urls)
-                            result_text = json.dumps({
-                                "content": "\n\n".join(
+                            result_text = f'Web search results for: "{objective if parallel_mode else query}"\n\n' + "\n\n".join(
                                     f"# {item.get('title') or item.get('url')}\n{item.get('url')}\n{item.get('snippet') or ''}"
-                                    for item in results),
-                                "citations": list(dict.fromkeys(item["url"] for item in results if item.get("url")))
-                            }, ensure_ascii=False)
+                                    for item in results)
                             search_cache[query_key] = result_text
                         step["status"] = "completed"
-                    elif name == "fetch_webpage":
+                    elif name in {"web_fetch", "fetch_webpage"}:
                         target_url = _safe_fetch_url(arguments.get("url"))
                         step["url"] = target_url
                         canonical = _canonical_url(target_url)
-                        cached = cached_web_evidence.get(canonical)
+                        cached = cached_fetch(canonical)
                         content = str((cached or {}).get("content") or "").strip()
                         if content:
                             step["cached"] = True
@@ -2371,7 +2397,11 @@ async def stream_response(
                                         "summary": source.get("summary") or "", "site_name": source.get("site_name") or "",
                                         "publish_time": source.get("publish_time") or ""}
                             web_evidence.append(evidence)
-                            cached_web_evidence[canonical] = evidence
+                            if len(content.encode()) <= inline_fetch_bytes:
+                                if canonical not in cached_web_evidence and len(cached_web_evidence) >= 128:
+                                    oldest = min(cached_web_evidence, key=lambda key: cached_web_evidence[key]["_cache_inserted"])
+                                    cached_web_evidence.pop(oldest)
+                                cached_web_evidence[canonical] = {**evidence, "_cache_inserted": time.time()}
                         # Grok keeps the full body in a local artifact; only the inline preview is bounded.
                         preview = web_preview(content, root=app_settings.data_dir / "agent_sessions",
                                               conversation_id=conversation_id,
@@ -2388,7 +2418,7 @@ async def stream_response(
                             result_text = await extra_tool_handler(name, arguments)
                         else:
                             result_text = await asyncio.to_thread(extra_tool_handler, name, arguments)
-                        failure = _tool_result_failure(result_text)
+                        failure = _tool_result_failure(result_text, name)
                         step["status"] = "failed" if failure else "completed"
                         step["error"] = failure
                     elif is_plan:
@@ -2436,22 +2466,11 @@ async def stream_response(
                         result_text = str(exc)[:1000]
                         refused_web_calls += 1
                     elif is_search:
-                        engine = (
-                            "Parallel Search MCP"
-                            if parallel_mode
-                            else "DuckDuckGo"
-                            if legacy_mode
-                            else str(KEYLESS_PROVIDERS[web_tool_backend]["label"])
-                        )
-                        result_text = f"{engine} 搜索失败：{str(exc)[:1000]}。可以改写查询继续，或根据已有资料回答。"
-                    elif is_workspace:
-                        result_text = f"工作区操作失败：{str(exc)[:1000]}。请先读取当前文件并修正参数后重试。"
-                    elif is_extra:
-                        result_text = f"Agent 工具操作失败：{str(exc)[:1000]}。请根据错误结果修正参数后重试。"
-                    elif is_plan:
-                        result_text = f"update_plan 参数无效：{str(exc)[:500]}"
+                        result_text = f"Error calling tool: {str(exc)[:4000]}"
+                    elif is_workspace or is_extra or is_plan:
+                        result_text = f"Error calling tool: {str(exc)[:4000]}"
                     else:
-                        result_text = f"读取网页失败：{str(exc)[:1000]}。请根据已有搜索结果继续回答，必要时选择其他来源。"
+                        result_text = f"Error calling tool: {str(exc)[:4000]}"
                 trace_item = {
                     "id": call_id,
                     "name": workspace_name if is_workspace else name,
@@ -2532,7 +2551,7 @@ async def stream_response(
         "incomplete_reason": "",
         "plan": plan.export(),
         "retry_status": retry_status,
-        "tool_round_limit": role_tool_round_limit,
+        "tool_round_limit": max_tool_rounds,
         "agent_mode": bool(agent_mode),
         "response": {"tool_trace": tool_trace, "agent_mode": bool(agent_mode)},
         **({"responses_state": response_chain.export()} if api_protocol == "responses" else {}),

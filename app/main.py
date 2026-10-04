@@ -55,7 +55,7 @@ db = Database(settings.db_path)
 secret = b""
 tasks: dict[str, asyncio.Task[Any]] = {}
 MAX_CONCURRENT_JOBS = 2
-WEB_EVIDENCE_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
+WEB_EVIDENCE_CACHE_MAX_AGE_SECONDS = 15 * 60
 WEB_EVIDENCE_CONTEXT_MAX_CHARS = 16_000
 WEB_EVIDENCE_PER_SOURCE_MAX_CHARS = 6_000
 job_slots: Optional[asyncio.Semaphore] = None
@@ -858,10 +858,6 @@ async def _execute_job(job_id: str) -> None:
                 agent_mode=True,
                 extra_tools=runtime.tool_definitions,
                 extra_tool_handler=runtime.execute_async,
-                max_tool_rounds=96,
-                web_search_limit=96,
-                web_fetch_limit=96,
-                web_tool_round_limit=96,
                 cached_web_evidence=cached_web_evidence,
                 **response_options,
                 system_addendum=build_agent_skills_prompt(),
