@@ -144,6 +144,9 @@ class Database:
                 """
             )
             provider_columns = {row["name"] for row in db.execute("PRAGMA table_info(providers)").fetchall()}
+            evidence_columns = {row["name"] for row in db.execute("PRAGMA table_info(conversation_web_evidence)").fetchall()}
+            if "content_complete" not in evidence_columns:
+                db.execute("ALTER TABLE conversation_web_evidence ADD COLUMN content_complete INTEGER NOT NULL DEFAULT 0")
             if "provider_type" not in provider_columns:
                 db.execute("ALTER TABLE providers ADD COLUMN provider_type TEXT NOT NULL DEFAULT 'custom'")
             if "settings_json" not in provider_columns:
@@ -242,7 +245,7 @@ class Database:
                     canonical_url,
                     str(item.get("url") or canonical_url)[:2048],
                     str(item.get("title") or "")[:160],
-                    content[:12000],
+                    content,
                     str(item.get("summary") or " ".join(content.split())[:320])[:1200],
                     str(item.get("site_name") or "")[:160],
                     str(item.get("publish_time") or "")[:120],
@@ -257,8 +260,8 @@ class Database:
             db.executemany(
                 """INSERT INTO conversation_web_evidence(
                        user_id,conversation_id,canonical_url,url,title,content,
-                       summary,site_name,publish_time,fetched_at,last_used_at,source_job_id
-                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                       summary,site_name,publish_time,fetched_at,last_used_at,source_job_id,content_complete
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1)
                    ON CONFLICT(conversation_id,canonical_url) DO UPDATE SET
                        user_id=excluded.user_id,
                        url=excluded.url,
@@ -269,7 +272,8 @@ class Database:
                        publish_time=excluded.publish_time,
                        fetched_at=excluded.fetched_at,
                        last_used_at=excluded.last_used_at,
-                       source_job_id=excluded.source_job_id""",
+                       source_job_id=excluded.source_job_id,
+                       content_complete=1""",
                 rows,
             )
 

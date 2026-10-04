@@ -62,7 +62,7 @@ class _HtmlScripts(HTMLParser):
         return self._script is not None
 
 
-def _prepare_copy(source_root: Path) -> Path:
+def _prepare_copy(source_root: Path, context_archive: Path | None = None) -> Path:
     RUN_ROOT.mkdir(parents=True, exist_ok=True, mode=0o711)
     RUN_ROOT.chmod(0o711)
     target_root = Path(tempfile.mkdtemp(prefix="run-", dir=RUN_ROOT))
@@ -79,6 +79,20 @@ def _prepare_copy(source_root: Path) -> Path:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
             target.chmod(0o666)
+    if context_archive is not None and context_archive.is_dir():
+        # Export this conversation's private recovery files to the disposable
+        # sandbox. The actual archive never becomes writable to the command.
+        for source in context_archive.rglob("*"):
+            if source.is_symlink() or not source.is_file() or source.name.startswith("."):
+                continue
+            target = target_root / ".context" / source.relative_to(context_archive)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            for directory in (target_root / ".context", *target.parents):
+                if directory == target_root:
+                    break
+                directory.chmod(0o755)
+            shutil.copyfile(source, target)
+            target.chmod(0o444)
     return target_root
 
 
@@ -175,7 +189,7 @@ COMMAND_TIMEOUT_MAX = 60
 MAX_COMMAND_CHARS = 4_000
 
 
-def run_command(source_root: Path, command: Any, timeout_seconds: Any = None) -> dict[str, Any]:
+def run_command(source_root: Path, command: Any, timeout_seconds: Any = None, *, context_archive: Path | None = None) -> dict[str, Any]:
     """Run one bash command in a disposable, network-less copy of the workspace.
 
     Files the command creates or changes live only in the copy; the workspace
@@ -191,14 +205,7 @@ def run_command(source_root: Path, command: Any, timeout_seconds: Any = None) ->
     except (TypeError, ValueError) as exc:
         raise CodeRunnerError("timeout_seconds 无效") from exc
     timeout = max(1, min(COMMAND_TIMEOUT_MAX, timeout))
-    from .workspace import expand_file_views
-
-    def resolve(raw: str) -> Path | None:
-        candidate = (source_root / raw).resolve()
-        return candidate if str(candidate).startswith(str(source_root.resolve()) + os.sep) else None
-
-    text, view_notes = expand_file_views(text, resolve)
-    run_root = _prepare_copy(source_root)
+    run_root = _prepare_copy(source_root, context_archive)
     try:
         result = _run_isolated(run_root, "/bin/bash", ["-c", text], timeout)
         response = {
@@ -210,8 +217,6 @@ def run_command(source_root: Path, command: Any, timeout_seconds: Any = None) ->
             "limits": {"network": False, "timeout_seconds": timeout, "memory_mb": 128,
                        "note": "命令在工作区的一次性副本中执行，副本里的文件改动不会保存"},
         }
-        if view_notes:
-            response["notes"] = view_notes
         return response
     finally:
         shutil.rmtree(run_root, ignore_errors=True)

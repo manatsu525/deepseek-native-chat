@@ -756,13 +756,15 @@ async def _execute_job(job_id: str) -> None:
     cached_web_evidence = {
         str(item.get("canonical_url") or ""): item
         for item in prior_web_evidence
-        if item.get("canonical_url") and item.get("content")
+        if item.get("canonical_url") and item.get("content") and item.get("content_complete")
     }
     latest_user_text = next(
         (str(item.get("content") or "") for item in reversed(history) if item.get("role") == "user" and not item.get("agent_synthetic")),
         "",
     )
-    web_evidence_context = _build_web_evidence_context(prior_web_evidence, latest_user_text)
+    # Grok's committed tool history/compaction is the context source. The cache
+    # is consulted on demand, not copied into every user message a second time.
+    web_evidence_context = ""
     db.update_job(job_id, status="running", error="", stop_requested=0)
     last_write = 0.0
     attachment_lock_acquired = False

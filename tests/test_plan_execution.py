@@ -139,7 +139,7 @@ class ExecutionPlanTests(unittest.TestCase):
 class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
     async def run_loop(self, rounds, protocol="chat_completions", status_sequence=None, settings=None,
                        record_event=None, messages=None, context_window_tokens=None, agent_mode=True,
-                       custom_tools=None, custom_handler=None, workspace=None):
+                       custom_tools=None, custom_handler=None, workspace=None, web_enabled=False, **response_kwargs):
         payloads, executed, updates = [], [], []
         statuses = list(status_sequence or [])
         def event(obj):
@@ -195,13 +195,13 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(mimo_local.httpx, "AsyncClient", Client):
             result = await mimo_local.stream_response(
                 base_url="https://example.invalid/v1", api_key="test", model="test", messages=messages or [{"role":"user","content":"edit files"}],
-                timeout=5, stopped=lambda:False, update=update, web_enabled=False, agent_mode=agent_mode,
+                timeout=5, stopped=lambda:False, update=update, web_enabled=web_enabled, agent_mode=agent_mode,
                 context_window_tokens=context_window_tokens,
                 workspace=workspace,
                 conversation_id=workspace.root.name if workspace is not None else None,
                 max_tool_rounds=15, api_protocol=protocol, settings=settings,
                 extra_tools=custom_tools or [{"type":"function","function":{"name":"run_command","description":"run","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}],
-                extra_tool_handler=custom_handler or execute, record_event=record_event)
+                extra_tool_handler=custom_handler or execute, record_event=record_event, **response_kwargs)
         self.assertFalse(rounds)
         return result, payloads, executed, updates
 
@@ -222,7 +222,7 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
                     [("p3","update_plan",{"todos":final})], ["done"]], protocol)
                 self.assertEqual(executed, ["inspect a","inspect b","should run","implement","verify"])
                 names = [t.get("name", t.get("function",{}).get("name")) for t in payloads[1]["tools"]]
-                self.assertEqual(names,["run_command","update_plan"])
+                self.assertEqual(names,["run_command","todo_write"])
                 self.assertFalse(result["incomplete"])
                 self.assertEqual(result["plan"]["steps"][1]["status"], "completed")
                 self.assertNotIn("evidence", result["plan"]["steps"][1])

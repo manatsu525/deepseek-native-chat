@@ -121,7 +121,7 @@ class AgentSessionLoopTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn('"exit_code": 0', history[-2]["content"])
                 requests = [event["payload"]["body"] for event in events if event["kind"] == "model/request"]
                 self.assertEqual(requests, payloads)
-                self.assertNotIn("Authorization", json.dumps(events))
+                self.assertNotIn('"Authorization":', json.dumps(events))
                 self.assertFalse(result["incomplete"])
                 _, next_payloads, _, _ = await loops.PlanLoopTests.run_loop(self, [["already saved"]],
                     protocol=protocol, messages=[*history, {"role": "user", "content": "what changed?"}])

@@ -171,6 +171,48 @@ class ChecklistPlan:
         return {"version": 2, "steps": copy.deepcopy(self.steps)} if self.initialized else None
 
 
+class GrokTodo(ChecklistPlan):
+    """Grok Build TodoState: merge by ID, no execution gate or receipts."""
+
+    def __init__(self, saved: dict[str, Any] | None = None) -> None:
+        self.initialized = bool(saved)
+        self.steps = []
+        for n, item in enumerate((saved or {}).get("steps") or []):
+            self.steps.append({"id": str(item.get("id") or n + 1),
+                               "step": str(item.get("step") or item.get("content") or ""),
+                               "status": {"done": "completed", "blocked": "pending"}.get(
+                                   item.get("status"), item.get("status", "pending"))})
+
+    def apply(self, arguments: dict[str, Any], **_: Any) -> str:
+        updates = arguments.get("todos")
+        if not isinstance(updates, list):
+            raise ValueError("todos must be an array")
+        ids = [str(item.get("id") or "") for item in updates if isinstance(item, dict)]
+        if len(ids) != len(updates) or not all(ids) or len(ids) != len(set(ids)):
+            raise ValueError("Each task needs a unique nonempty id")
+        candidate = copy.deepcopy(self.steps) if arguments.get("merge", True) else []
+        for item, task_id in zip(updates, ids):
+            status = item.get("status")
+            if status is not None and status not in {"pending", "in_progress", "completed", "cancelled"}:
+                raise ValueError("Invalid task status")
+            existing = next((task for task in candidate if task["id"] == task_id), None)
+            if existing is None:
+                existing = {"id": task_id, "step": item.get("content") or task_id,
+                            "status": status or "pending"}
+                candidate.append(existing)
+            else:
+                if item.get("content") is not None:
+                    existing["step"] = item["content"]
+                if status is not None:
+                    existing["status"] = status
+        self.steps = candidate
+        self.initialized = True
+        return self.render() or "No tasks currently tracked."
+
+    def render(self) -> str:
+        return "\n".join(f"- [{item['status']}] {item['id']}: {item['step']}" for item in self.steps)
+
+
 _STATUS_KEYS = ("status", "state", "done", "completed", "complete", "finished")
 _NON_TEXT_KEYS = set(_STATUS_KEYS) | {"id", "index", "order", "priority", "number", "no", "n"}
 _LINE_PREFIX_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)]|\(\d+\)|#+)?\s*(\[(?P<mark>[ xX~])\])?\s*")

@@ -89,19 +89,15 @@ class AgentToolTests(unittest.TestCase):
             self.assertFalse(small["truncated"])
             self.assertEqual(len(small["entries"]), 10)
 
-    def test_partial_file_views_in_commands_show_the_whole_file(self) -> None:
+    def test_partial_file_views_in_commands_are_not_rewritten(self) -> None:
         import json
 
         with patch("app.agent.AGENT_PROJECT_ROOT", self.root):
             (self.root / "conf.json").write_text("\n".join(f"line {n}" for n in range(1, 41)) + "\n")
             result = json.loads(self.runtime.execute("run_command", {"command": "sed -n '10,12p' conf.json; echo ===; head -3 conf.json | wc -l"}))
             self.assertTrue(result["ok"])
-            self.assertIn("     1\tline 1", result["stdout"])
-            self.assertIn("    40\tline 40", result["stdout"])
-            self.assertEqual(result["stdout"].count("line 40"), 1)  # the piped head is untouched
-            self.assertEqual(len(result["notes"]), 1)
-            self.assertIn("sed -n '10,12p' conf.json", result["notes"][0])
-            self.assertIn("40 行", result["notes"][0])
+            self.assertEqual(result["stdout"], "line 10\nline 11\nline 12\n===\n3\n")
+            self.assertNotIn("notes", result)
             # Big or missing files are left to the command as written.
             (self.root / "huge.txt").write_text("y" * 40_000)
             result = json.loads(self.runtime.execute("run_command", {"command": "head -c 5 huge.txt; tail -n 1 missing.txt"}))

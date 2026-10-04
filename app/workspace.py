@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .config import settings
+from .grok_tools import READ_TOOL, EDIT_TOOL, LIST_TOOL, GREP_TOOL, function as grok_function, read_window, replace_string, grep_content, list_directory
 
 
 WORKSPACES_DIR = settings.data_dir / "workspaces"
@@ -159,7 +160,9 @@ VALIDATION_TOOL_NAMES = {"run_python", "run_command", "check_web_syntax"}
 WORKSPACE_TOOL_NAMES = {
     item["function"]["name"] for item in [*WORKSPACE_TOOLS, RUN_PYTHON_TOOL, RUN_COMMAND_TOOL, CHECK_WEB_SYNTAX_TOOL]
 } | LEGACY_PATCH_TOOL_NAMES
-READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search_files"} | VALIDATION_TOOL_NAMES
+WORKSPACE_TOOL_NAMES |= {"list_dir", "search_replace", "grep", "bash"}
+VALIDATION_TOOL_NAMES.add("bash")
+READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search_files", "list_dir", "grep"} | VALIDATION_TOOL_NAMES
 EDIT_WORKSPACE_TOOL_NAMES = WORKSPACE_TOOL_NAMES - VALIDATION_TOOL_NAMES
 
 
@@ -341,7 +344,7 @@ def numbered_window(content: str, start_line: Any = None, max_chars: int = MAX_R
     return result
 
 
-_PATH_ALIASES = ("file_path", "filepath", "file", "filename")
+_PATH_ALIASES = ("target_file", "target_directory", "file_path", "filepath", "file", "filename")
 _EDITS_ALIASES = ("changes", "replacements", "patches")
 _OLD_ALIASES = ("old_string", "old", "search", "find")
 _NEW_ALIASES = ("new_string", "new", "replace", "replacement")
@@ -364,7 +367,7 @@ def normalize_file_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[
     a single top-level edit, or wrap everything in one object. Only missing
     canonical fields are filled in; canonical fields always win.
     """
-    if name not in FILE_TOOL_NAMES or not isinstance(arguments, dict):
+    if name not in FILE_TOOL_NAMES | {"list_dir", "search_replace", "grep"} or not isinstance(arguments, dict):
         return arguments
     result = dict(arguments)
     if len(result) == 1:
@@ -597,7 +600,11 @@ class ConversationWorkspace:
         write, invalidating provider prompt caches.  ``list_files`` remains the
         authoritative way for the model to discover paths.
         """
-        tools = [*WORKSPACE_TOOLS, RUN_COMMAND_TOOL, RUN_PYTHON_TOOL, CHECK_WEB_SYNTAX_TOOL]
+        # Grok's foreground-only bash configuration preserves the ordinary sandbox contract.
+        bash = grok_function("bash", "Run a command in a disposable copy of the workspace without network. Files changed by commands are discarded; save changes with search_replace. Foreground execution only.",
+                             {"command": {"type": "string"}, "description": {"type": "string"},
+                              "timeout": {"type": "integer", "description": "Timeout in milliseconds"}}, ["command", "description"])
+        tools = [LIST_TOOL, READ_TOOL, EDIT_TOOL, GREP_TOOL, bash, RUN_PYTHON_TOOL, CHECK_WEB_SYNTAX_TOOL]
         if access == "read_only":
             tools = [item for item in tools if item["function"]["name"] in READ_ONLY_WORKSPACE_TOOL_NAMES]
         elif access == "edit":
@@ -613,7 +620,7 @@ class ConversationWorkspace:
         if target.stat().st_size > MAX_FILE_BYTES and not relative.startswith(".context/"):
             raise WorkspaceError("文件过大，无法读取")
         try:
-            content = target.read_text(encoding="utf-8")
+            content = target.read_bytes().decode("utf-8")
         except UnicodeDecodeError as exc:
             raise WorkspaceError("工作区工具只支持 UTF-8 文本文件") from exc
         return content, relative
@@ -681,7 +688,7 @@ class ConversationWorkspace:
         from .code_runner import run_command
 
         self.root.mkdir(parents=True, exist_ok=True)
-        return run_command(self.root, command, timeout_seconds)
+        return run_command(self.root, command, timeout_seconds, context_archive=self.context_archive)
 
     def run_python(self, path: Any, arguments: Any = None) -> dict[str, Any]:
         from .code_runner import run_python
@@ -733,10 +740,33 @@ class ConversationWorkspace:
         return {"ok": True, "path": relative}
 
     def execute(self, name: str, arguments: dict[str, Any]) -> str:
-        if name == "list_files":
+        if name == "list_dir":
+            target, _ = self._resolve_read(arguments.get("target_directory", arguments.get("path")), allow_root=True)
+            result: Any = {"content": "", "truncated": False} if target == self.root and not target.exists() else list_directory(target)
+        elif name == "grep":
+            target, _ = self._resolve_read(arguments.get("path", ""), allow_root=True)
+            result = {"content": "No matches found.", "truncated": False} if target == self.root and not target.exists() else grep_content(target, arguments, cwd=self.root if self.root.is_dir() else target.parent)
+        elif name == "search_replace":
+            path = arguments.get("file_path", arguments.get("path"))
+            old, new = arguments.get("old_string"), arguments.get("new_string")
+            if not isinstance(old, str) or not isinstance(new, str):
+                raise WorkspaceError("old_string and new_string must be strings")
+            target, _ = self.resolve(path)
+            content = self._read_text(path)[0] if target.exists() else ""
+            result = self.write_file(path, replace_string(content, old, new, bool(arguments.get("replace_all"))))
+            result["message"] = f"The file {path} has been {'created' if not old else 'updated'} successfully."
+        elif name == "bash":
+            timeout = arguments.get("timeout")
+            result = self.run_command(arguments.get("command"), max(1, int(timeout) / 1000) if timeout is not None else None)
+        elif name == "list_files":
             result: Any = {"files": self.list_files()}
         elif name == "read_file":
-            result = self.read_snapshot(arguments.get("path"), arguments.get("start_line"))
+            if "target_file" in arguments or "offset" in arguments or "limit" in arguments:
+                content, relative = self._read_text(arguments.get("target_file", arguments.get("path")))
+                result = {"path": relative, "revision": self._revision(content),
+                          **read_window(content, arguments.get("offset"), arguments.get("limit"))}
+            else:
+                result = self.read_snapshot(arguments.get("path"), arguments.get("start_line"))
         elif name == "write_file":
             result = self.write_file(arguments.get("path"), arguments.get("content"))
         elif name == "edit_file" or name in LEGACY_PATCH_TOOL_NAMES:

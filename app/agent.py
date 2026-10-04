@@ -27,6 +27,11 @@ from urllib.parse import unquote, urlsplit
 from . import attachments
 from .db import Database
 from .skills import SkillRegistry
+from .config import settings
+from .grok_tools import (
+    READ_TOOL, EDIT_TOOL, LIST_TOOL, GREP_TOOL, SKILL_TOOL, BASH_TOOL, TASK_OUTPUT_TOOL,
+    KILL_TASK_TOOL, BashTasks, read_window, replace_string, grep_content, list_directory,
+)
 from .workspace import (
     EDIT_FILE_DESCRIPTION,
     EDITS_SCHEMA,
@@ -198,6 +203,11 @@ HOST_TOOLS = [
 ]
 
 
+# The former contracts remain executable for persisted sessions, but are no longer advertised.
+HOST_TOOLS = [LIST_TOOL, READ_TOOL, EDIT_TOOL, GREP_TOOL, BASH_TOOL,
+              TASK_OUTPUT_TOOL, KILL_TASK_TOOL, SKILL_TOOL]
+
+
 CONVERSATION_TOOLS = [
     _function("conversation_list", "List this user's conversations newest first.", {"limit": {"type": "integer", "minimum": 1, "maximum": 200}}, []),
     _function("conversation_read", "Read a conversation's messages and metadata.", {"conversation_id": {"type": "string"}, "message_limit": {"type": "integer", "minimum": 1, "maximum": 500}}, ["conversation_id"]),
@@ -229,6 +239,8 @@ class AgentRuntime:
         self.is_admin = bool(is_admin)
         self.skills = SkillRegistry()
         self._cancelled = threading.Event()
+        task_dir = settings.data_dir / "agent_sessions" / hashlib.sha256(self.conversation_id.encode()).hexdigest() / "bash"
+        self.bash_tasks = BashTasks((self.user_id, self.conversation_id), task_dir, self._cancelled)
 
     async def execute_async(self, name: str, arguments: dict[str, Any]) -> str:
         worker = asyncio.create_task(asyncio.to_thread(self.execute, name, arguments))
@@ -236,6 +248,7 @@ class AgentRuntime:
             return await asyncio.shield(worker)
         except asyncio.CancelledError:
             self._cancelled.set()
+            await asyncio.to_thread(self.bash_tasks.cancel_owned)
             # Cancelling to_thread does not stop its worker. Keep the job slot
             # occupied until the command has exited and the tool has returned.
             while not worker.done():
@@ -329,12 +342,15 @@ class AgentRuntime:
         }
 
     def _host_read_file(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        path = self._path(arguments.get("path"))
+        path = self._path(arguments.get("target_file") or arguments.get("path"))
         if not path.is_file():
             raise ValueError(f"文件不存在：{path}")
         if path.stat().st_size > HOST_READ_MAX_BYTES:
             raise ValueError(f"文件过大（上限 {HOST_READ_MAX_BYTES // 1024 // 1024}MB）：{path}")
         content = self._read_host_text(path)
+        if "target_file" in arguments or "offset" in arguments or "limit" in arguments:
+            return {"path": str(path), "revision": hashlib.sha256(content.encode()).hexdigest(),
+                    **read_window(content, arguments.get("offset"), arguments.get("limit"))}
         # Whole file in one result unless it exceeds the per-read bound; only
         # then does start_line continue from next_start_line.
         return {
@@ -419,9 +435,6 @@ class AgentRuntime:
         if not cwd.is_dir():
             raise ValueError(f"工作目录不存在：{cwd}")
         timeout = max(1, min(3600, int(arguments.get("timeout_seconds", HOST_COMMAND_TIMEOUT) or HOST_COMMAND_TIMEOUT)))
-        command, view_notes = expand_file_views(
-            command, lambda raw: Path(raw).expanduser() if Path(raw).expanduser().is_absolute() else cwd / raw
-        )
         environment = os.environ.copy()
         supplied_env = arguments.get("env")
         if isinstance(supplied_env, dict):
@@ -475,8 +488,6 @@ class AgentRuntime:
                 "timeout": timed_out, "cancelled": cancelled,
                 "error": "任务已停止" if cancelled else "命令执行超时" if timed_out else "",
             }
-            if view_notes:
-                result["notes"] = view_notes
             return result
 
     def _host_delete_path(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -651,6 +662,14 @@ class AgentRuntime:
         if self._cancelled.is_set():
             return _json({"ok": False, "cancelled": True, "error": "任务已停止"})
         dispatch = {
+            "list_dir": lambda args: list_directory(self._path(args.get("target_directory"))),
+            "grep": lambda args: grep_content(self._path(args.get("path"), required=False), args, cwd=AGENT_PROJECT_ROOT),
+            "search_replace": self._search_replace,
+            "bash": lambda args: self.bash_tasks.run(args, AGENT_PROJECT_ROOT),
+            "task_output": self.bash_tasks.output,
+            "get_task_output": self.bash_tasks.get_output,
+            "kill_task": self.bash_tasks.kill,
+            "skill": lambda args: self.skills.invoke(str(args.get("skill") or ""), str(args.get("args") or ""), self.conversation_id),
             "list_files": self._host_list_files,
             "read_file": self._host_read_file,
             "write_file": self._host_write_file,
@@ -687,9 +706,21 @@ class AgentRuntime:
         if handler is None:
             raise ValueError(f"不支持的 Agent 工具：{name}")
         try:
-            return _json(handler(arguments))
+            result = handler(arguments)
+            return result if isinstance(result, str) else _json(result)
         except Exception as exc:
             return _json({"ok": False, "error": str(exc)[:4_000]})
+
+    def _search_replace(self, arguments: dict[str, Any]) -> dict:
+        path = self._path(arguments.get("file_path"))
+        old, new = arguments.get("old_string"), arguments.get("new_string")
+        if not isinstance(old, str) or not isinstance(new, str):
+            raise ValueError("old_string and new_string must be strings")
+        content = self._read_host_text(path) if path.exists() else ""
+        updated = replace_string(content, old, new, bool(arguments.get("replace_all")))
+        result = self._host_write_file({"path": str(path), "content": updated})
+        result["message"] = f"The file {path} has been {'created' if not old else 'updated'} successfully."
+        return result
 
 
 def build_agent_skills_prompt() -> str:
