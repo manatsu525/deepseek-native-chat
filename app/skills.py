@@ -8,14 +8,12 @@ minimal: YAML front matter is parsed only for name and description.
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-from html import escape
 
 from .config import settings
 
@@ -24,16 +22,19 @@ BUILTIN_SKILLS_ROOT = Path(__file__).resolve().parent.parent / "skills"
 USER_SKILLS_ROOT = settings.data_dir / "skills"
 SKILL_CONFIG_PATH = settings.data_dir / "agent-skills.json"
 
-DEFAULT_SKILLS = ()
-
-# These IDs identify the shipped pre-Grok default configuration, not a user's
-# deliberately empty selection. Keep migration limited to that obsolete list.
-RETIRED_DEFAULT_SKILLS = frozenset({
-    "conversation-management", "executing-plans", "frontend-page-management",
-    "react-best-practices", "requesting-code-review", "skill-management",
-    "systematic-debugging", "test-driven-development", "verification-before-completion",
-    "web-design-guidelines", "writing-plans",
-})
+DEFAULT_SKILLS = (
+    "writing-plans",
+    "executing-plans",
+    "systematic-debugging",
+    "verification-before-completion",
+    "requesting-code-review",
+    "test-driven-development",
+    "react-best-practices",
+    "web-design-guidelines",
+    "conversation-management",
+    "frontend-page-management",
+    "skill-management",
+)
 
 
 @dataclass(frozen=True)
@@ -43,7 +44,6 @@ class Skill:
     description: str
     path: Path
     builtin: bool
-    disable_model_invocation: bool = False
 
     @property
     def markdown_path(self) -> Path:
@@ -55,20 +55,13 @@ def _frontmatter(text: str, fallback_name: str) -> tuple[str, str]:
     description = ""
     lines = text.splitlines()
     if lines and lines[0].strip() == "---":
-        for index, line in enumerate(lines[1:], 1):
+        for line in lines[1:]:
             if line.strip() == "---":
                 break
             match = re.match(r"^\s*(name|description)\s*:\s*(.*?)\s*$", line, re.I)
             if not match:
                 continue
             value = match.group(2).strip().strip("\"'")
-            if value in {">", ">-", ">+", "|", "|-", "|+"}:
-                continuation = []
-                for following in lines[index + 1:]:
-                    if following.strip() and not following.startswith((" ", "\t")):
-                        break
-                    continuation.append(following.strip())
-                value = " ".join(continuation).strip()
             if match.group(1).casefold() == "name":
                 name = value or name
             else:
@@ -113,20 +106,12 @@ class SkillRegistry:
             except (OSError, UnicodeDecodeError):
                 continue
             name, description = _frontmatter(text, folder.name)
-            frontmatter = text.split("---", 2)[1] if text.startswith("---\n") and text.count("---") >= 2 else ""
-            disabled = bool(re.search(r"^disable-model-invocation\s*:\s*(?:true|yes|1)\s*$", frontmatter, re.M | re.I))
-            result.append(Skill(skill_id, name, description, folder, builtin, disabled))
+            result.append(Skill(skill_id, name, description, folder, builtin))
         return result
 
     def all(self) -> list[Skill]:
         found: dict[str, Skill] = {item.skill_id: item for item in self._scan_root(self.builtin_root, True)}
         found.update({item.skill_id: item for item in self._scan_root(self.user_root, False)})
-        project = Path(os.getenv("AGENT_WORKSPACE_ROOT", "/home/share"))
-        for root in (Path("/root/.agents/skills"), Path("/root/.grok/skills"),
-                     project / ".agents/skills", project / ".grok/skills"):
-            for item in self._scan_root(root, False):
-                scoped = Skill("discovered:" + item.skill_id, item.name, item.description, item.path, True, item.disable_model_invocation)
-                found[scoped.skill_id] = scoped
         return sorted(found.values(), key=lambda item: (not item.builtin, item.skill_id.casefold()))
 
     def find(self, skill_id: str) -> Optional[Skill]:
@@ -151,13 +136,8 @@ class SkillRegistry:
 
     def enabled_ids(self) -> list[str]:
         configured = self._configured()
-        if configured and set(configured) <= RETIRED_DEFAULT_SKILLS:
-            # Only migrate when none of the listed skills still exists. This
-            # preserves customized installations and explicit empty/disabled lists.
-            if not any(item.skill_id in configured for item in self.all()):
-                configured = None
         if configured is None:
-            return [item.skill_id for item in self.all() if not item.builtin or item.skill_id.startswith("discovered:")]
+            return [item.skill_id for item in self.all() if item.skill_id in DEFAULT_SKILLS]
         available = {item.skill_id for item in self.all()}
         return [item for item in configured if item in available]
 
@@ -180,45 +160,16 @@ class SkillRegistry:
         sections: list[str] = []
         for skill_id in self.enabled_ids():
             skill = self.find(skill_id)
-            if skill is None or skill.disable_model_invocation:
+            if skill is None:
                 continue
-            from .grok_tools import utf8_prefix
-            description = utf8_prefix(" ".join(str(skill.description or "").split()), 400)
-            sections.append(f'<agent_skill fullPath="{escape(str(skill.markdown_path), quote=True)}">{escape(description, quote=False)}</agent_skill>')
+            description = " ".join(str(skill.description or "").split())[:200]
+            sections.append(f"- {skill.skill_id}: {description}" if description else f"- {skill.skill_id}")
         if not sections:
             return ""
         return (
-            "<agent_skills>\nThe following skills are available for use. Load the applicable skill with the skill tool.\n\n"
+            "INSTALLED AGENT SKILLS (call skill_read with the id before applying one; read only what the task needs):\n"
             + "\n".join(sections)
-            + "\n</agent_skills>"
         )
-
-    def invoke(self, name: str, args: str = "", session_id: str = "") -> str:
-        from .grok_tools import utf8_prefix
-        skill = self.find(name)
-        if skill is None or skill.skill_id not in self.enabled_ids():
-            raise ValueError(f"Skill unavailable or disabled: {name}")
-        if skill.disable_model_invocation:
-            raise ValueError(f"Skill does not permit model invocation: {name}")
-        body = skill.markdown_path.read_text(encoding="utf-8")
-        if body.startswith("---\n"):
-            parts = body.split("---", 2)
-            if len(parts) == 3:
-                body = parts[2].lstrip("\r\n")
-        if len(body.encode()) > 100_000:
-            prefix = utf8_prefix(body, 100_000)
-            body = prefix.rsplit("\n", 1)[0] + f"\n[Skill content truncated. Read {skill.markdown_path} with offset and limit to continue.]"
-        positional = args.split()
-        consumed = bool(re.search(r"\$ARGUMENTS|\$\d+", body))
-        body = re.sub(r"\$ARGUMENTS\[(\d+)\]|\$(\d+)", lambda match:
-                      positional[int(match[1] or match[2])] if int(match[1] or match[2]) < len(positional) else "", body)
-        body = body.replace("$ARGUMENTS", args)
-        body = body.replace("${SKILL_DIR}", str(skill.path)).replace("${CLAUDE_SKILL_DIR}", str(skill.path))
-        body = body.replace("${SESSION_ID}", session_id).replace("${CLAUDE_SESSION_ID}", session_id)
-        if args and not consumed:
-            body += "\n\n**ARGUMENTS:** " + args
-        return (f'<skill name="{escape(skill.name, quote=True)}" description="{escape(skill.description, quote=True)}" '
-                f'path="{escape(str(skill.markdown_path), quote=True)}">\n{body}\n</skill>')
 
     def install(self, source: str, name: str = "") -> Skill:
         source_value = str(source or "").strip()

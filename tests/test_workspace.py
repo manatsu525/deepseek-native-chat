@@ -100,13 +100,13 @@ class WorkspaceTests(unittest.TestCase):
         after = self.workspace.tool_definitions()
         self.assertEqual(before, after)
         names = {item["function"]["name"] for item in after}
-        self.assertIn("search_replace", names)
+        self.assertIn("edit_file", names)
         for removed in ("apply_line_edits", "apply_patch", "apply_patch_batch", "replace_text"):
             self.assertNotIn(removed, names)
         self.assertIn("run_python", names)
         self.assertIn("check_web_syntax", names)
         read_schema = next(item for item in after if item["function"]["name"] == "read_file")["function"]["parameters"]
-        self.assertEqual(set(read_schema["properties"]), {"target_file", "offset", "limit"})
+        self.assertEqual(set(read_schema["properties"]), {"path", "start_line"})
         for tool in after:
             path_schema = tool["function"]["parameters"]["properties"].get("path")
             if path_schema:
@@ -114,14 +114,15 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_edit_access_can_modify_but_cannot_run_validation(self) -> None:
         names = {item["function"]["name"] for item in self.workspace.tool_definitions("edit")}
-        self.assertIn("list_dir", names)
+        self.assertIn("list_files", names)
         self.assertIn("read_file", names)
-        self.assertIn("grep", names)
-        self.assertIn("search_replace", names)
+        self.assertIn("search_files", names)
+        self.assertIn("write_file", names)
+        self.assertIn("edit_file", names)
         self.assertNotIn("run_python", names)
         self.assertNotIn("check_web_syntax", names)
         read_only = {item["function"]["name"] for item in self.workspace.tool_definitions("read_only")}
-        self.assertNotIn("search_replace", read_only)
+        self.assertNotIn("edit_file", read_only)
 
     def test_read_returns_whole_file_even_when_a_start_line_is_given(self) -> None:
         self.workspace.write_file("app.js", "one\ntwo\nthree\nfour\n")

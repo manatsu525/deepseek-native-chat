@@ -55,7 +55,7 @@ db = Database(settings.db_path)
 secret = b""
 tasks: dict[str, asyncio.Task[Any]] = {}
 MAX_CONCURRENT_JOBS = 2
-WEB_EVIDENCE_CACHE_MAX_AGE_SECONDS = 15 * 60
+WEB_EVIDENCE_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 WEB_EVIDENCE_CONTEXT_MAX_CHARS = 16_000
 WEB_EVIDENCE_PER_SOURCE_MAX_CHARS = 6_000
 job_slots: Optional[asyncio.Semaphore] = None
@@ -756,15 +756,13 @@ async def _execute_job(job_id: str) -> None:
     cached_web_evidence = {
         str(item.get("canonical_url") or ""): item
         for item in prior_web_evidence
-        if item.get("canonical_url") and item.get("content") and item.get("content_complete")
+        if item.get("canonical_url") and item.get("content")
     }
     latest_user_text = next(
         (str(item.get("content") or "") for item in reversed(history) if item.get("role") == "user" and not item.get("agent_synthetic")),
         "",
     )
-    # Grok's committed tool history/compaction is the context source. The cache
-    # is consulted on demand, not copied into every user message a second time.
-    web_evidence_context = ""
+    web_evidence_context = _build_web_evidence_context(prior_web_evidence, latest_user_text)
     db.update_job(job_id, status="running", error="", stop_requested=0)
     last_write = 0.0
     attachment_lock_acquired = False
@@ -858,6 +856,10 @@ async def _execute_job(job_id: str) -> None:
                 agent_mode=True,
                 extra_tools=runtime.tool_definitions,
                 extra_tool_handler=runtime.execute_async,
+                max_tool_rounds=96,
+                web_search_limit=96,
+                web_fetch_limit=96,
+                web_tool_round_limit=96,
                 cached_web_evidence=cached_web_evidence,
                 **response_options,
                 system_addendum=build_agent_skills_prompt(),

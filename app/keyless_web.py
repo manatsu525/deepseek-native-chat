@@ -8,7 +8,7 @@ import httpx
 
 
 MCP_PROTOCOL = "2025-03-26"
-MAX_PAGE_CHARS = 10 * 1024 * 1024
+MAX_PAGE_CHARS = 8000
 
 PROVIDERS: dict[str, dict[str, Any]] = {
     "keenable": {
@@ -53,11 +53,12 @@ KEYLESS_SEARCH_WEB_TOOL = {
     "type": "function",
     "function": {
         "name": "web_search",
-        "description": "Search the web for information. Returns source content and citations from the selected search provider.",
+        "description": "使用当前选定的匿名搜索服务搜索互联网，返回最多 10 条真实网页结果、URL 和摘要。需要发现来源时先搜索；不要把搜索结果页 URL 交给 fetch_webpage。",
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "一个清晰、具体的自然语言搜索查询"},
+                "num_results": {"type": "integer", "description": "结果数量，最多 10 条", "minimum": 1, "maximum": 10},
             },
             "required": ["query"],
             "additionalProperties": False,
@@ -124,19 +125,21 @@ class KeylessWebProvider:
         query = " ".join(str(query or "").split())[:500]
         if not query:
             raise ValueError("搜索词不能为空")
+        limit = max(1, min(int(limit), 10))
         if self.provider == "keenable":
-            arguments = {"query": query, "mode": "pro"}
+            arguments = {"query": query, "mode": "pro", "snippet_max_length": 500}
         elif self.provider == "tavily":
             arguments = {
                 "query": query,
+                "max_results": limit,
                 "search_depth": "basic",
                 "include_raw_content": False,
                 "include_images": False,
             }
         elif self.provider == "firecrawl":
-            arguments = {"query": query, "sources": [{"type": "web"}]}
+            arguments = {"query": query, "limit": limit, "sources": [{"type": "web"}]}
         else:
-            arguments = {"query": query}
+            arguments = {"query": query, "count": limit}
         structured, text = await self._call_tool(str(self.config["search_tool"]), arguments)
         payload = _payload(structured, text)
         _raise_service_error(self.label, payload)
@@ -162,9 +165,9 @@ class KeylessWebProvider:
                 continue
             results.append(
                 {
-                    "url": url,
-                    "title": title,
-                    "snippet": snippet,
+                    "url": url[:2000],
+                    "title": title[:300],
+                    "snippet": " ".join(snippet.split())[:500],
                     "publish_date": str(
                         item.get("publish_date")
                         or item.get("published_date")
@@ -174,6 +177,8 @@ class KeylessWebProvider:
                     )[:80],
                 }
             )
+            if len(results) >= limit:
+                break
         if not results:
             raise KeylessWebError(f"{self.label} 搜索未返回可用结果")
         return results
@@ -206,6 +211,8 @@ class KeylessWebProvider:
         content = _page_content(self.provider, payload, text).strip()
         if not content:
             raise KeylessWebError(f"{self.label} 未返回可用网页正文")
+        if len(content) > MAX_PAGE_CHARS:
+            content = content[:MAX_PAGE_CHARS].rstrip() + "\n\n[网页内容已截断，仅保留前面部分]"
         return content
 
     async def _initialize(self) -> None:

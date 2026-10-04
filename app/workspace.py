@@ -8,14 +8,11 @@ import os
 import re
 import shlex
 import shutil
-import threading
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .config import settings
-from .grok_tools import READ_TOOL, EDIT_TOOL, LIST_TOOL, GREP_TOOL, BASH_TOOL, TASK_OUTPUT_TOOL, KILL_TASK_TOOL, SKILL_TOOL, BashTasks, model_tool_output, document_text, function as grok_function, read_window, replace_string, grep_content, list_directory
-from .skills import SkillRegistry
 
 
 WORKSPACES_DIR = settings.data_dir / "workspaces"
@@ -162,10 +159,7 @@ VALIDATION_TOOL_NAMES = {"run_python", "run_command", "check_web_syntax"}
 WORKSPACE_TOOL_NAMES = {
     item["function"]["name"] for item in [*WORKSPACE_TOOLS, RUN_PYTHON_TOOL, RUN_COMMAND_TOOL, CHECK_WEB_SYNTAX_TOOL]
 } | LEGACY_PATCH_TOOL_NAMES
-WORKSPACE_TOOL_NAMES |= {"list_dir", "search_replace", "grep", "bash", "get_task_output", "kill_task", "skill"}
-VALIDATION_TOOL_NAMES.add("bash")
-READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search_files", "list_dir", "grep"} | VALIDATION_TOOL_NAMES
-READ_ONLY_WORKSPACE_TOOL_NAMES = (READ_ONLY_WORKSPACE_TOOL_NAMES - {"bash", "run_command", "run_python"}) | {"get_task_output", "kill_task", "skill"}
+READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search_files"} | VALIDATION_TOOL_NAMES
 EDIT_WORKSPACE_TOOL_NAMES = WORKSPACE_TOOL_NAMES - VALIDATION_TOOL_NAMES
 
 
@@ -347,7 +341,7 @@ def numbered_window(content: str, start_line: Any = None, max_chars: int = MAX_R
     return result
 
 
-_PATH_ALIASES = ("target_file", "target_directory", "file_path", "filepath", "file", "filename")
+_PATH_ALIASES = ("file_path", "filepath", "file", "filename")
 _EDITS_ALIASES = ("changes", "replacements", "patches")
 _OLD_ALIASES = ("old_string", "old", "search", "find")
 _NEW_ALIASES = ("new_string", "new", "replace", "replacement")
@@ -370,7 +364,7 @@ def normalize_file_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[
     a single top-level edit, or wrap everything in one object. Only missing
     canonical fields are filled in; canonical fields always win.
     """
-    if name not in FILE_TOOL_NAMES | {"list_dir", "search_replace", "grep"} or not isinstance(arguments, dict):
+    if name not in FILE_TOOL_NAMES or not isinstance(arguments, dict):
         return arguments
     result = dict(arguments)
     if len(result) == 1:
@@ -543,18 +537,10 @@ class ConversationWorkspace:
             raise WorkspaceError("无效的工作区标识")
         self.root = WORKSPACES_DIR / str(user_id) / conversation_id
         self.context_archive = settings.data_dir / "agent_sessions" / hashlib.sha256(conversation_id.encode()).hexdigest()
-        from .code_runner import persistent_bash_command, stop_persistent_bash
-        self._cancelled = threading.Event()
-        self.bash_tasks = BashTasks((int(user_id), conversation_id), self.context_archive / "bash", self._cancelled,
-                                   launcher=lambda command, cwd, task_id: persistent_bash_command(cwd, self.context_archive, command, task_id),
-                                   stop_process=stop_persistent_bash, display_directory="/workspace/.context/bash")
-        self.skills = SkillRegistry()
 
     @staticmethod
     def _clean_path(value: Any, *, allow_root: bool = False) -> PurePosixPath:
         raw = str(value or "").strip()
-        if raw == "/workspace" or raw.startswith("/workspace/"):
-            raw = raw[len("/workspace"):].lstrip("/") or "."
         # Models often name the workspace root as "/" when searching it.
         if allow_root and raw in {"", ".", "/", "./"}:
             return PurePosixPath(".")
@@ -611,9 +597,7 @@ class ConversationWorkspace:
         write, invalidating provider prompt caches.  ``list_files`` remains the
         authoritative way for the model to discover paths.
         """
-        tools = [LIST_TOOL, READ_TOOL, EDIT_TOOL, GREP_TOOL, BASH_TOOL, TASK_OUTPUT_TOOL, KILL_TASK_TOOL]
-        if self.skills.enabled_ids():
-            tools.append(SKILL_TOOL)
+        tools = [*WORKSPACE_TOOLS, RUN_COMMAND_TOOL, RUN_PYTHON_TOOL, CHECK_WEB_SYNTAX_TOOL]
         if access == "read_only":
             tools = [item for item in tools if item["function"]["name"] in READ_ONLY_WORKSPACE_TOOL_NAMES]
         elif access == "edit":
@@ -629,7 +613,7 @@ class ConversationWorkspace:
         if target.stat().st_size > MAX_FILE_BYTES and not relative.startswith(".context/"):
             raise WorkspaceError("文件过大，无法读取")
         try:
-            content = target.read_bytes().decode("utf-8")
+            content = target.read_text(encoding="utf-8")
         except UnicodeDecodeError as exc:
             raise WorkspaceError("工作区工具只支持 UTF-8 文本文件") from exc
         return content, relative
@@ -661,23 +645,18 @@ class ConversationWorkspace:
             raise WorkspaceError(f"一个工作区最多占用 {MAX_TOTAL_BYTES // 1024 // 1024}MB")
         return encoded
 
-    def write_file(self, path: Any, content: Any, *, native: bool = False) -> dict[str, Any]:
+    def write_file(self, path: Any, content: Any) -> dict[str, Any]:
         target, relative = self.resolve(path)
         if target.exists() and (not target.is_file() or target.is_symlink()):
             raise WorkspaceError("目标路径不是普通文件")
         text = str(content or "")
-        encoded = text.encode("utf-8") if native else self._validate_write(target, text)
+        encoded = self._validate_write(target, text)
         target.parent.mkdir(parents=True, exist_ok=True)
-        for directory in (WORKSPACES_DIR, WORKSPACES_DIR / self.root.parent.name):
+        for directory in (WORKSPACES_DIR, WORKSPACES_DIR / self.root.parent.name, self.root):
             if directory.exists():
                 directory.chmod(0o700)
-        self.root.chmod(0o777)
-        for directory in (target.parent, *target.parent.parents):
-            if directory == self.root.parent:
-                break
-            directory.chmod(0o777)
         target.write_bytes(encoded)
-        target.chmod(0o666)
+        target.chmod(0o600)
         return {"ok": True, "path": relative, "size": len(encoded)}
 
     def edit_file(self, path: Any, edits: Any) -> dict[str, Any]:
@@ -702,7 +681,7 @@ class ConversationWorkspace:
         from .code_runner import run_command
 
         self.root.mkdir(parents=True, exist_ok=True)
-        return run_command(self.root, command, timeout_seconds, context_archive=self.context_archive)
+        return run_command(self.root, command, timeout_seconds)
 
     def run_python(self, path: Any, arguments: Any = None) -> dict[str, Any]:
         from .code_runner import run_python
@@ -754,41 +733,10 @@ class ConversationWorkspace:
         return {"ok": True, "path": relative}
 
     def execute(self, name: str, arguments: dict[str, Any]) -> str:
-        if name == "list_dir":
-            target, relative = self._resolve_read(arguments.get("target_directory", arguments.get("path")), allow_root=True)
-            result: Any = {"content": "- /workspace/\n", "truncated": False} if target == self.root and not target.exists() else list_directory(target, display_path="/workspace/" + relative)
-        elif name == "grep":
-            target, _ = self._resolve_read(arguments.get("path", ""), allow_root=True)
-            result = {"content": '<workspace_result workspace_path="/workspace">\nNo matches found\n</workspace_result>', "truncated": False} if target == self.root and not target.exists() else grep_content(target, arguments, cwd=self.root if self.root.is_dir() else target.parent, display_cwd="/workspace")
-        elif name == "search_replace":
-            path = arguments.get("file_path", arguments.get("path"))
-            old, new = arguments.get("old_string"), arguments.get("new_string")
-            if not isinstance(old, str) or not isinstance(new, str):
-                raise WorkspaceError("old_string and new_string must be strings")
-            target, _ = self.resolve(path)
-            content = target.read_bytes().decode("utf-8") if target.exists() else ""
-            from .grok_tools import bool_arg
-            result = self.write_file(path, replace_string(content, old, new, bool_arg(arguments.get("replace_all"))), native=True)
-            result["message"] = f"The file {path} has been {'created' if not old else 'updated'} successfully."
-        elif name == "bash":
-            self.root.mkdir(parents=True, exist_ok=True)
-            result = self.bash_tasks.run(arguments, self.root)
-        elif name == "get_task_output":
-            result = self.bash_tasks.get_output(arguments)
-        elif name == "kill_task":
-            result = self.bash_tasks.kill(arguments)
-        elif name == "skill":
-            return self.skills.invoke(str(arguments.get("skill") or ""), str(arguments.get("args") or ""), self.root.name)
-        elif name == "list_files":
+        if name == "list_files":
             result: Any = {"files": self.list_files()}
         elif name == "read_file":
-            if "target_file" in arguments or "offset" in arguments or "limit" in arguments:
-                target, relative = self._resolve_read(arguments.get("target_file", arguments.get("path")))
-                content = document_text(target, arguments)
-                result = {"path": relative, "revision": self._revision(content),
-                          **read_window(content, arguments.get("offset"), arguments.get("limit"), path=relative)}
-            else:
-                result = self.read_snapshot(arguments.get("path"), arguments.get("start_line"))
+            result = self.read_snapshot(arguments.get("path"), arguments.get("start_line"))
         elif name == "write_file":
             result = self.write_file(arguments.get("path"), arguments.get("content"))
         elif name == "edit_file" or name in LEGACY_PATCH_TOOL_NAMES:
@@ -805,25 +753,7 @@ class ConversationWorkspace:
             result = self.check_web_syntax(arguments.get("path"))
         else:
             raise WorkspaceError(f"不支持的工作区工具：{name}")
-        if name in {"list_dir", "grep", "search_replace", "bash", "get_task_output", "kill_task"} or (name == "read_file" and "target_file" in arguments):
-            return model_tool_output(name, result)
         return json.dumps(result, ensure_ascii=False)
-
-    async def execute_async(self, name: str, arguments: dict[str, Any]) -> str:
-        import asyncio
-        worker = asyncio.create_task(asyncio.to_thread(self.execute, name, arguments))
-        try:
-            return await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            self._cancelled.set()
-            await asyncio.to_thread(self.bash_tasks.cancel_owned)
-            while not worker.done():
-                try:
-                    await asyncio.shield(worker)
-                except asyncio.CancelledError:
-                    pass
-            worker.result()
-            raise
 
 
 class AgentSharedWorkspace:

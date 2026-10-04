@@ -24,7 +24,7 @@ MIMO_MAX_SEARCH_RESULTS = 10
 JINA_READER_PREFIX = "https://r.jina.ai/"
 JINA_MAX_FETCHES_PER_RESPONSE = 8
 JINA_MAX_CHARS = 8000
-JINA_MAX_BYTES = 10 * 1024 * 1024
+JINA_MAX_BYTES = 40000
 JINA_RATE_LIMIT = 20
 JINA_RATE_WINDOW = 60.0
 DDG_SEARCH_ENDPOINTS = (
@@ -291,7 +291,9 @@ def _parse_ddg_results(html: str, limit: int) -> list[dict[str, str]]:
             re.IGNORECASE | re.DOTALL,
         )
         snippet = _html_text(snippet_match.group(2)) if snippet_match else ""
-        results.append({"title": title, "url": url, "snippet": snippet})
+        results.append({"title": title[:300], "url": url[:2000], "snippet": snippet[:DDG_MAX_SNIPPET_CHARS]})
+        if len(results) >= limit:
+            break
     return results
 
 
@@ -509,10 +511,13 @@ async def _read_with_jina(client: Any, url: str, stopped: Callable[[], bool]) ->
             async for chunk in _response_bytes(response):
                 if stopped():
                     raise asyncio.CancelledError
-                size += len(chunk)
-                if size > JINA_MAX_BYTES:
-                    raise RuntimeError("Jina Reader 网页超过 10MiB 下载上限")
-                chunks.append(chunk)
+                if size >= JINA_MAX_BYTES:
+                    break
+                piece = chunk[: JINA_MAX_BYTES - size]
+                chunks.append(piece)
+                size += len(piece)
+                if size >= JINA_MAX_BYTES:
+                    break
     except asyncio.CancelledError:
         raise
     except (httpx.HTTPError, curl_requests.errors.CurlError) as exc:
@@ -529,6 +534,8 @@ async def _read_with_jina(client: Any, url: str, stopped: Callable[[], bool]) ->
     header, separator, markdown_body = content.partition("Markdown Content:")
     if separator and not markdown_body.strip() and ("warning:" in header.casefold() or "error" in header.casefold()):
         raise RuntimeError("Jina Reader 未返回可用网页正文")
+    if len(content) > JINA_MAX_CHARS:
+        content = content[:JINA_MAX_CHARS].rstrip() + "\n\n[网页内容已截断，仅保留前面部分]"
     return content
 
 
@@ -600,11 +607,12 @@ SEARCH_WEB_TOOL = {
     "type": "function",
     "function": {
         "name": "web_search",
-        "description": "Search the web for information using DuckDuckGo. Returns source content and citations.",
+        "description": "使用外部 DuckDuckGo 搜索互联网，返回最多 10 条真实网页结果、链接和摘要。用于最新信息、事实核查、资料发现和不确定的冷门问题。每次只搜索一个查询词，不要把搜索引擎结果页 URL 交给 fetch_webpage。",
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "自然语言搜索词；需要中英文资料时分轮搜索，不要一次拼成长列表"},
+                "num_results": {"type": "integer", "description": "结果数量，最多 10 条", "minimum": 1, "maximum": 10},
             },
             "required": ["query"],
             "additionalProperties": False,
@@ -636,7 +644,7 @@ PARALLEL_SEARCH_WEB_TOOL = {
     "type": "function",
     "function": {
         "name": "web_search",
-        "description": "Search the web using Parallel Search MCP. Provide an objective and 1-3 related search queries. Returns source content and citations.",
+        "description": "通过 Parallel Search MCP 搜索互联网，返回最多 10 条高度相关的真实来源和可直接用于回答的网页摘录。请提供一个明确目标和 1-3 个简短、相关的查询；资料足够时不要继续读取网页。",
         "parameters": {
             "type": "object",
             "properties": {

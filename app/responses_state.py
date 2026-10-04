@@ -10,7 +10,7 @@ from typing import Any
 def state_scope(provider: dict, job: dict, settings: dict) -> str:
     # Never persist credentials themselves. Changing any routing/configuration
     # input starts a new chain, as does switching user, conversation or mode.
-    value = ["grok-build-contract-v2", provider.get("id"), provider.get("base_url"), provider.get("api_key"),
+    value = [provider.get("id"), provider.get("base_url"), provider.get("api_key"),
              job.get("user_id"), job.get("conversation_id"), job.get("model"),
              job.get("chat_mode"), job.get("effort"), job.get("timezone"), settings]
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()

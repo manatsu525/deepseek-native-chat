@@ -276,10 +276,6 @@ class WebEvidenceTests(unittest.IsolatedAsyncioTestCase):
                 raise AssertionError("an exhausted fetch must be dropped before upstream execution")
 
         class FakeWorkspace:
-            root = Path("/tmp/nonexistent-test-workspace")
-            from app.skills import SkillRegistry
-            skills = SkillRegistry()
-
             def tool_definitions(self, _access):
                 return [
                     {

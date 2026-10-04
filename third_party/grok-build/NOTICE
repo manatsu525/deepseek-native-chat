@@ -4,13 +4,3 @@ are adapted from xai-org/grok-build, commit
 Copyright 2023-2026 SpaceXAI. Licensed under Apache-2.0 (see LICENSE).
 Rust conversation types and transport/persistence interfaces have been adapted
 to this application's Python types, three Custom API protocols, and journal.
-
-app/templates/grok_system_prompt.md is the upstream system prompt template.
-app/prompts.py renders its feature switches and changes only product identity,
-UI surface, tool availability, and factual workspace/account adapters.
-app/grok_tools.py, GrokTodo in app/plan.py, and the Skill invocation path are
-Python adaptations of the standard Grok Build read/search/edit/bash/todo/skill
-contracts and web_fetch overflow at the same revision. Runtime transport,
-process ownership, sandboxing, artifact allocation, and the UI are adapted to
-this application. Existing web acquisition providers are retained; their
-responses replace xAI's native search generation and HTML fetch transport.
