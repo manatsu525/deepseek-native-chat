@@ -53,11 +53,10 @@ do not expand it. Protected recent exchanges are not hard-truncated, so the
 trigger is not a guarantee that every wire request is below that character
 count. Numeric bounds remain 40000–4000000.
 
-Responses function-call replay and request-size measurement use canonical
-execution arguments, including their post-execution compacted projection.
-Native reasoning items and signatures remain intact. When arguments are
-compacted during a stateful turn, the next request rebuilds the stored chain
-from compacted local history; tools already executed are not run again.
+Large write/edit arguments are retained verbatim after execution, including
+failed calls. Responses replays original native items and reasoning signatures;
+parameter size alone does not reset its stored response chain. Whole-context
+compaction remains governed by the fixed configured threshold above.
 
 ## Diagnosis and verification
 

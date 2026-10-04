@@ -1,4 +1,4 @@
-"""Offline regression coverage for actual wire projection and fixed budgets."""
+"""Offline regression coverage for intact tool arguments and fixed budgets."""
 import copy
 import json
 import tempfile
@@ -13,7 +13,7 @@ import test_responses_state as responses_tests
 
 
 class ResponsesCompactionTests(unittest.IsolatedAsyncioTestCase):
-    def test_wire_and_meter_use_compacted_arguments_preserving_native_items(self):
+    def test_wire_and_meter_preserve_original_arguments_and_native_items(self):
         reasoning = {"id": "rs_1", "type": "reasoning", "encrypted_content": "opaque-signature", "summary": []}
         for name, succeeded, arguments in (
             ("write_file", True, {"path": "game.html", "content": "x" * 65_000}),
@@ -28,14 +28,14 @@ class ResponsesCompactionTests(unittest.IsolatedAsyncioTestCase):
                 message = {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "function": function}],
                            "responses_output_items": [reasoning, native]}
                 before = serialized_chars([message])
-                self.assertTrue(mimo_local._compact_workspace_call_arguments(function, name=name, path="game.html", succeeded=succeeded))
+                self.assertFalse(mimo_local._compact_workspace_call_arguments(function, name=name, path="game.html", succeeded=succeeded))
                 wire = mimo_local._responses_input([message])
                 self.assertEqual(wire[0], reasoning)
                 self.assertEqual(wire[1]["arguments"], function["arguments"])
-                self.assertLess(len(wire[1]["arguments"]), 200)
+                self.assertEqual(wire[1]["arguments"], raw)
                 self.assertEqual(wire[1]["id"], "fc_1")
                 self.assertEqual(wire[1]["call_id"], "call_1")
-                self.assertLess(serialized_chars([message]), before / 10)
+                self.assertEqual(serialized_chars([message]), before)
                 self.assertEqual(native["arguments"], raw)  # original diagnostic item stays intact
                 self.assertEqual(mimo_local._responses_input([{"role": "assistant", "responses_output_items": [reasoning, native]}]),
                                  [reasoning, native])
@@ -59,7 +59,7 @@ class ResponsesCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(serialized_chars(history), 240_000)
         self.assertEqual(history[-1]["content"], "x" * 50_000)
 
-    async def test_next_actual_request_rebases_and_shrinks_without_reexecuting(self):
+    async def test_next_actual_request_keeps_arguments_without_reexecuting(self):
         content = "UNIQUE_LARGE_BODY_" * 4000
         reasoning = {"id": "rs_1", "type": "reasoning", "encrypted_content": "opaque", "summary": []}
         for agent_mode, store, failed in ((False, False, False), (False, True, False),
@@ -99,13 +99,16 @@ class ResponsesCompactionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(result["tool_trace"]), 1)
                 self.assertEqual(writes[0][1]["content"], content)
                 sent = transport.payloads[1]
-                self.assertNotIn("previous_response_id", sent)
-                calls = [item for item in sent["input"] if item.get("type") == "function_call"]
-                self.assertEqual(len(calls), 1)
-                self.assertLess(len(calls[0]["arguments"]), 200)
-                self.assertIn(reasoning, sent["input"])
+                if store:
+                    self.assertEqual(sent.get("previous_response_id"), "resp_write")
+                else:
+                    self.assertNotIn("previous_response_id", sent)
+                    calls = [item for item in sent["input"] if item.get("type") == "function_call"]
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(json.loads(calls[0]["arguments"])["content"], content)
+                    self.assertIn(reasoning, sent["input"])
                 self.assertEqual(len([item for item in sent["input"] if item.get("type") == "function_call_output"]), 1)
                 self.assertEqual(result["round_stats"][0]["context_budget"], 240_000)
-                self.assertTrue(result["round_stats"][0]["arguments_compacted"])
+                self.assertFalse(result["round_stats"][0].get("arguments_compacted", False))
                 if not failed:
                     self.assertEqual((workspace.root / "game.html").read_text(), content)
