@@ -98,6 +98,7 @@ DEFAULT_SETTINGS = {
     # explicitly disables automatic retries for a model.
     "retry_status_codes": [503],
     "context_budget_chars": 240_000,
+    "context_window_tokens": None,
     "temperature_enabled": False,
     "temperature": 1.0,
     "top_p_enabled": False,

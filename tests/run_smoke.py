@@ -38,7 +38,7 @@ SMOKE_SPECS = (
     "test_plan_execution.PlanLoopTests.test_configured_http_status_retries_with_same_policy",
     "test_agent_tools.AgentToolTests",
     "test_custom_responses.CustomResponsesProtocolTests.test_output_token_field_matches_each_custom_protocol",
-    "test_custom_responses.CustomResponsesProtocolTests.test_chat_tool_history_becomes_responses_items",
+    "test_custom_model_settings.CustomModelSettingsTests.test_working_context_window_is_local_per_model_and_advanced_independent",
     "test_responses_compaction.ResponsesCompactionTests",
     "test_custom_responses.CustomResponsesConnectionTests",
     "test_web_evidence.WebEvidenceTests",

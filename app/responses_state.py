@@ -10,9 +10,10 @@ from typing import Any
 def state_scope(provider: dict, job: dict, settings: dict) -> str:
     # Never persist credentials themselves. Changing any routing/configuration
     # input starts a new chain, as does switching user, conversation or mode.
+    route_settings = {key: value for key, value in settings.items() if key != "context_window_tokens"}
     value = [provider.get("id"), provider.get("base_url"), provider.get("api_key"),
              job.get("user_id"), job.get("conversation_id"), job.get("model"),
-             job.get("chat_mode"), job.get("effort"), job.get("timezone"), settings]
+             job.get("chat_mode"), job.get("effort"), job.get("timezone"), route_settings]
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 

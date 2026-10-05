@@ -21,6 +21,13 @@ _cache: dict[str, tuple[float, int | None]] = {}
 _lock = threading.Lock()
 
 
+def effective_context_window(reported: int | None, working: int | None) -> int | None:
+    """Local compaction window; never raise a provider's known capacity."""
+    if working is None:
+        return reported
+    return min(working, reported) if reported else working
+
+
 def _window_from_entry(entry: dict[str, Any]) -> int | None:
     for field in WINDOW_FIELDS:
         value = entry.get(field)

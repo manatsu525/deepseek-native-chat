@@ -36,6 +36,15 @@ file quotas or appear among generated/downloadable workspace files.
 
 ## Application adapters (not a claim of byte-identical Grok HTTP traffic)
 
+Custom has an optional per-model `context_window_tokens` working window. Blank
+uses the provider catalog window (or the existing 256k fallback when unknown).
+A configured value is clamped to the known model capacity and controls the
+existing half-window pruning and 75%/85% compaction thresholds in both modes.
+It is a local setting, not an upstream request field, and remains active with
+advanced JSON enabled. It adds no hard truncation or change to reasoning replay.
+The local setting does not change the provider history scope; an actual working
+window change invalidates the compactor's window-dependent state as before.
+
 We retain Chat Completions, Responses and Anthropic Messages, the current API
 credentials/routing options, and our existing Agent tools. Grok-only request
 headers, remote fleet flags, Cursor wire templates, memory flush, forks and

@@ -197,6 +197,8 @@
         <p class="muted custom-cost-note">只勾选当前模型所在的聚合商；未勾选时不会改写模型名或请求路由。</p>
       </div>
       <label>最大生成 Token<input id="customMaxCompletion" type="number" min="256" max="131072" step="256" value="65536"></label>
+      <label>工作上下文窗口（Token）<input id="customContextWindow" type="number" min="8192" max="4194304" step="1" placeholder="留空：自动读取模型窗口"></label>
+      <p class="wide muted custom-cost-note">仅控制本地裁剪和压缩的计算窗口，不做硬截断，也不发送到上游；每个模型独立保存，开启高级 JSON 时仍生效。设置超过模型已知窗口时取较小值。</p>
       <label>自动重试 HTTP 状态码<input id="customRetryStatusCodes" type="text" inputmode="numeric" placeholder="503, 429, 500" value="503"></label>
       <p class="wide muted custom-cost-note">填写 400-599 状态码，多个用逗号分隔；命中后统一每 5 秒重试，最多 60 次。默认只重试 503，清空可关闭自动重试。</p>
       <label class="check"><input id="customTemperatureEnabled" type="checkbox"> 发送 temperature</label>

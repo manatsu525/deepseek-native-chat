@@ -21,6 +21,42 @@ from app.db import Database
 class CustomModelSettingsTests(unittest.TestCase):
     admin_password = "custom-settings-test-password"
 
+    def test_working_context_window_is_local_per_model_and_advanced_independent(self) -> None:
+        from app.model_limits import effective_context_window
+        from app.responses_state import state_scope
+        provider_id = self.add_legacy_provider()
+        main.migrate_custom_provider_settings()
+        body = {**self.settings_body("model-a", temperature=0.7, backend="parallel"),
+                "context_window_tokens": 64_000, "advanced_enabled": True,
+                "advanced_request": {"model": "model-a", "max_completion_tokens": 8192}}
+        response = self.client.put(f"/api/providers/{provider_id}/settings", json=body)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["model_settings"]["model-a"]["context_window_tokens"], 64_000)
+        self.assertIsNone(response.json()["model_settings"]["model-b"]["context_window_tokens"])
+        preview = self.client.post(f"/api/providers/{provider_id}/settings/preview", json=body)
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertNotIn("context_window_tokens", preview.json()["parameters"])
+        self.assertEqual(preview.json()["parameters"], body["advanced_request"])
+        body["advanced_enabled"] = False
+        preview = self.client.post(f"/api/providers/{provider_id}/settings/preview", json=body)
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertNotIn("context_window_tokens", preview.json()["parameters"])
+        for invalid in (8191, 4_194_305, 64_000.5):
+            bad = self.client.put(f"/api/providers/{provider_id}/settings", json={**body, "context_window_tokens": invalid})
+            self.assertEqual(bad.status_code, 422, bad.text)
+        reset = self.client.put(f"/api/providers/{provider_id}/settings", json={**body, "context_window_tokens": None})
+        self.assertEqual(reset.status_code, 200, reset.text)
+        self.assertIsNone(reset.json()["model_settings"]["model-a"]["context_window_tokens"])
+        self.assertEqual(effective_context_window(1_048_576, 64_000), 64_000)
+        self.assertEqual(effective_context_window(32_000, 64_000), 32_000)
+        self.assertEqual(effective_context_window(None, 64_000), 64_000)
+        self.assertEqual(effective_context_window(1_048_576, None), 1_048_576)
+        self.assertIsNone(effective_context_window(None, None))
+        # A local window change must not invalidate native reasoning or the
+        # provider response chain. The compactor separately checks its window.
+        self.assertEqual(state_scope({}, {}, {}), state_scope({}, {}, {"context_window_tokens": None}))
+        self.assertEqual(state_scope({}, {}, {}), state_scope({}, {}, {"context_window_tokens": 64_000}))
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.data_dir = Path(self.temp_dir.name) / "data"

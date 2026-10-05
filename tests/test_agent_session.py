@@ -126,7 +126,9 @@ class AgentSessionLoopTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(mode=mode, protocol=protocol), tempfile.TemporaryDirectory() as directory:
                     db = Database(Path(directory) / "test.db")
                     uid, pid = seed(db)
-                    db.run("UPDATE providers SET provider_type=? WHERE id=?", (kind, pid))
+                    db.run("UPDATE providers SET provider_type=?,settings_json=? WHERE id=?", (kind, json.dumps({
+                        "model_settings": {"test": {"context_window_tokens": 64_000,
+                            "advanced_enabled": True, "advanced_request": {"model": "test", "store": False}}}}), pid))
                     job(db, uid, pid, "legacy")
                     db.run("UPDATE jobs SET status='completed',chat_mode=? WHERE id='legacy'", (mode,))
                     legacy_meta = {"job_id": "legacy"}
@@ -150,6 +152,7 @@ class AgentSessionLoopTests(unittest.IsolatedAsyncioTestCase):
                         # Exercise the actual serializers and loop with mocked
                         # model output; the acquisition result is a local fixture.
                         self.assertFalse(kwargs.get("user_context_addendum"))
+                        self.assertEqual(kwargs["context_window_tokens"], 64_000)
                         if kind == "custom_response" and not sizes:
                             self.assertFalse(kwargs.get("responses_state", {}).get("response_id"))
                         messages = kwargs["messages"]
@@ -166,7 +169,7 @@ class AgentSessionLoopTests(unittest.IsolatedAsyncioTestCase):
                         rounds = [[("new-fetch", "run_command", {"command": "mock acquisition"})], ["done"]] if len(sizes) == 1 else [["done"]]
                         result, payloads, _, _ = await loops.PlanLoopTests.run_loop(
                             self, rounds, protocol=protocol, record_event=kwargs["record_event"], messages=messages,
-                            context_window_tokens=1_048_576, agent_mode=mode == "agent", custom_handler=execute,
+                            context_window_tokens=kwargs["context_window_tokens"], agent_mode=mode == "agent", custom_handler=execute,
                             settings={"advanced_enabled": True, "advanced_request": {"model": "test", "store": False}})
                         for payload in payloads:
                             serialized = json.dumps(payload, ensure_ascii=False)

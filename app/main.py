@@ -40,7 +40,7 @@ from .mimo import (
     list_models as custom_list_models,
 )
 from .mimo_local import stream_response as custom_stream_response, build_custom_request_parameters
-from .model_limits import context_window_tokens
+from .model_limits import context_window_tokens, effective_context_window
 from .reasoning_effort import DEFAULT as DEFAULT_REASONING_EFFORT
 from .reasoning_effort import LEVELS as REASONING_EFFORT_LEVELS
 from .security import load_secret, make_token, password_hash, password_ok, read_token
@@ -154,6 +154,7 @@ class CustomSettingsBody(BaseModel):
     max_completion_tokens: int = Field(default=65536, ge=256, le=MIMO_MAX_COMPLETION_TOKENS)
     retry_status_codes: list[int] = Field(default_factory=lambda: [503], max_length=20)
     context_budget_chars: int = Field(default=DEFAULT_CONTEXT_BUDGET_CHARS, ge=MIN_CONTEXT_BUDGET_CHARS, le=MAX_CONTEXT_BUDGET_CHARS)
+    context_window_tokens: Optional[int] = Field(default=None, ge=8192, le=4_194_304)
     temperature_enabled: bool = False
     temperature: float = Field(default=1.0, ge=0, le=1.5)
     top_p_enabled: bool = False
@@ -676,6 +677,10 @@ async def _execute_job(job_id: str) -> None:
                 context_model = context_model[:-6]
         response_options["context_window_tokens"] = await asyncio.to_thread(
             context_window_tokens, provider["base_url"], provider["api_key"], context_model
+        )
+        response_options["context_window_tokens"] = effective_context_window(
+            response_options["context_window_tokens"],
+            custom_settings_for_model(provider, job["model"]).get("context_window_tokens"),
         )
     if kind == "custom_response":
         response_scope = state_scope(provider, job, custom_settings_for_model(provider, job["model"]))
