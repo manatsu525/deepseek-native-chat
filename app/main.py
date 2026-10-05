@@ -703,6 +703,10 @@ async def _execute_job(job_id: str) -> None:
             projected = prior_journal.history(scope=journal_scope)
             if projected is not None:
                 history = projected
+                if prior_journal.legacy_web_evidence_removed and response_options.get("responses_state", {}).get("response_id"):
+                    # A server-side chain still contains the obsolete suffixes;
+                    # restart it with the cleaned full history once.
+                    response_options["responses_state"] = {}
                 response_options["agent_context_state"] = prior_journal.context_state(scope=journal_scope)
                 replay_rows = history_rows[:index]
                 break
@@ -758,11 +762,6 @@ async def _execute_job(job_id: str) -> None:
         for item in prior_web_evidence
         if item.get("canonical_url") and item.get("content")
     }
-    latest_user_text = next(
-        (str(item.get("content") or "") for item in reversed(history) if item.get("role") == "user" and not item.get("agent_synthetic")),
-        "",
-    )
-    web_evidence_context = _build_web_evidence_context(prior_web_evidence, latest_user_text)
     db.update_job(job_id, status="running", error="", stop_requested=0)
     last_write = 0.0
     attachment_lock_acquired = False
@@ -863,7 +862,6 @@ async def _execute_job(job_id: str) -> None:
                 cached_web_evidence=cached_web_evidence,
                 **response_options,
                 system_addendum=build_agent_skills_prompt(),
-                user_context_addendum=web_evidence_context,
                 record_event=journal.append,
             )
         elif is_custom_provider(kind):
@@ -884,7 +882,6 @@ async def _execute_job(job_id: str) -> None:
                 effort=provider_settings.get("reasoning_effort") or job["effort"],
                 workspace=job_workspace,
                 cached_web_evidence=cached_web_evidence,
-                user_context_addendum=web_evidence_context,
                 record_event=journal.append,
                 **response_options,
             )

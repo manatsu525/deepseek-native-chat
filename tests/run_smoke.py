@@ -27,7 +27,7 @@ SMOKE_SPECS = (
     "test_agent_compaction.CompactionParityTests.test_meter_utf8_native_mirrors_and_reseed",
     "test_agent_compaction.CompactionLoopTests.test_ordinary_chat_compacts_and_recovers_private_archive_all_protocols",
     "test_agent_compaction.CompactionLoopTests.test_two_successive_compactions_tool_receipts_and_all_protocols",
-    "test_plan_execution.ExecutionPlanTests.test_plan_state_and_checkpoint_restore",
+    "test_agent_session.AgentSessionLoopTests.test_many_turns_keep_web_results_once_and_clean_legacy_history",
     "test_agent_session.AgentSessionTests",
     "test_agent_session.AgentSessionLoopTests.test_committed_tools_replay_all_protocols",
     "test_agent_session.AgentSessionLoopTests.test_main_cross_turn_and_restart_use_committed_history",

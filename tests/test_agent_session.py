@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.agent_session import AgentJournal, project_history
+from app.agent_session import AgentJournal, project_history, remove_legacy_web_evidence, LEGACY_WEB_EVIDENCE_PREFIX
 from app.db import Database
 from app.plan import ChecklistPlan
 from app import main, mimo_local
@@ -57,6 +57,18 @@ class AgentSessionTests(unittest.TestCase):
         self.assertEqual(legacy.steps, [{"step": "old", "status": "completed"}])
 
     def test_durable_projection_request_immutability_and_unknown_outcome(self):
+        quoted = "quoted" + LEGACY_WEB_EVIDENCE_PREFIX + "user's own quotation"
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,original"}}
+        sample = [{"role": "user", "content": "question" + LEGACY_WEB_EVIDENCE_PREFIX + "duplicate page"},
+                  {"role": "tool", "content": "original webpage result"},
+                  {"role": "user", "content": quoted},
+                  {"role": "user", "content": [{"type": "text", "text": "question"}, image,
+                    {"type": "text", "text": LEGACY_WEB_EVIDENCE_PREFIX.lstrip("\n") + "duplicate page"}]}]
+        remove_legacy_web_evidence(sample, {"question", quoted})
+        self.assertEqual(sample[0]["content"], "question")
+        self.assertEqual(sample[1]["content"], "original webpage result")
+        self.assertEqual(sample[2]["content"], quoted)
+        self.assertEqual(sample[3]["content"], [{"type": "text", "text": "question"}, image])
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.db")
             uid, pid = seed(db)
@@ -105,6 +117,94 @@ class AgentSessionTests(unittest.TestCase):
 
 
 class AgentSessionLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_many_turns_keep_web_results_once_and_clean_legacy_history(self):
+        from app.agent_compaction import estimate_history
+        page = "WEB_FACT_unique_document_" + "网页事实，仅保留原始工具结果。" * 1500 + "_TAIL_FACT"
+        old = "LEGACY_DOCUMENT_unique_" + "历史正文。" * 1000 + "_LEGACY_TAIL"
+        for mode in ("standard", "agent"):
+            for protocol, kind in (("chat_completions", "custom"), ("responses", "custom_response"), ("messages", "custom_messages")):
+                with self.subTest(mode=mode, protocol=protocol), tempfile.TemporaryDirectory() as directory:
+                    db = Database(Path(directory) / "test.db")
+                    uid, pid = seed(db)
+                    db.run("UPDATE providers SET provider_type=? WHERE id=?", (kind, pid))
+                    job(db, uid, pid, "legacy")
+                    db.run("UPDATE jobs SET status='completed',chat_mode=? WHERE id='legacy'", (mode,))
+                    legacy_meta = {"job_id": "legacy"}
+                    if kind == "custom_response":
+                        provider = db.one("SELECT * FROM providers WHERE id=?", (pid,))
+                        legacy_meta["responses_state"] = {"response_id": "obsolete-server-history", "disabled": False,
+                            "scope": main.state_scope(provider, db.one("SELECT * FROM jobs WHERE id='legacy'"), main.custom_settings_for_model(provider, "test"))}
+                    db.run("INSERT INTO messages(conversation_id,role,content,meta_json,created_at) VALUES(?,?,?,?,?)", ("chat", "user", "legacy question", "{}", 1))
+                    db.run("INSERT INTO messages(conversation_id,role,content,meta_json,created_at) VALUES(?,?,?,?,?)", ("chat", "assistant", "legacy done", json.dumps(legacy_meta), 1))
+                    legacy = AgentJournal(db, "legacy", "chat")
+                    legacy.append("history/start", {"messages": [
+                        {"role": "user", "content": "legacy question" + LEGACY_WEB_EVIDENCE_PREFIX + old},
+                        assistant("old-fetch"), {"role": "tool", "tool_call_id": "old-fetch", "content": old},
+                        {"role": "assistant", "content": "legacy done"}]})
+                    db.upsert_web_evidence(uid, "chat", "legacy", [{"url": "https://example.test/old", "canonical_url": "https://example.test/old", "content": old}])
+                    sizes = []
+                    request_sizes = []
+                    async def execute(name, args):
+                        return page
+                    async def stream(**kwargs):
+                        # Exercise the actual serializers and loop with mocked
+                        # model output; the acquisition result is a local fixture.
+                        self.assertFalse(kwargs.get("user_context_addendum"))
+                        if kind == "custom_response" and not sizes:
+                            self.assertFalse(kwargs.get("responses_state", {}).get("response_id"))
+                        messages = kwargs["messages"]
+                        sent = json.dumps(messages, ensure_ascii=False)
+                        self.assertNotIn(LEGACY_WEB_EVIDENCE_PREFIX, sent)
+                        for prior in range(len(sizes) + 1):
+                            self.assertIn(f'"follow-up {prior}"', sent)
+                        self.assertLessEqual(sent.count("LEGACY_DOCUMENT_unique_"), 1)
+                        self.assertLessEqual(sent.count("WEB_FACT_unique_document_"), 1)
+                        if len(sizes) < 8:
+                            self.assertEqual(sent.count("LEGACY_DOCUMENT_unique_"), 1)
+                            self.assertEqual(sent.count("WEB_FACT_unique_document_"), 0 if not sizes else 1)
+                        sizes.append(estimate_history(messages))
+                        rounds = [[("new-fetch", "run_command", {"command": "mock acquisition"})], ["done"]] if len(sizes) == 1 else [["done"]]
+                        result, payloads, _, _ = await loops.PlanLoopTests.run_loop(
+                            self, rounds, protocol=protocol, record_event=kwargs["record_event"], messages=messages,
+                            context_window_tokens=1_048_576, agent_mode=mode == "agent", custom_handler=execute,
+                            settings={"advanced_enabled": True, "advanced_request": {"model": "test", "store": False}})
+                        for payload in payloads:
+                            serialized = json.dumps(payload, ensure_ascii=False)
+                            self.assertLessEqual(serialized.count("LEGACY_DOCUMENT_unique_"), 1)
+                            self.assertLessEqual(serialized.count("WEB_FACT_unique_document_"), 1)
+                            self.assertNotIn("WEB EVIDENCE FROM THIS CONVERSATION:", serialized)
+                        request_sizes.append(len(json.dumps(payloads[0], ensure_ascii=False).encode()))
+                        if len(sizes) == 1:
+                            result["web_evidence"] = [{"url": "https://example.test/new", "canonical_url": "https://example.test/new", "content": page}]
+                        return result
+                    with patch.object(main, "db", db), patch.object(main, "custom_streamer", return_value=stream), \
+                         patch.object(main, "AgentRuntime"), patch.object(main, "AgentSharedWorkspace") as workspace, \
+                         patch.object(main, "context_window_tokens", return_value=1_048_576), \
+                         patch.object(main, "build_agent_skills_prompt", return_value=""), \
+                         patch.object(mimo_local, "app_settings") as config:
+                        config.data_dir = Path(directory)
+                        workspace.return_value.list_files.return_value = []
+                        for index in range(24):
+                            ident = f"turn-{index}"
+                            job(db, uid, pid, ident)
+                            db.run("UPDATE jobs SET chat_mode=? WHERE id=?", (mode, ident))
+                            db.run("INSERT INTO messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)", ("chat", "user", f"follow-up {index}", 1))
+                            await main.run_job(ident)
+                            state = db.one("SELECT status,error FROM jobs WHERE id=?", (ident,))
+                            self.assertEqual(state["status"], "completed", f"{ident}: {state['error']}")
+                    # Only tiny user/assistant exchanges are added after the
+                    # document was first acquired; no per-turn page-sized growth.
+                    self.assertLess(sizes[-1] - sizes[1], 3000)
+                    self.assertLess(max(sizes[1:]) - sizes[1], 3000)
+                    self.assertTrue(all(b - a < 750 for a, b in zip(sizes[1:], sizes[2:])))
+                    self.assertLess(request_sizes[-1] - request_sizes[1], 8000)
+                    # The existing Grok ten-turn pruning can remove old bodies
+                    # from requests; their full receipts remain recoverable.
+                    transcript = next(Path(directory).rglob("updates.jsonl")).read_text()
+                    self.assertIn("_TAIL_FACT", transcript)
+                    self.assertIn("_LEGACY_TAIL", transcript)
+                    print(f"web-history regression {mode}/{protocol}: 24 turns, estimated tokens first={sizes[1]} peak={max(sizes[1:])} final={sizes[-1]}, request bytes {request_sizes[1]} -> {request_sizes[-1]}")
+
     async def test_committed_tools_replay_all_protocols(self):
         for protocol in ("chat_completions", "responses", "messages"):
             with self.subTest(protocol=protocol):

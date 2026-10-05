@@ -16,6 +16,41 @@ from typing import Any
 from .db import Database
 
 
+LEGACY_WEB_EVIDENCE_PREFIX = (
+    "\n\n---\n[Context supplied by the application, not written by the user]\n"
+    "WEB EVIDENCE FROM THIS CONVERSATION:\n"
+)
+
+
+def remove_legacy_web_evidence(messages: list[dict[str, Any]], originals: set[str]) -> bool:
+    """Remove generated user suffixes, verified against the original user text.
+
+    Tool receipts and original user messages remain untouched. The diagnostic
+    journal is not rewritten; only its model-facing projection is cleaned.
+    """
+    changed = False
+    for message in messages:
+        if message.get("role") != "user" or message.get("agent_synthetic"):
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content not in originals:
+            original, marker, _ = content.partition(LEGACY_WEB_EVIDENCE_PREFIX)
+            if marker and original in originals:
+                message["content"] = original
+                changed = True
+        elif isinstance(content, list):
+            # Multimodal requests stored the application block as its own part.
+            if not any(isinstance(p, dict) and p.get("type") == "text" and p.get("text") in originals
+                       for p in content):
+                continue
+            label = LEGACY_WEB_EVIDENCE_PREFIX.lstrip("\n")
+            message["content"] = [p for p in content if not (
+                isinstance(p, dict) and p.get("type") == "text"
+                and str(p.get("text") or "").startswith(label) and p.get("text") not in originals)]
+            changed |= len(message["content"]) != len(content)
+    return changed
+
+
 def project_history(events: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
     messages = None
     for event in events:
@@ -57,6 +92,7 @@ class AgentJournal:
     def __init__(self, db: Database, job_id: str, conversation_id: str):
         self.db, self.job_id, self.conversation_id = db, job_id, conversation_id
         self.pending_preview: dict[str, Any] | None = None
+        self.legacy_web_evidence_removed = False
 
     def append(self, kind: str, payload: dict[str, Any]) -> None:
         if kind == "model/preview":
@@ -131,6 +167,11 @@ class AgentJournal:
         history = project_history(events)
         if history is None:
             return None
+        if any(LEGACY_WEB_EVIDENCE_PREFIX.lstrip("\n") in str(m.get("content") or "")
+               for m in history if m.get("role") == "user"):
+            originals = {row["content"] for row in self.db.all(
+                "SELECT content FROM messages WHERE conversation_id=? AND role='user'", (self.conversation_id,))}
+            self.legacy_web_evidence_removed = remove_legacy_web_evidence(history, originals)
         source = self.db.one(
             "SELECT payload_json FROM agent_events WHERE job_id=? AND conversation_id=? AND kind='turn/start' "
             "AND id<=? ORDER BY id DESC LIMIT 1", (self.job_id, self.conversation_id, checkpoint["id"]))
