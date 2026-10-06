@@ -1070,12 +1070,11 @@ async def stream_response(
     if api_protocol == "messages":
         headers["x-api-key"] = api_key
         headers["anthropic-version"] = "2023-06-01"
-    # Deferred tool groups (see app/tool_groups.py). In standard mode the file
-    # tools are sent from the start only once the conversation's workspace has
-    # files; in Agent mode the conversation and Skill tools wait for load_tools.
+    # Ordinary full-access workspaces load their file group on demand. Neither
+    # uploaded files nor execution-log directories mean that tools were loaded.
+    # Agent mode retains its existing core/extension tool selection.
     files_deferrable = (
-        not agent_mode and workspace is not None and workspace_access == "full" and not workspace.list_files()
-        and not workspace.context_archive.is_dir()
+        not agent_mode and workspace is not None and workspace_access == "full"
     )
     extra_groups = sorted({
         group for group in (group_of_extra_tool(name) for name in extra_tool_names) if group
@@ -1167,6 +1166,9 @@ async def stream_response(
         function = call.get("function") or {}
         if function.get("name") == "load_tools" and str(message.get("content", "")).startswith("Loaded tool groups:"):
             loaded_groups.update(requested_groups(_json_object(function.get("arguments") or "{}"), deferrable_groups))
+        if (files_deferrable and message.get("role") == "tool" and not _tool_result_failure(str(message.get("content") or ""))
+                and function.get("name") in WORKSPACE_TOOL_NAMES):
+            loaded_groups.add("files")
         group = group_of_extra_tool(str(function.get("name") or ""))
         if group and message.get("role") == "tool" and not _tool_result_failure(str(message.get("content") or "")):
             loaded_groups.add(group)

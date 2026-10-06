@@ -45,6 +45,11 @@ advanced JSON enabled. It adds no hard truncation or change to reasoning replay.
 The local setting does not change the provider history scope; an actual working
 window change invalidates the compactor's window-dependent state as before.
 
+Ordinary full-access chats defer file tools behind `load_tools`, even when files
+or execution-log directories exist. Successful loading is saved in the context
+state and restored across turns/compaction. Successful prior file-tool receipts
+also restore the group for older conversations. Agent's core toolset is unchanged.
+
 We retain Chat Completions, Responses and Anthropic Messages, the current API
 credentials/routing options, and our existing Agent tools. Grok-only request
 headers, remote fleet flags, Cursor wire templates, memory flush, forks and

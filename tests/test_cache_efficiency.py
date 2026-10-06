@@ -561,16 +561,16 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["tool_trace"][0]["status"], "completed")
         self.assertIn("write_file", [t["function"]["name"] for t in requests[1]["tools"]])
 
-    async def test_workspace_with_files_starts_with_file_tools(self):
+    async def test_workspace_with_files_still_defers_file_tools(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = ConversationWorkspace(1, "existing")
             workspace.root = Path(directory)
             workspace.write_file("main.py", "print(1)\n")
             _, requests = await run_stream(workspace, [answer_round("ok")])
         names = [t["function"]["name"] for t in requests[0]["tools"]]
-        self.assertIn("edit_file", names)
-        self.assertNotIn("load_tools", names)
-        self.assertIn("edit_file", requests[0]["messages"][0]["content"])
+        self.assertNotIn("edit_file", names)
+        self.assertIn("load_tools", names)
+        self.assertNotIn("edit_file", requests[0]["messages"][0]["content"])
 
     async def test_agent_mode_defers_conversation_and_skill_tools(self):
         runtime = AgentRuntime(None, 1, "defer", is_admin=True)

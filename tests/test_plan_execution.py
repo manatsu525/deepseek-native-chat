@@ -139,7 +139,7 @@ class ExecutionPlanTests(unittest.TestCase):
 class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
     async def run_loop(self, rounds, protocol="chat_completions", status_sequence=None, settings=None,
                        record_event=None, messages=None, context_window_tokens=None, agent_mode=True,
-                       custom_tools=None, custom_handler=None, workspace=None):
+                       custom_tools=None, custom_handler=None, workspace=None, agent_context_state=None):
         payloads, executed, updates = [], [], []
         statuses = list(status_sequence or [])
         def event(obj):
@@ -197,6 +197,7 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
                 base_url="https://example.invalid/v1", api_key="test", model="test", messages=messages or [{"role":"user","content":"edit files"}],
                 timeout=5, stopped=lambda:False, update=update, web_enabled=False, agent_mode=agent_mode,
                 context_window_tokens=context_window_tokens,
+                agent_context_state=agent_context_state,
                 workspace=workspace,
                 conversation_id=workspace.root.name if workspace is not None else None,
                 max_tool_rounds=15, api_protocol=protocol, settings=settings,

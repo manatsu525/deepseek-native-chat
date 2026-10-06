@@ -117,6 +117,65 @@ class AgentSessionTests(unittest.TestCase):
 
 
 class AgentSessionLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_file_tools_require_explicit_loading_and_survive_restoration(self):
+        from app.workspace import ConversationWorkspace
+        for protocol in ("chat_completions", "responses", "messages"):
+            with self.subTest(protocol=protocol), tempfile.TemporaryDirectory() as directory, patch.object(mimo_local, "app_settings") as config:
+                config.data_dir = Path(directory)
+                workspace = ConversationWorkspace(1, "deferred")
+                workspace.root = Path(directory) / "workspace"
+                workspace.context_archive = Path(directory) / "archive"
+                workspace.context_archive.mkdir()
+                workspace.write_file("uploaded.txt", "An uploaded file does not load schemas.")
+                events = []
+                def record(kind, payload):
+                    events.append({"kind": kind, "payload": copy.deepcopy(payload)})
+                def names(payload):
+                    return [t.get("name", (t.get("function") or {}).get("name")) for t in payload.get("tools", [])]
+                async def run(rounds, messages=None, state=None):
+                    return await loops.PlanLoopTests.run_loop(self, rounds, protocol=protocol, agent_mode=False,
+                        workspace=workspace, custom_tools=[], messages=messages, record_event=record,
+                        agent_context_state=state, context_window_tokens=128_000)
+                _, first, _, _ = await run([["hello"]])
+                self.assertIn("load_tools", names(first[0]))
+                self.assertNotIn("write_file", names(first[0]))
+                history = project_history(events)
+                state = next(e["payload"] for e in reversed(events) if e["kind"] == "context/state")
+                events.clear()
+                _, second, _, _ = await run([["another ordinary answer"]], [*history, {"role": "user", "content": "hello again"}], state)
+                self.assertEqual(first[0]["tools"], second[0]["tools"])
+                self.assertEqual(first[0].get("instructions", first[0].get("system", first[0].get("messages", [{}])[0])),
+                                 second[0].get("instructions", second[0].get("system", second[0].get("messages", [{}])[0])))
+                history = project_history(events)
+                events.clear()
+                result, loaded, _, _ = await run([
+                    [("load-files", "load_tools", {"groups": ["files"]})],
+                    [("write-file", "write_file", {"path": "new.txt", "content": "saved"})], ["done"]],
+                    [*history, {"role": "user", "content": "write a file"}], state)
+                self.assertNotIn("write_file", names(loaded[0]))
+                self.assertIn("write_file", names(loaded[1]))
+                self.assertEqual(workspace.read_file("new.txt"), "saved")
+                self.assertFalse(result["incomplete"])
+                history = project_history(events)
+                state = next(e["payload"] for e in reversed(events) if e["kind"] == "context/state")
+                self.assertIn("files", state["loaded_groups"])
+                events.clear()
+                # A new loop/process reconstructs schemas from persisted state
+                # even when compaction has removed the old load_tools receipt.
+                _, resumed, _, _ = await run([["still loaded"]], [{"role": "user", "content": "continue"}], state)
+                self.assertEqual(loaded[-1]["tools"], resumed[0]["tools"])
+                self.assertEqual(names(resumed[0]).count("write_file"), 1)
+                events.clear()
+                # Older histories with successful file work but no load receipt
+                # also retain their loaded state on the next request.
+                old = [{"role": "user", "content": "old task"},
+                    {"role": "assistant", "content": "", "tool_calls": [{"id": "old-read", "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path":"new.txt"}'}}]},
+                    {"role": "tool", "tool_call_id": "old-read", "content": "saved"},
+                    {"role": "user", "content": "continue"}]
+                _, recovered, _, _ = await run([["restored"]], old)
+                self.assertIn("read_file", names(recovered[0]))
+
     async def test_many_turns_keep_web_results_once_and_clean_legacy_history(self):
         from app.agent_compaction import estimate_history
         page = "WEB_FACT_unique_document_" + "网页事实，仅保留原始工具结果。" * 1500 + "_TAIL_FACT"

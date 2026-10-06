@@ -43,7 +43,7 @@ SMOKE_SPECS = (
     "test_custom_responses.CustomResponsesConnectionTests",
     "test_web_evidence.WebEvidenceTests",
     "test_research_prompt.SystemPromptTests",
-    "test_code_runner.CodeRunnerTests.test_rejects_non_python_and_escaping_paths",
+    "test_agent_session.AgentSessionLoopTests.test_file_tools_require_explicit_loading_and_survive_restoration",
     "test_code_runner.CodeRunnerTests.test_runs_disposable_copy_with_systemd_limits",
 )
 
