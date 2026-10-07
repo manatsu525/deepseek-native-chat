@@ -14,6 +14,31 @@ from typing import Any
 from .db import Database
 
 
+LEGACY_WEB_EVIDENCE_PREFIX = (
+    "\n\n---\n[Context supplied by the application, not written by the user]\n"
+    "WEB EVIDENCE FROM THIS CONVERSATION:\n"
+)
+
+
+def remove_legacy_web_evidence(messages: list[dict[str, Any]], originals: set[str]) -> None:
+    """Clean generated suffixes in Agent replay, preserving original user text."""
+    for message in messages:
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content not in originals:
+            original, marker, _ = content.partition(LEGACY_WEB_EVIDENCE_PREFIX)
+            if marker and original in originals:
+                message["content"] = original
+        elif isinstance(content, list):
+            if not any(isinstance(p, dict) and p.get("type") == "text" and p.get("text") in originals for p in content):
+                continue
+            label = LEGACY_WEB_EVIDENCE_PREFIX.lstrip("\n")
+            message["content"] = [p for p in content if not (
+                isinstance(p, dict) and p.get("type") == "text"
+                and str(p.get("text") or "").startswith(label) and p.get("text") not in originals)]
+
+
 def project_history(events: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
     messages = None
     for event in events:
@@ -96,6 +121,11 @@ class AgentJournal:
         history = project_history(events)
         if history is None:
             return None
+        if any("WEB EVIDENCE FROM THIS CONVERSATION:" in str(m.get("content") or "")
+               for m in history if m.get("role") == "user"):
+            originals = {row["content"] for row in self.db.all(
+                "SELECT content FROM messages WHERE conversation_id=? AND role='user'", (self.conversation_id,))}
+            remove_legacy_web_evidence(history, originals)
         source = self.db.one(
             "SELECT payload_json FROM agent_events WHERE job_id=? AND conversation_id=? AND kind='turn/start' "
             "AND id<=? ORDER BY id DESC LIMIT 1", (self.job_id, self.conversation_id, checkpoint["id"]))

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.agent_session import AgentJournal, project_history
+from app.agent_session import AgentJournal, project_history, remove_legacy_web_evidence, LEGACY_WEB_EVIDENCE_PREFIX
 from app.db import Database
 from app.plan import ChecklistPlan
 from app import main, mimo_local
@@ -57,6 +57,12 @@ class AgentSessionTests(unittest.TestCase):
         self.assertEqual(legacy.steps, [{"step": "old", "status": "completed"}])
 
     def test_durable_projection_request_immutability_and_unknown_outcome(self):
+        original = "question"
+        history = [{"role": "user", "content": original + LEGACY_WEB_EVIDENCE_PREFIX + "duplicate body"},
+                   {"role": "tool", "content": "original tool result"}]
+        remove_legacy_web_evidence(history, {original})
+        self.assertEqual(history[0]["content"], original)
+        self.assertEqual(history[1]["content"], "original tool result")
         with tempfile.TemporaryDirectory() as directory:
             db = Database(Path(directory) / "test.db")
             uid, pid = seed(db)
@@ -96,6 +102,50 @@ class AgentSessionTests(unittest.TestCase):
 
 
 class AgentSessionLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_develop_ordinary_history_is_lean_and_tool_loading_is_persistent(self):
+        from app.workspace import ConversationWorkspace
+        for protocol, kind in (("chat_completions", "custom"), ("responses", "custom_response"), ("messages", "custom_messages")):
+            with self.subTest(protocol=protocol), tempfile.TemporaryDirectory() as directory:
+                db = Database(Path(directory) / "test.db")
+                uid, pid = seed(db)
+                db.run("UPDATE providers SET provider_type=? WHERE id=?", (kind, pid))
+                captured = []
+                async def stream(**kwargs):
+                    captured.append(copy.deepcopy(kwargs))
+                    self.assertNotIn("record_event", kwargs)
+                    self.assertNotIn("agent_context_state", kwargs)
+                    return {"answer": "final only", "reasoning": "private reasoning sentinel", "searches": [], "sources": [], "usage": {},
+                            "tool_trace": [{"id": "read", "name": "read_file", "status": "completed", "path": "a.txt"}],
+                            "loaded_tool_groups": ["files"]}
+                with patch.object(main, "db", db), patch.object(main, "custom_streamer", return_value=stream), \
+                     patch.object(main, "AgentSharedWorkspace") as shared, patch.object(main, "context_window_tokens", return_value=1_048_576):
+                    shared.return_value.list_files.return_value = []
+                    for index in range(3):
+                        ident = f"ordinary-{index}"
+                        job(db, uid, pid, ident)
+                        db.run("UPDATE jobs SET chat_mode='standard' WHERE id=?", (ident,))
+                        db.run("INSERT INTO messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)", ("chat", "user", ident, 1))
+                        await main.run_job(ident)
+                        status = db.one("SELECT status,error FROM jobs WHERE id=?", (ident,))
+                        self.assertEqual(status["status"], "completed", status["error"])
+                    self.assertEqual(captured[1]["loaded_tool_groups"], ["files"])
+                    self.assertEqual(captured[2]["loaded_tool_groups"], ["files"])
+                    self.assertFalse(any(m.get("role") == "tool" or m.get("responses_output_items") for m in captured[2]["messages"]))
+                    self.assertNotIn("private reasoning sentinel", json.dumps(captured[2]["messages"]))
+                    self.assertEqual(db.one("SELECT COUNT(*) n FROM agent_events")["n"], 0)
+                workspace = ConversationWorkspace(uid, "lean")
+                workspace.root = Path(directory) / "workspace"
+                workspace.write_file("already-there.txt", "existing file does not load schemas")
+                result, first, _, _ = await loops.PlanLoopTests.run_loop(self, [["hello"]], protocol=protocol, agent_mode=False, workspace=workspace)
+                def names(payload):
+                    return [t.get("name", (t.get("function") or {}).get("name")) for t in payload.get("tools", [])]
+                self.assertNotIn("write_file", names(first[0]))
+                self.assertIn("load_tools", names(first[0]))
+                result, loaded, _, _ = await loops.PlanLoopTests.run_loop(self, [[("load", "load_tools", {"groups": ["files"]})], ["loaded"]], protocol=protocol, agent_mode=False, workspace=workspace)
+                self.assertIn("write_file", names(loaded[1]))
+                _, restored, _, _ = await loops.PlanLoopTests.run_loop(self, [["next question"]], protocol=protocol, agent_mode=False, workspace=workspace, loaded_tool_groups=result["loaded_tool_groups"])
+                self.assertEqual(loaded[1]["tools"], restored[0]["tools"])
+
     async def test_committed_tools_replay_all_protocols(self):
         for protocol in ("chat_completions", "responses", "messages"):
             with self.subTest(protocol=protocol):

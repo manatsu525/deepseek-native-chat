@@ -898,6 +898,7 @@ async def stream_response(
     context_window_tokens: int | None = None,
     initial_plan: dict[str, Any] | None = None,
     record_event: Callable[[str, dict[str, Any]], None] | None = None,
+    loaded_tool_groups: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run a custom OpenAI-compatible model with local web tools.
 
@@ -941,17 +942,19 @@ async def stream_response(
     if api_protocol == "messages":
         headers["x-api-key"] = api_key
         headers["anthropic-version"] = "2023-06-01"
-    # Deferred tool groups (see app/tool_groups.py). In standard mode the file
-    # tools are sent from the start only once the conversation's workspace has
-    # files; in Agent mode the conversation and Skill tools wait for load_tools.
+    # Ordinary file tools load by explicit model intent, independently of files
+    # and log directories. Agent keeps its existing extension discovery.
     files_deferrable = (
-        not agent_mode and workspace is not None and workspace_access == "full" and not workspace.list_files()
+        not agent_mode and workspace is not None and workspace_access == "full"
     )
     extra_groups = sorted({
         group for group in (group_of_extra_tool(name) for name in extra_tool_names) if group
     }) if agent_mode else []
     deferrable_groups = (["files"] if files_deferrable else []) + extra_groups
-    loaded_groups: set[str] = set()
+    loaded_groups: set[str] = set(loaded_tool_groups or []) & set(deferrable_groups)
+    publish = update
+    async def update(state: dict[str, Any]) -> None:
+        await publish({**state, "loaded_tool_groups": sorted(loaded_groups)})
     system_prompt = _apply_model_system_prompt(
         build_system_prompt(
             agent_mode=agent_mode,
@@ -2638,6 +2641,7 @@ async def stream_response(
         "tool_trace": tool_trace,
         "round_stats": round_stats,
         "web_evidence": web_evidence,
+        "loaded_tool_groups": sorted(loaded_groups),
         "incomplete": tool_budget_exhausted or (not agent_mode and plan.unfinished),
         "incomplete_reason": "plan_unfinished" if not agent_mode and plan.unfinished else "",
         "plan": plan.export(),

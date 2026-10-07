@@ -681,6 +681,26 @@ async def _execute_job(job_id: str) -> None:
     journal = AgentJournal(db, job_id, job["conversation_id"]) if agent_job else None
     journal_scope = state_scope(provider, job, custom_settings_for_model(provider, job["model"])) if agent_job else ""
     replay_rows = history_rows
+    # Persist tool availability without replaying ordinary tool transcripts.
+    for row in history_rows:
+        if row["role"] != "assistant":
+            continue
+        meta = db.decode(row.get("meta_json", "{}"), {})
+        groups = meta.get("loaded_tool_groups")
+        if groups is None and meta.get("job_id"):
+            old_state = db.one("SELECT payload_json FROM agent_events WHERE job_id=? AND kind='context/state' ORDER BY id DESC LIMIT 1", (meta["job_id"],))
+            if old_state:
+                groups = db.decode(old_state["payload_json"], {}).get("loaded_groups")
+        if isinstance(groups, list):
+            response_options["loaded_tool_groups"] = groups
+            break
+        trace = meta.get("tool_trace") or []
+        if any(item.get("status") == "completed" and (
+                item.get("name") in {"read_file", "write_file", "edit_file", "list_files", "search_files", "run_command", "run_python"}
+                or (item.get("name") == "load_tools" and "files" in str(item.get("path") or "").split(", ")))
+               for item in trace):
+            response_options["loaded_tool_groups"] = ["files"]
+            break
     if agent_job:
         # The newest durable projection already contains preceding history.
         # Load it once, not every older job and its diagnostic request bodies.
@@ -748,7 +768,7 @@ async def _execute_job(job_id: str) -> None:
         (str(item.get("content") or "") for item in reversed(history) if item.get("role") == "user"),
         "",
     )
-    web_evidence_context = _build_web_evidence_context(prior_web_evidence, latest_user_text)
+    web_evidence_context = "" if agent_job else _build_web_evidence_context(prior_web_evidence, latest_user_text)
     db.update_job(job_id, status="running", error="", stop_requested=0)
     last_write = 0.0
     attachment_lock_acquired = False
@@ -761,7 +781,7 @@ async def _execute_job(job_id: str) -> None:
         return not state or bool(state["stop_requested"])
 
     def diagnostics_meta() -> dict[str, Any]:
-        return {key: value for key, value in live_diagnostics.items() if value}
+        return {key: value for key, value in live_diagnostics.items() if value or key == "loaded_tool_groups"}
 
     async def update(state: dict[str, Any]) -> None:
         nonlocal last_write
@@ -769,7 +789,7 @@ async def _execute_job(job_id: str) -> None:
             live_diagnostics["plan"] = state["plan"]
             # Progress checkpoints must not be lost to UI streaming throttling.
             db.update_job(job_id, plan_json=json.dumps(state["plan"] or {}, ensure_ascii=False))
-        for key in ("tool_trace", "round_stats"):
+        for key in ("tool_trace", "round_stats", "loaded_tool_groups"):
             if key in state:
                 live_diagnostics[key] = list(state[key])
         retry_state = state.get("retry_status")
@@ -893,6 +913,7 @@ async def _execute_job(job_id: str) -> None:
                 )
         display_files = agent_workspace.list_files() if agent_job else job_workspace.list_files()
         meta = {"job_id": job_id, "conversation_id": job["conversation_id"], "provider_id": job["provider_id"], "provider_type": kind, "model": job["model"], "chat_mode": job.get("chat_mode") or "standard", "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"], "agents": result.get("agents", []), "workspace_files": display_files}
+        meta["loaded_tool_groups"] = result.get("loaded_tool_groups", response_options.get("loaded_tool_groups", []))
         if result.get("tool_trace"):
             meta["tool_trace"] = result["tool_trace"]
             work_log = build_work_log(result["tool_trace"])
