@@ -71,6 +71,16 @@ class CompactRequestTests(unittest.TestCase):
         self.assertEqual(checkpoint_payload(conversation)["progress_notes"][0], "决定：新建独立兵种")
 
     def test_checkpoint_carries_files_plan_and_sources(self):
+        from app.context_tokens import estimate_tokens, legacy_token_budget
+        self.assertEqual(legacy_token_budget(240_000), 250_000)
+        self.assertEqual(legacy_token_budget(80_000), 20_000)
+        ascii_history = BASE + exchange("ascii", "read_file", {}, "x" * 10_000)
+        cjk_history = BASE + exchange("cjk", "read_file", {}, "中" * 10_000)
+        self.assertLess(estimate_tokens(ascii_history), 8192)
+        self.assertGreater(estimate_tokens(cjk_history), 8192)
+        self.assertIsNone(compact_request(ascii_history, base_message_count=2, budget=8192, measure=estimate_tokens))
+        self.assertIsNotNone(compact_request(cjk_history, base_message_count=2, budget=8192, measure=estimate_tokens))
+        self.assertIn("中" * 10_000, cjk_history[-1]["content"])
         knowledge = FileKnowledge()
         knowledge.record_read({"path": "a.js", "revision": "r1", "line_count": 1, "from_line": 1,
                                "through_line": 1, "truncated": False, "content": "1|x();"})

@@ -138,7 +138,7 @@ class ExecutionPlanTests(unittest.TestCase):
 
 class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
     async def run_loop(self, rounds, protocol="chat_completions", status_sequence=None, settings=None,
-                       record_event=None, messages=None, agent_mode=True, workspace=None, loaded_tool_groups=None):
+                       record_event=None, messages=None, agent_mode=True, workspace=None, loaded_tool_groups=None, usage_sequence=None):
         payloads, executed, updates = [], [], []
         statuses = list(status_sequence or [])
         def event(obj):
@@ -148,6 +148,7 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
                 self.status_code = status_code
             async def aiter_lines(self):
                 actions = rounds.pop(0)
+                sample_usage = (usage_sequence or []).pop(0) if usage_sequence else {}
                 if protocol == "responses":
                     output = []
                     for i, action in enumerate(actions):
@@ -158,7 +159,7 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
                             item = {"type": "function_call", "id": "fc_"+ident, "call_id": ident, "name": name, "arguments": json.dumps(args)}
                             output.append(item)
                             yield event({"type": "response.output_item.done", "output_index": i, "item": item})
-                    yield event({"type": "response.completed", "response": {"id": "resp_"+str(len(payloads)), "output": output, "usage": {}}})
+                    yield event({"type": "response.completed", "response": {"id": "resp_"+str(len(payloads)), "output": output, "usage": sample_usage}})
                 elif protocol == "messages":
                     for i, action in enumerate(actions):
                         if isinstance(action, str):
@@ -168,10 +169,14 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
                             yield event({"type": "content_block_start", "index": i, "content_block": {"type": "tool_use", "id": ident, "name": name, "input": {}}})
                             yield event({"type": "content_block_delta", "index": i, "delta": {"type": "input_json_delta", "partial_json": json.dumps(args)}})
                     yield event({"type": "message_stop"})
+                    if sample_usage:
+                        yield event({"type": "message_delta", "usage": {"input_tokens": sample_usage["input_tokens"], "output_tokens": 1}})
                 else:
                     for i, action in enumerate(actions):
                         delta = {"content": action} if isinstance(action, str) else {"tool_calls": [{"index": i, "id": action[0], "type": "function", "function": {"name": action[1], "arguments": json.dumps(action[2])}}]}
                         yield event({"choices": [{"delta": delta}]})
+                    if sample_usage:
+                        yield event({"usage": {"prompt_tokens": sample_usage["input_tokens"], "completion_tokens": 1}})
                 yield "data: [DONE]"
             async def aread(self):
                 return b""

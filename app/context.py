@@ -192,21 +192,29 @@ def compact_request(
     sources: dict[str, dict[str, str]] | None = None,
     plan: dict[str, Any] | None = None,
     preserve_user_messages: bool = False,
+    measure: Callable[[list[dict[str, Any]]], int] | None = None,
+    fixed_tokens: int = 0,
+    trigger_tokens: int | None = None,
 ) -> dict[str, Any] | None:
-    """Bring the request under ``budget`` chars; return what was done, or None.
+    """Reduce old results toward the budget in the supplied measurement unit.
+
+    Runtime callers measure tokens; legacy utility callers can measure chars.
 
     The returned ``stubbed`` list holds (tool name, arguments) of every result
     replaced this time, so the caller can lift dedupe marks that pointed at
     content which is no longer in the request.
     """
-    if serialized_chars(conversation) <= budget:
+    size = measure or serialized_chars
+    current = trigger_tokens if trigger_tokens is not None else size(conversation) + fixed_tokens
+    if current <= budget:
         return None
-    target = int(budget * LOW_WATER_RATIO)
+    target = max(0, int(budget * LOW_WATER_RATIO) - fixed_tokens)
     base = [dict(message) for message in conversation[:base_message_count]]
     internal = [dict(message) for message in conversation[base_message_count:]]
     previous = checkpoint_payload(base)
 
-    snapshots = knowledge.snapshots(min(int(budget * SNAPSHOT_BUDGET_RATIO), SNAPSHOT_MAX_CHARS)) if knowledge is not None else []
+    snapshot_chars = int(budget * SNAPSHOT_BUDGET_RATIO) * (4 if measure else 1)
+    snapshots = knowledge.snapshots(min(snapshot_chars, SNAPSHOT_MAX_CHARS)) if knowledge is not None else []
     base_instruction = (
         "Older tool results were replaced by one-line stubs to fit the context budget; your own messages and "
         "tool calls are intact. file_snapshots hold the exact current content of files you read or wrote "
@@ -246,13 +254,13 @@ def compact_request(
             base[0] = {**base[0], "content": f"{original}{CONTEXT_CHECKPOINT_MARKER}{text}"}
 
     attach(notes)
-    room = target - serialized_chars(base)
+    room = target - size(base)
     stubbed: list[tuple[str, dict[str, Any]]] = []
     exchanges = _exchanges(internal)
 
     # Pass 1: stub old tool results, oldest exchange first.
     for start, end in exchanges[: max(0, len(exchanges) - PROTECTED_RECENT_EXCHANGES)]:
-        if serialized_chars(internal) <= room:
+        if size(internal) <= room:
             break
         calls = _call_index(internal[start])
         for index in range(start + 1, end):
@@ -268,7 +276,7 @@ def compact_request(
 
     # Pass 2: drop whole old exchanges, keeping the model's words as notes.
     dropped_rounds = 0
-    while serialized_chars(internal) > room and len(_exchanges(internal)) > 1:
+    while size(internal) > room and len(_exchanges(internal)) > 1:
         start, end = _exchanges(internal)[0]
         for message in internal[start:end]:
             if message.get("role") == "assistant":

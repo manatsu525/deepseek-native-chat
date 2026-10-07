@@ -47,11 +47,15 @@ preserve balanced tool groups and are logged separately; original events stay
 on disk. No additional paid summarization requests are introduced. Native
 reasoning fields are retained only for the same route/configuration scope.
 
-The configured `context_budget_chars` is always a fixed compaction trigger,
-including the default 240000. Model window metadata and reported token usage
-do not expand it. Protected recent exchanges are not hard-truncated, so the
-trigger is not a guarantee that every wire request is below that character
-count. Numeric bounds remain 40000–4000000.
+The configured `context_budget_tokens` is a fixed local trigger, default 250000.
+Real provider input usage calibrates the estimate of subsequent input, including
+tool schemas and new tool results. Before the first usage report a local
+text/media estimate is used. Model window metadata does not change the budget.
+Legacy `context_budget_chars` remains only for migration and old history scope;
+default 240000 maps to 250000 tokens, custom values are divided by four.
+Protected recent exchanges are not hard-truncated, so the trigger is not a
+guarantee that every wire request is below that token count. Numeric bounds
+are 8192–4194304 tokens. Estimation error varies across models and media.
 
 Large write/edit arguments are retained verbatim after execution, including
 failed calls. Responses replays original native items and reasoning signatures;

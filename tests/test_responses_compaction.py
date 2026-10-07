@@ -108,7 +108,7 @@ class ResponsesCompactionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(json.loads(calls[0]["arguments"])["content"], content)
                     self.assertIn(reasoning, sent["input"])
                 self.assertEqual(len([item for item in sent["input"] if item.get("type") == "function_call_output"]), 1)
-                self.assertEqual(result["round_stats"][0]["context_budget"], 240_000)
+                self.assertEqual(result["round_stats"][0]["context_budget_tokens"], 250_000)
                 self.assertFalse(result["round_stats"][0].get("arguments_compacted", False))
                 if not failed:
                     self.assertEqual((workspace.root / "game.html").read_text(), content)

@@ -25,6 +25,7 @@ from . import attachments
 from .agent import AgentRuntime, build_agent_skills_prompt
 from .config import settings
 from .context import DEFAULT_CONTEXT_BUDGET_CHARS, MAX_CONTEXT_BUDGET_CHARS, MIN_CONTEXT_BUDGET_CHARS
+from .context_tokens import DEFAULT_TOKEN_BUDGET, MIN_TOKEN_BUDGET, MAX_TOKEN_BUDGET, legacy_token_budget
 from .custom_request import validate_request_overrides, validate_advanced_request
 from .responses_state import state_scope, resume_state
 from .db import Database
@@ -153,6 +154,7 @@ class CustomSettingsBody(BaseModel):
     max_completion_tokens: int = Field(default=65536, ge=256, le=MIMO_MAX_COMPLETION_TOKENS)
     retry_status_codes: list[int] = Field(default_factory=lambda: [503], max_length=20)
     context_budget_chars: int = Field(default=DEFAULT_CONTEXT_BUDGET_CHARS, ge=MIN_CONTEXT_BUDGET_CHARS, le=MAX_CONTEXT_BUDGET_CHARS)
+    context_budget_tokens: int = Field(default=DEFAULT_TOKEN_BUDGET, ge=MIN_TOKEN_BUDGET, le=MAX_TOKEN_BUDGET)
     temperature_enabled: bool = False
     temperature: float = Field(default=1.0, ge=0, le=1.5)
     top_p_enabled: bool = False
@@ -225,6 +227,8 @@ def normalize_custom_settings(value: Any = None) -> dict[str, Any]:
         data.update(value.model_dump())
     elif isinstance(value, dict):
         data.update(value)
+        if "context_budget_tokens" not in value and "context_budget_chars" in value:
+            data["context_budget_tokens"] = legacy_token_budget(value["context_budget_chars"])
     raw_aggregators = data.get("lowest_price_aggregators", [])
     if isinstance(raw_aggregators, str):
         raw_aggregators = [raw_aggregators]

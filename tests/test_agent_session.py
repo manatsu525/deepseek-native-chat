@@ -102,6 +102,23 @@ class AgentSessionTests(unittest.TestCase):
 
 
 class AgentSessionLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_provider_input_tokens_trigger_budget_below_character_threshold(self):
+        for mode in (False, True):
+            for protocol in ("chat_completions", "responses", "messages"):
+                with self.subTest(agent_mode=mode, protocol=protocol):
+                    events = []
+                    result, payloads, _, _ = await loops.PlanLoopTests.run_loop(self,
+                        [[("read", "run_command", {"command": "read"})], ["done"]],
+                        protocol=protocol, agent_mode=mode, settings={"context_budget_tokens": 8192},
+                        usage_sequence=[{"input_tokens": 10_000, "output_tokens": 1}, {}],
+                        record_event=lambda k, p: events.append((k, copy.deepcopy(p))))
+                    self.assertEqual(result["round_stats"][0]["input_tokens"], 10_000)
+                    self.assertLess(result["round_stats"][0]["request_chars"], 40_000)
+                    self.assertTrue(result["round_stats"][0].get("compacted_after"))
+                    self.assertEqual(result["round_stats"][0]["context_budget_tokens"], 8192)
+                    self.assertNotIn("context_budget_tokens", payloads[0])
+                    self.assertNotIn("previous_response_id", payloads[1])
+
     async def test_develop_ordinary_history_is_lean_and_tool_loading_is_persistent(self):
         from app.workspace import ConversationWorkspace
         for protocol, kind in (("chat_completions", "custom"), ("responses", "custom_response"), ("messages", "custom_messages")):

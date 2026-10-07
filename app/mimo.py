@@ -98,6 +98,7 @@ DEFAULT_SETTINGS = {
     # explicitly disables automatic retries for a model.
     "retry_status_codes": [503],
     "context_budget_chars": 240_000,
+    "context_budget_tokens": 250_000,
     "temperature_enabled": False,
     "temperature": 1.0,
     "top_p_enabled": False,
@@ -156,6 +157,9 @@ def _settings(value: dict[str, Any] | None) -> dict[str, Any]:
     result = dict(DEFAULT_SETTINGS)
     if value:
         result.update(value)
+        if "context_budget_tokens" not in value and "context_budget_chars" in value:
+            from .context_tokens import legacy_token_budget
+            result["context_budget_tokens"] = legacy_token_budget(value["context_budget_chars"])
     return result
 
 

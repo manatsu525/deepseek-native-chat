@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import math
 import logging
 import re
 import uuid
@@ -24,6 +25,7 @@ from .agent import HOST_READ_MAX_CHARS, AgentRuntime
 from .prompts import build_system_prompt, files_group_rules
 from .tool_groups import group_of_extra_tool, load_tools_definition, requested_groups
 from .file_knowledge import FileKnowledge
+from .context_tokens import estimate_tokens, normalize_token_budget
 from .context import (
     CONTEXT_CHECKPOINT_MARKER,
     DEFAULT_CONTEXT_BUDGET_CHARS,
@@ -1014,13 +1016,10 @@ async def stream_response(
     if initial_plan and plan.steps and not agent_mode:
         conversation.append({"role": "user", "content": plan.runtime_note()})
         response_chain.reset()
-    context_budget_setting = normalize_budget(config.get("context_budget_chars", DEFAULT_CONTEXT_BUDGET_CHARS))
-    context_budget = effective_context_budget(
-        context_budget_setting,
-        window_tokens=context_window_tokens,
-        request_chars=0,
-        input_tokens=0,
-    )
+    context_budget = normalize_token_budget(config.get("context_budget_tokens"))
+    token_ratio = 1.0
+    def token_size(items: list[dict[str, Any]]) -> int:
+        return math.ceil(estimate_tokens(items) * token_ratio)
     # Host files can also change through shell commands, so their snapshots
     # are revalidated against disk before a checkpoint reuses them.
     knowledge = FileKnowledge(validate=_host_revision if agent_mode else None)
@@ -1044,14 +1043,14 @@ async def stream_response(
         # Historic tool transcripts can now be longer than the former final-only
         # replay. Compact with the existing policy before the first request;
         # protect the newest user request and retain original events on disk.
-        if _serialized_chars(conversation) > context_budget:
+        if token_size(conversation) > context_budget:
             latest_user = next((i for i in range(len(conversation) - 1, 0, -1)
                                 if conversation[i].get("role") == "user"), len(conversation))
             previous = [conversation[0], {"role": "user", "content": "此前执行记录："},
                         *conversation[1:latest_user]]
             compact_request(previous, base_message_count=2,
-                            budget=max(40_000, context_budget - _serialized_chars(conversation[latest_user:])),
-                            knowledge=knowledge, preserve_user_messages=True)
+                            budget=max(8192, context_budget - token_size(conversation[latest_user:])),
+                            knowledge=knowledge, preserve_user_messages=True, measure=token_size)
             conversation = [*previous, *conversation[latest_user:]]
             base_message_count = len(conversation)
             response_chain.reset()
@@ -1212,6 +1211,16 @@ async def stream_response(
                     # checklist. Execution resumes as soon as a valid step is active.
                     round_tools = [UPDATE_PLAN_TOOL]
             final_answer_only = force_final_answer or (tools_expected and not round_tools)
+            pre_compacted = compact_request(
+                conversation, base_message_count=base_message_count, budget=context_budget,
+                knowledge=knowledge, workspace_files=workspace.list_files if workspace is not None else None,
+                sources=sources, plan=plan.export(), measure=token_size,
+                fixed_tokens=math.ceil(estimate_tokens(round_tools) * token_ratio),
+            )
+            if pre_compacted:
+                response_chain.reset()
+                token_ratio = 1.0
+                record("context/checkpoint", {"messages": conversation[1:], "compaction": pre_compacted, "unit": "tokens"})
             mimo_model = is_mimo_model(model)
             request_messages = conversation
             runtime_note_kind = ""
@@ -1318,6 +1327,9 @@ async def stream_response(
                 "messages": len(request_messages),
                 "chained": bool(payload.get("previous_response_id")),
                 "request_chars": _serialized_chars(request_messages),
+                "request_tokens_estimate": token_size(request_messages) + math.ceil(estimate_tokens(round_tools) * token_ratio),
+                "context_budget_tokens": context_budget,
+                "context_budget": context_budget,
                 "final_only": bool(final_answer_only),
             }
             if runtime_note_kind:
@@ -1634,6 +1646,9 @@ async def stream_response(
             if responses_protocol and response_chain.disabled and response_chain.reason:
                 round_stat["chain_state"] = response_chain.reason
             round_stats.append(round_stat)
+            if round_stat["input_tokens"] > 0:
+                # Real input usage includes reused cached tokens and tool schemas.
+                token_ratio = round_stat["input_tokens"] / max(1, estimate_tokens(request_messages) + estimate_tokens(round_tools))
             calls = normalize_tool_calls(_tool_calls(round_tools_by_index, round_number))
             record("model/output", {"round": round_number + 1, "content": round_answer,
                                     "reasoning": round_reasoning, "tool_calls": calls,
@@ -2592,14 +2607,6 @@ async def stream_response(
                 force_final_answer = True
             if responses_protocol:
                 response_chain.pending = _responses_input(conversation[tool_results_start:])
-            if round_stats:
-                context_budget = effective_context_budget(
-                    context_budget_setting,
-                    window_tokens=context_window_tokens,
-                    request_chars=int(round_stats[-1].get("request_chars") or 0),
-                    input_tokens=int(round_stats[-1].get("input_tokens") or 0),
-                )
-                round_stats[-1]["context_budget"] = context_budget
             compacted = compact_request(
                 conversation,
                 base_message_count=base_message_count,
@@ -2608,6 +2615,8 @@ async def stream_response(
                 workspace_files=workspace.list_files if workspace is not None else None,
                 sources=sources,
                 plan=plan.export(),
+                measure=token_size,
+                fixed_tokens=math.ceil(estimate_tokens(round_tools) * token_ratio),
             )
             if compacted:
                 record("context/checkpoint", {"messages": conversation[1:], "compaction": compacted})
@@ -2627,6 +2636,7 @@ async def stream_response(
                     }
                 if responses_protocol:
                     response_chain.reset()
+                token_ratio = 1.0
             # Includes executed-argument trimming and other model-visible
             # projections even when no budget compaction was necessary.
             record("context/checkpoint", {"messages": conversation[1:]})
