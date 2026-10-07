@@ -102,6 +102,53 @@ class AgentSessionTests(unittest.TestCase):
 
 
 class AgentSessionLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_research_and_read_only_work_never_require_file_mutations(self):
+        from app.workspace import ConversationWorkspace
+        class Web:
+            def __init__(self, *_): self.searches = 0
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_): return False
+            async def search(self, query, num_results=10):
+                self.searches += 1
+                return [{"url": f"https://example.test/page{self.searches - 1}", "title": "source", "snippet": "fixture evidence"}]
+            async def fetch(self, url, objective=""): return "fixture rule text"
+        forbidden = ("联网查询已暂停", "现在就写文件", "没有修改任何文件", "先根据已有资料动手", "只读操作已暂停")
+        for protocol in ("chat_completions", "responses", "messages"):
+            for mode in (False, True):
+                with self.subTest(protocol=protocol, agent_mode=mode), tempfile.TemporaryDirectory() as directory:
+                    workspace = ConversationWorkspace(1, "research")
+                    workspace.root = Path(directory)
+                    rounds = [[(f"search{n}", "web_search", {"query": f"distincttopic{n}"}),
+                               (f"fetch{n}", "fetch_webpage", {"url": f"https://example.test/page{n}"})] for n in range(8)]
+                    rounds.append(["explained"])
+                    events = []
+                    with patch.object(mimo_local, "KeylessWebProvider", Web):
+                        result, payloads, executed, _ = await loops.PlanLoopTests.run_loop(self, rounds,
+                            protocol=protocol, agent_mode=mode, workspace=None if mode else workspace,
+                            settings={"web_tool_backend": "keenable"}, web_enabled=True,
+                            messages=[{"role": "user", "content": "解释规则，不要写文件"}],
+                            record_event=lambda k, p: events.append((k, copy.deepcopy(p))))
+                    self.assertEqual(result["answer"], "explained")
+                    self.assertEqual(len(result["tool_trace"]), 16)
+                    self.assertTrue(all(t["status"] == "completed" for t in result["tool_trace"]))
+                    self.assertEqual(workspace.list_files(), [])
+                    self.assertFalse(executed)
+                    for phrase in forbidden:
+                        self.assertNotIn(phrase, json.dumps(payloads, ensure_ascii=False))
+                    self.assertFalse(any(t["name"] in ("write_file", "load_tools") for t in result["tool_trace"]))
+            with self.subTest(protocol=protocol, work="20 reads"), tempfile.TemporaryDirectory() as directory:
+                workspace = ConversationWorkspace(1, "review")
+                workspace.root = Path(directory)
+                for n in range(20): workspace.write_file(f"f{n}.txt", f"content{n}")
+                rounds = [[(f"r{n}", "read_file", {"path": f"f{n}.txt"}),
+                           (f"r{n+1}", "read_file", {"path": f"f{n+1}.txt"})] for n in range(0, 20, 2)]
+                rounds.append(["reviewed"])
+                result, payloads, _, _ = await loops.PlanLoopTests.run_loop(self, rounds, protocol=protocol,
+                    agent_mode=False, workspace=workspace, loaded_tool_groups=["files"])
+                self.assertEqual(result["answer"], "reviewed")
+                self.assertTrue(all(t["status"] == "completed" for t in result["tool_trace"]))
+                for phrase in forbidden: self.assertNotIn(phrase, json.dumps(payloads, ensure_ascii=False))
+
     async def test_provider_input_tokens_trigger_budget_below_character_threshold(self):
         for mode in (False, True):
             for protocol in ("chat_completions", "responses", "messages"):

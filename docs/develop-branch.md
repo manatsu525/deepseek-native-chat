@@ -27,3 +27,8 @@ token budget, default 250000. Provider input usage calibrates local estimates;
 the threshold is not a hard request ceiling. Old default character budgets
 migrate to 250000 tokens, custom character values approximately divide by four.
 Routine smoke tests remain capped at 50, offline only.
+
+No web/read-only progress gate requires a file mutation, command or validation.
+The old mutation counters, write nudges and their refusals have been removed;
+ordinary research never needs an unrelated file operation to unlock tools.
+Normal per-tool quotas and filesystem permissions remain unchanged.

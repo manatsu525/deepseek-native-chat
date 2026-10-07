@@ -134,17 +134,6 @@ HOST_LEGACY_TOOL_ALIASES = {
 # A repeated search that shares this share of its terms with an earlier one is
 # answered from the earlier results instead of being sent upstream again.
 SIMILAR_SEARCH_JACCARD = 0.6
-# Consecutive web calls without any file change, command or validation: warn
-# in the tool result, then refuse further web calls until real progress.
-WEB_STALL_WARN_CALLS = 4
-WEB_STALL_REFUSE_CALLS = 8
-# Tool calls of any kind (reads, commands, searches) without a file change or
-# validation: nag in every result from here on, every few calls.
-MUTATION_STALL_CALLS = 10
-MUTATION_STALL_EVERY = 4
-# From here on, read-only calls are refused until something is written.
-MUTATION_STALL_REFUSE_CALLS = 16
-STALL_REFUSALS_BEFORE_ANSWER = 3
 READ_ONLY_TOOL_NAMES = {
     "read_file", "list_files", "search_files", "web_search", "fetch_webpage",
     "host_read_file", "host_list_files", "host_search_files", "frontend_read_page", "frontend_list_pages",
@@ -451,22 +440,6 @@ def _similar_search(terms: set[str], previous: list[tuple[int, set[str], str]]) 
         if union and len(terms & old_terms) / union >= SIMILAR_SEARCH_JACCARD:
             return index, label
     return None
-
-
-def _web_stall_hint(agent_mode: bool) -> str:
-    if agent_mode:
-        return (
-            "开源项目的源文件（配置、JSON、代码）应该用 run_command 直接获取"
-            "（git clone --depth 1 或 curl -L 原始文件），再在本地读取；网页搜索只返回摘录，拿不到完整文件。"
-        )
-    return "网页搜索只返回摘录；资料仍不足时，请说明缺少哪个具体事实并基于合理假设继续。"
-
-
-def _web_stall_note(count: int, agent_mode: bool) -> str:
-    return (
-        f"\n\n[Runtime note] 已经连续 {count} 次联网查询而没有任何文件修改、命令执行或验证。"
-        "请停止重复研究：用已有资料开始动手，把尚不确定的地方写成明确假设。" + _web_stall_hint(agent_mode)
-    )
 
 
 def _short_hash(value: Any) -> str:
@@ -998,10 +971,6 @@ async def stream_response(
     refused_web_calls = 0
     tool_budget_exhausted = False
     searched_terms: list[tuple[int, set[str], str]] = []
-    web_calls_since_progress = 0
-    calls_since_mutation = 0
-    stall_refusals = 0
-    files_changed = 0
     responses_protocol_enabled = api_protocol == "responses"
     tool_results_start = len(messages) + 1
     round_stats: list[dict[str, Any]] = []
@@ -1787,7 +1756,7 @@ async def stream_response(
                 )
                 if final_answer_attempts < FINAL_ANSWER_ATTEMPTS:
                     continue
-                if tool_trace and (tool_rounds_used >= role_tool_round_limit or stall_refusals >= STALL_REFUSALS_BEFORE_ANSWER):
+                if tool_trace and tool_rounds_used >= role_tool_round_limit:
                     # The tool budget ran out mid-task and the model still
                     # wants tools. Its file changes are already saved, so end
                     # as an incomplete answer the user can continue, not an error.
@@ -1980,14 +1949,6 @@ async def stream_response(
                     # the model calls an exhausted tool with malformed arguments,
                     # tell it to stop using that tool instead of inviting a retry.
                     # tool_rounds_used already counts this round.
-                    if is_search or name == "fetch_webpage":
-                        web_calls_since_progress += 1
-                        if web_calls_since_progress > WEB_STALL_REFUSE_CALLS:
-                            raise ToolQuotaExceeded(
-                                f"联网查询已暂停：连续 {web_calls_since_progress - 1} 次联网而没有任何文件修改、命令执行或验证。"
-                                "先根据已有资料动手（修改文件、运行命令或验证），之后才能继续联网。"
-                                + _web_stall_hint(agent_mode)
-                            )
                     if (is_search or name == "fetch_webpage") and tool_rounds_used > web_round_limit:
                         raise ToolQuotaExceeded(
                             f"联网工具（web_search / fetch_webpage）的轮次额度已用完（最多 {web_round_limit} 轮），"
@@ -2041,29 +2002,6 @@ async def stream_response(
                         raise ValueError("工具参数必须是 JSON 对象")
                     received_keys = sorted(arguments)
                     arguments = normalize_file_tool_arguments(workspace_name if is_workspace else name, arguments)
-                    read_only_mode = workspace_access == "read_only"
-                    if (
-                        not read_only_mode
-                        and calls_since_mutation >= MUTATION_STALL_REFUSE_CALLS
-                        and (workspace_tools_expected or extra_tools_expected)
-                        and _read_only_call(workspace_name if is_workspace else name, arguments)
-                    ):
-                        # Text nudges were ignored for 16 calls: stop the
-                        # exploration loop.
-                        if files_changed:
-                            # The work exists; what follows is re-checking it
-                            # without end. Take the answer after this round.
-                            force_final_answer = True
-                            raise ToolQuotaExceeded(
-                                f"只读操作已结束：文件已经改好之后又连续 {calls_since_mutation} 次读取、搜索或只读命令。"
-                                "现在直接回答用户：列出改动的文件、已做的验证和仍然成立的假设。不要再发起工具调用。"
-                            )
-                        stall_refusals += 1
-                        raise ToolQuotaExceeded(
-                            f"只读操作已暂停：已连续 {calls_since_mutation} 次读取、搜索或只读命令而没有修改任何文件。"
-                            "现在二选一：(1) 用 write_file / edit_file 把已经确定的内容写入文件（不确定之处写成明确假设）；"
-                            "(2) 直接回答用户，说明已了解的情况、已做的判断和还缺什么。不要再发起只读调用。"
-                        )
                     if is_extra:
                         # Keep the live trace useful for host operations without
                         # copying complete file contents or command arguments.
@@ -2494,63 +2432,6 @@ async def stream_response(
                         result_text = f"update_plan 参数无效：{str(exc)[:500]}"
                     else:
                         result_text = f"读取网页失败：{str(exc)[:1000]}。请根据已有搜索结果继续回答，必要时选择其他来源。"
-                if (is_search or name == "fetch_webpage") and WEB_STALL_WARN_CALLS <= web_calls_since_progress <= WEB_STALL_REFUSE_CALLS:
-                    result_text += _web_stall_note(web_calls_since_progress, agent_mode)
-                    step["web_stall_warning"] = web_calls_since_progress
-                progressed = step["status"] == "completed" and (
-                    (is_workspace and workspace_name in WORKSPACE_MUTATION_TOOLS | {"run_python", "run_command", "check_web_syntax"})
-                    or (is_extra and (name in HOST_FILE_MUTATION_TOOLS or name in HOST_COMMAND_TOOLS | HOST_VALIDATION_TOOLS))
-                )
-                if progressed:
-                    web_calls_since_progress = 0
-                mutated = step["status"] == "completed" and (
-                    (is_workspace and workspace_name in WORKSPACE_MUTATION_TOOLS | {"run_python", "run_command", "check_web_syntax"})
-                    or (is_extra and (name in HOST_FILE_MUTATION_TOOLS or name in HOST_VALIDATION_TOOLS))
-                )
-                if not is_plan and not is_load:
-                    calls_since_mutation = 0 if mutated else calls_since_mutation + 1
-                if mutated and (
-                    (is_workspace and workspace_name in WORKSPACE_MUTATION_TOOLS)
-                    or (is_extra and name in HOST_FILE_MUTATION_TOOLS)
-                ):
-                    files_changed += 1
-                read_only_mode = workspace_access == "read_only"
-                if (
-                    not is_plan and not is_load
-                    and not read_only_mode
-                    and calls_since_mutation >= MUTATION_STALL_CALLS
-                    and (calls_since_mutation - MUTATION_STALL_CALLS) % MUTATION_STALL_EVERY == 0
-                    and (workspace_tools_expected or extra_tools_expected)
-                ):
-                    step["mutation_stall_warning"] = calls_since_mutation
-                    if files_changed:
-                        result_text += (
-                            f"\n\n[Runtime note] 文件已经改好之后又连续 {calls_since_mutation} 次工具调用（读取、命令、搜索）。"
-                            "如果你运行的检查已经通过，现在就直接回答用户：列出改动的文件、做过的验证和假设。"
-                            "不要再逐项核对已经确认过的内容。"
-                        )
-                    else:
-                        result_text += (
-                            f"\n\n[Runtime note] 已经连续 {calls_since_mutation} 次工具调用（读取、命令、搜索）而没有修改任何文件。"
-                            "如果方案已经清楚，现在就写文件，不要再确认已经拿到的信息；"
-                            "如果确实还缺一个事实，一次性获取后立即动手，并把无法确认的地方写成明确假设。"
-                        )
-                    if plan.steps:
-                        result_text += "\n当前计划：\n" + plan.render()
-                elif (
-                    not is_plan and not is_load
-                    and read_only_mode
-                    and calls_since_mutation >= MUTATION_STALL_REFUSE_CALLS
-                    and (calls_since_mutation - MUTATION_STALL_REFUSE_CALLS) % MUTATION_STALL_EVERY == 0
-                    and (workspace_tools_expected or extra_tools_expected)
-                ):
-                    step["mutation_stall_warning"] = calls_since_mutation
-                    result_text += (
-                        f"\n\n[Runtime note] 当前排查/只读分析已进行了 {calls_since_mutation} 次检索调用。"
-                        "若已有充分证据与分析结论，请基于已有发现直接回答用户或推进计划。"
-                    )
-                    if plan.steps:
-                        result_text += "\n当前计划：\n" + plan.render()
                 trace_item = {
                     "id": call_id,
                     "name": workspace_name if is_workspace else name,
@@ -2560,7 +2441,7 @@ async def stream_response(
                     "status": step["status"],
                     "error": step["error"],
                 }
-                for field in ("cached", "quota_counted", "received_argument_keys", "received_argument_chars", "similar_to_search", "web_stall_warning", "mutation_stall_warning"):
+                for field in ("cached", "quota_counted", "received_argument_keys", "received_argument_chars", "similar_to_search"):
                     if field in step:
                         trace_item[field] = step[field]
                 if is_workspace and workspace_name == "read_file":
@@ -2601,10 +2482,6 @@ async def stream_response(
             for t in prefetched_tasks.values():
                 if not t.done():
                     t.cancel()
-            if stall_refusals >= STALL_REFUSALS_BEFORE_ANSWER:
-                # It keeps asking to look around after being told to write or
-                # answer: end the tool loop and take the answer it can give.
-                force_final_answer = True
             if responses_protocol:
                 response_chain.pending = _responses_input(conversation[tool_results_start:])
             compacted = compact_request(
