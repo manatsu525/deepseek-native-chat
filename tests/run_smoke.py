@@ -37,7 +37,7 @@ SMOKE_SPECS = (
     "test_plan_execution.PlanLoopTests.test_503_waits_five_seconds_and_reports_recovery",
     "test_plan_execution.PlanLoopTests.test_configured_http_status_retries_with_same_policy",
     "test_agent_tools.AgentToolTests",
-    "test_research_prompt.SystemPromptTests.test_tool_continuation_is_shared_when_file_tools_deferred",
+    "test_custom_responses.CustomResponsesProtocolTests.test_output_token_field_matches_each_custom_protocol",
     "test_custom_responses.CustomResponsesProtocolTests.test_chat_tool_history_becomes_responses_items",
     "test_responses_compaction.ResponsesCompactionTests",
     "test_text_tokens.ContentTokenLimitsTests",

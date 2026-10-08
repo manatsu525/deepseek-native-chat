@@ -32,9 +32,3 @@ No web/read-only progress gate requires a file mutation, command or validation.
 The old mutation counters, write nudges and their refusals have been removed;
 ordinary research never needs an unrelated file operation to unlock tools.
 Normal per-tool quotas and filesystem permissions remain unchanged.
-
-Tool-loop continuity and result-based progress reporting are common system
-rules in both modes, including ordinary web research before file tools load.
-Intermediate text reports new findings or a concrete evidence gap and the next
-action; the substantive user answer belongs at completion. Loading file tools
-does not duplicate these rules or reset the active request.

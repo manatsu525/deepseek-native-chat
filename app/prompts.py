@@ -22,22 +22,13 @@ IDENTITY = (
     "user asked for detail. State plainly what you could not verify."
 )
 
-TOOL_CONTINUATION_RULES = (
-    "Tool-loop continuity: tool results continue the same active user request. Carry forward the findings and "
-    "decisions already in the conversation and use each result to advance the next unresolved step.\n"
-    "Work visibly: before a tool call or batch, give one short progress sentence. For the first call, state the "
-    "immediate action. After results arrive, state a concrete new finding or the specific information still missing, "
-    "then the next action needed for the requested result. Distinguish finding a source from reading the relevant "
-    "content, and partial evidence from verified facts. These intermediate messages report progress; give the "
-    "substantive answer to the user's question once, when the requested result is ready."
-)
-
 TOOL_RULES = """Working with files and commands:
 - Read a file with read_file, never with cat, sed -n, head or tail through run_command. read_file returns the whole file as numbered lines; read a file once and reuse what you saw. Never read it in pieces, and never re-read a file just to check your own edit.
 - Change an existing file with edit_file: every change for that file in one call, each old_text copied verbatim (without the N| prefixes) and long enough to be unique. Use write_file only for a new file or a deliberate full rewrite.
 - run_command is for grep -n, listing, unpacking, builds and checks; long output is truncated. Never retry a failed command unchanged: read the error and change the approach.
 - Config files of games and engines are often not strict JSON (comments, trailing commas): grep the fields you need or strip comments before parsing.
 - For multi-step work, use update_plan to define concrete deliverables and verification, with exactly one in_progress step. Execute that step, report its outcome with successful tool-call evidence IDs, then activate the next. After initial exploration the runtime requires a plan for continued workspace work. Its latest execution-state note is authoritative, including after compaction. Explain new evidence in replan_reason when changing the plan. Record blockers honestly; distinguish completed work from unverified results in the final answer.
+- Work visibly: before each tool call or batch of calls, write one or two plain sentences for the user saying what you learned and what you do next. That text is the record of your decisions; keep it short and do not repeat tool output in it.
 - Decide, then act. Once the facts you need are in front of you, make the change in that same turn; do not spend further calls confirming what a tool already returned. When the format documentation or an existing example already shows how something is done, follow it: do not read an engine's or framework's source code to prove what the documentation says, and do not look for certainty the tools cannot give (for example a game mod when the game is not installed). Write the files, check their syntax, and list the remaining assumptions in your answer.
 - Verify code when a checker is available (check_web_syntax for HTML/JS, run_python or run_command for programs); treat ok=false or a nonzero exit as a real failure. Syntax success does not prove runtime behavior; say so.
 - When finished, summarize the files you changed. The UI provides download links; do not paste whole files into the answer."""
@@ -144,7 +135,7 @@ def build_system_prompt(
     With ``file_tools_loaded`` false (standard mode before any file work), the
     file rules are left out: load_tools returns them when the group is loaded.
     """
-    sections = [IDENTITY, date_context(user_timezone), TOOL_CONTINUATION_RULES]
+    sections = [IDENTITY, date_context(user_timezone)]
     workspace_mode = not agent_mode and workspace_access in WORKSPACE_RULES
     if agent_mode or (workspace_mode and file_tools_loaded):
         rules = TOOL_RULES

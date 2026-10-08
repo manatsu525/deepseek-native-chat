@@ -1,29 +1,9 @@
 import unittest
 
-from app.prompts import build_system_prompt, TOOL_CONTINUATION_RULES, files_group_rules
+from app.prompts import build_system_prompt
 
 
 class SystemPromptTests(unittest.TestCase):
-    def test_tool_continuation_is_shared_when_file_tools_deferred(self) -> None:
-        for agent_mode in (False, True):
-            for backend in ("parallel", "keenable", "legacy"):
-                for file_tools_loaded in (False, True):
-                    with self.subTest(agent=agent_mode, backend=backend, loaded=file_tools_loaded):
-                        kwargs = dict(agent_mode=agent_mode, web_enabled=True, web_backend=backend,
-                                      workspace_access=None if agent_mode else "full", user_timezone="UTC",
-                                      file_tools_loaded=file_tools_loaded)
-                        prompt = build_system_prompt(**kwargs)
-                        self.assertEqual(prompt.count(TOOL_CONTINUATION_RULES), 1)
-                        self.assertIn("same active user request", prompt)
-                        self.assertIn("concrete new finding", prompt)
-                        self.assertIn("specific information still missing", prompt)
-                        self.assertIn("when the requested result is ready", prompt)
-                        self.assertEqual(prompt, build_system_prompt(**kwargs))
-                        if not agent_mode and not file_tools_loaded:
-                            self.assertNotIn("Working with files and commands:", prompt)
-                            self.assertIn("not loaded yet", prompt)
-        self.assertNotIn("Work visibly", files_group_rules("full"))
-
     def test_research_rules_keep_user_terms_exact(self) -> None:
         prompt = build_system_prompt(agent_mode=False, web_enabled=True, web_backend="parallel",
                                      workspace_access="full", user_timezone="UTC")
