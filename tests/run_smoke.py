@@ -40,7 +40,7 @@ SMOKE_SPECS = (
     "test_custom_responses.CustomResponsesProtocolTests.test_output_token_field_matches_each_custom_protocol",
     "test_custom_responses.CustomResponsesProtocolTests.test_chat_tool_history_becomes_responses_items",
     "test_responses_compaction.ResponsesCompactionTests",
-    "test_custom_responses.CustomResponsesConnectionTests",
+    "test_text_tokens.ContentTokenLimitsTests",
     "test_web_evidence.WebEvidenceTests",
     "test_agent_session.AgentSessionLoopTests.test_research_and_read_only_work_never_require_file_mutations",
     "test_agent_session.AgentSessionLoopTests.test_provider_input_tokens_trigger_budget_below_character_threshold",

@@ -33,10 +33,11 @@ class HostReadTests(unittest.TestCase):
             self.assertEqual((result['from_line'], result['through_line'], result['truncated']), (1, 100, False))
             self.assertIn('1|line 1\n', result['content'])
             big = Path(directory) / 'big.txt'
-            big.write_text(''.join(f'{"y" * 99}\n' for _ in range(2000)))
+            big.write_text(''.join(f'{"y " * 75}\n' for _ in range(2000)))
             result = json.loads(runtime.execute('host_read_file', {'path': str(big)}))
             self.assertTrue(result['truncated'])
-            self.assertLessEqual(len(result['content']), agent_module.HOST_READ_MAX_CHARS)
+            from app.text_tokens import count_tokens
+            self.assertLessEqual(count_tokens(result['content']), agent_module.HOST_READ_MAX_TOKENS)
             self.assertEqual(result['next_start_line'], result['through_line'] + 1)
             self.assertEqual(result['line_count'], 2000)
             self.assertTrue(result['revision'])

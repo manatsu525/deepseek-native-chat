@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .text_tokens import truncate_tokens
+
 import json
 import sqlite3
 import threading
@@ -242,8 +244,8 @@ class Database:
                     canonical_url,
                     str(item.get("url") or canonical_url)[:2048],
                     str(item.get("title") or "")[:160],
-                    content[:12000],
-                    str(item.get("summary") or " ".join(content.split())[:320])[:1200],
+                    truncate_tokens(content, 12000),
+                    truncate_tokens(str(item.get("summary") or truncate_tokens(" ".join(content.split()), 320)), 1200),
                     str(item.get("site_name") or "")[:160],
                     str(item.get("publish_time") or "")[:120],
                     timestamp,

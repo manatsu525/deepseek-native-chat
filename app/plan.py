@@ -8,6 +8,8 @@ compaction, instead of re-deriving the approach every round.
 
 from __future__ import annotations
 
+from .text_tokens import count_tokens, truncate_tokens
+
 import json
 import logging
 import re
@@ -15,7 +17,7 @@ import copy
 from typing import Any
 
 MAX_PLAN_ITEMS = 20
-MAX_ITEM_CHARS = 200
+MAX_ITEM_TOKENS = 200
 STATUSES = ("pending", "in_progress", "done", "blocked")
 STEP_ALIASES = ("step", "title", "description", "task", "content", "text", "name", "item")
 STATUS_ALIASES = {"todo": "pending", "not_started": "pending", "open": "pending", "doing": "in_progress",
@@ -27,7 +29,7 @@ STATUS_ALIASES = {"todo": "pending", "not_started": "pending", "open": "pending"
 # API keys, or ordinary tool arguments). Remove this block after the plan
 # contract has been stabilized.
 _PLAN_DEBUG_LOGGER = logging.getLogger("app.plan.debug")
-_PLAN_DEBUG_MAX_CHARS = 24_000
+_PLAN_DEBUG_MAX_TOKENS = 24_000
 
 
 def _plan_debug_json(value: Any) -> str:
@@ -35,9 +37,9 @@ def _plan_debug_json(value: Any) -> str:
         encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     except Exception:
         encoded = repr(value)
-    if len(encoded) <= _PLAN_DEBUG_MAX_CHARS:
+    if count_tokens(encoded) <= _PLAN_DEBUG_MAX_TOKENS:
         return encoded
-    return encoded[:_PLAN_DEBUG_MAX_CHARS] + f"...[truncated chars={len(encoded)}]"
+    return truncate_tokens(encoded, _PLAN_DEBUG_MAX_TOKENS) + f"...[truncated tokens={count_tokens(encoded)}]"
 
 UPDATE_PLAN_TOOL = {
     "type": "function",
@@ -194,7 +196,7 @@ def _parse_step(item: Any) -> tuple[str, str]:
     """Extract (text, status) from one step in any common convention."""
     if isinstance(item, (str, int, float)):
         parsed = _split_plan_text(str(item))
-        return (parsed[0]["step"][:MAX_ITEM_CHARS], parsed[0]["status"]) if parsed else ("", "pending")
+        return (truncate_tokens(parsed[0]["step"], MAX_ITEM_TOKENS), parsed[0]["status"]) if parsed else ("", "pending")
     if not isinstance(item, dict):
         return "", "pending"
     # Models trained on other todo tools send title/description/task/content.
@@ -213,7 +215,7 @@ def _parse_step(item: Any) -> tuple[str, str]:
         status = STATUS_ALIASES.get(status, status)
     if status not in STATUSES:
         status = "pending"
-    return " ".join(text.split())[:MAX_ITEM_CHARS], status
+    return truncate_tokens(" ".join(text.split()), MAX_ITEM_TOKENS), status
 
 
 class TaskPlan:
@@ -252,7 +254,7 @@ class TaskPlan:
         if not steps:
             raise ValueError("每个步骤需要非空的 step 文本")
         self.steps = steps
-        self.note = " ".join(str(arguments.get("note") or "").split())[:1000]
+        self.note = truncate_tokens(" ".join(str(arguments.get("note") or "").split()), 1000)
         self.updates += 1
         done = sum(1 for item in steps if item["status"] == "done")
         return json.dumps(
@@ -389,7 +391,7 @@ class ExecutionPlan(TaskPlan):
                 "steps 必须包含 1–20 个完整步骤", arguments, before, context=debug_context,
                 raw_type=type(raw).__name__, raw_length=len(raw) if isinstance(raw, list) else None,
             )
-        reason = str(arguments.get("replan_reason") or "").strip()[:1000]
+        reason = truncate_tokens(str(arguments.get("replan_reason") or "").strip(), 1000)
         previous = {s["id"]: s for s in self.steps}
         titles = {s["step"]: s for s in self.steps}
         candidate = []
@@ -412,7 +414,7 @@ class ExecutionPlan(TaskPlan):
                     "每个步骤需要 step 和有效的 status", arguments, before, context=debug_context,
                     candidate=candidate, invalid_item=item,
                 )
-            title = " ".join(str(item.get("step") or "").split())[:MAX_ITEM_CHARS]
+            title = truncate_tokens(" ".join(str(item.get("step") or "").split()), MAX_ITEM_TOKENS)
             if not title:
                 self._reject_plan_update(
                     "步骤描述不能为空", arguments, before, context=debug_context,
@@ -440,7 +442,7 @@ class ExecutionPlan(TaskPlan):
                 or (old or {}).get("outcome", "")
             )
             step = {"id": step_id, "step": title, "status": norm_status,
-                    "outcome": str(raw_outcome).strip()[:1000],
+                    "outcome": truncate_tokens(str(raw_outcome).strip(), 1000),
                     "evidence": list((old or {}).get("evidence") or [])}
             status_changed = not old or old["status"] != step["status"]
             if step["status"] == "done" and status_changed:
@@ -546,7 +548,7 @@ class ExecutionPlan(TaskPlan):
                 self.receipts[s["id"]] = []
         self.steps, self.serial = candidate, serial
         if "note" in arguments:
-            self.note = str(arguments.get("note") or "")[:1000]
+            self.note = truncate_tokens(str(arguments.get("note") or ""), 1000)
         self.updates += 1
         self._debug_event("accepted", arguments, before, context=debug_context, candidate=candidate,
                           replan_reason=reason)
@@ -558,7 +560,7 @@ class ExecutionPlan(TaskPlan):
             key = self.active["id"]
             receipts = self.receipts.setdefault(key, [])
             receipts.append({"id": call_id, "tool": name, "status": status, "path": path[:300],
-                             "result": result[:200]})
+                             "result": truncate_tokens(result, 200)})
 
     def _available_evidence(self) -> set[str]:
         """Return successful operation IDs from the whole current plan.

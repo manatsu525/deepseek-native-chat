@@ -134,10 +134,11 @@ class WorkspaceTests(unittest.TestCase):
             self.workspace.read_snapshot("app.js", 9)
 
     def test_only_an_oversized_file_is_split_and_continued(self) -> None:
-        self.workspace.write_file("big.txt", "".join(f"{'z' * 99}\n" for _ in range(1500)))
+        self.workspace.write_file("big.txt", "".join(f"{'z ' * 75}\n" for _ in range(1500)))
         first = self.workspace.read_snapshot("big.txt")
         self.assertTrue(first["truncated"])
-        self.assertLessEqual(len(first["content"]), workspace.MAX_READ_CHARS)
+        from app.text_tokens import count_tokens
+        self.assertLessEqual(count_tokens(first["content"]), workspace.MAX_READ_TOKENS)
         rest = self.workspace.read_snapshot("big.txt", first["next_start_line"])
         self.assertEqual(rest["from_line"], first["through_line"] + 1)
         self.assertEqual(rest["through_line"], 1500)

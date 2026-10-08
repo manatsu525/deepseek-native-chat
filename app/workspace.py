@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .text_tokens import count_tokens, truncate_tokens
+
 import bisect
 import difflib
 import json
@@ -21,7 +23,7 @@ MAX_FILES = 200
 MAX_FILE_BYTES = 512 * 1024
 MAX_TOTAL_BYTES = 10 * 1024 * 1024
 # One read returns a whole file up to this size (typical single-file apps fit).
-MAX_READ_CHARS = 100_000
+MAX_READ_TOKENS = 100_000
 MAX_SEARCH_RESULTS = 20
 AGENT_MAX_FILES = 4_000
 
@@ -168,7 +170,7 @@ class WorkspaceError(ValueError):
 
 
 EXCERPT_CONTEXT_LINES = 2
-EXCERPT_MAX_CHARS = 6_000
+EXCERPT_MAX_TOKENS = 6_000
 _LINE_NUMBER_PREFIX = re.compile(r"^\s*\d+\|")
 
 
@@ -212,11 +214,11 @@ def edited_excerpt(content: str, regions: list[tuple[int, int]]) -> dict[str, An
             rendered.append("...")
         for number in range(first, last + 1):
             text = f"{number}|{lines[number - 1]}"
-            if used + len(text) > EXCERPT_MAX_CHARS:
+            if used + count_tokens(text + "\n") > EXCERPT_MAX_TOKENS:
                 truncated = True
                 break
             rendered.append(text)
-            used += len(text) + 1
+            used += count_tokens(text + "\n")
         if truncated:
             break
     return {"updated_excerpt": "\n".join(rendered), "excerpt_truncated": truncated}
@@ -239,7 +241,7 @@ def _closest_region_hint(content: str, old: str) -> str:
             best_ratio, best_start = ratio, index
     if best_ratio < 0.5:
         return ""
-    shown = [f"{number + 1}|{lines[number][:100]}" for number in range(best_start, min(len(lines), best_start + min(window, 8)))]
+    shown = [f"{number + 1}|{truncate_tokens(lines[number], 100)}" for number in range(best_start, min(len(lines), best_start + min(window, 8)))]
     return "最接近的当前内容：\n" + "\n".join(shown)
 
 
@@ -295,7 +297,7 @@ def expand_file_views(command: str, resolve: Any, max_bytes: int = FILE_VIEW_MAX
     return _FILE_VIEW_RE.sub(replace, command), notes
 
 
-def numbered_window(content: str, start_line: Any = None, max_chars: int = MAX_READ_CHARS) -> dict[str, Any]:
+def numbered_window(content: str, start_line: Any = None, max_tokens: int = MAX_READ_TOKENS) -> dict[str, Any]:
     """Render a file as numbered lines, whole whenever it fits in one response.
 
     ``start_line`` only continues a read that was truncated. If the whole file
@@ -311,9 +313,9 @@ def numbered_window(content: str, start_line: Any = None, max_chars: int = MAX_R
         raise WorkspaceError("start_line 必须大于等于 1")
     if lines and first > len(lines):
         raise WorkspaceError(f"start_line 超出文件范围（共 {len(lines)} 行）")
-    whole_size = sum(len(str(number)) + 2 + len(line) for number, line in enumerate(lines, 1))
+    whole_size = count_tokens("\n".join(f"{number}|{line}" for number, line in enumerate(lines, 1)))
     note = ""
-    if whole_size <= max_chars:
+    if whole_size <= max_tokens:
         if first != 1:
             note = "文件可以一次读完，已忽略 start_line 并返回全文。"
         first = 1
@@ -322,10 +324,10 @@ def numbered_window(content: str, start_line: Any = None, max_chars: int = MAX_R
     through = first - 1 if lines else 0
     for number in range(first, len(lines) + 1):
         text = f"{number}|{lines[number - 1]}"
-        if rendered and used + len(text) + 1 > max_chars:
+        if rendered and used + count_tokens(text + "\n") > max_tokens:
             break
         rendered.append(text)
-        used += len(text) + 1
+        used += count_tokens(text + "\n")
         through = number
     result: dict[str, Any] = {
         "line_count": len(lines),
@@ -606,8 +608,8 @@ class ConversationWorkspace:
 
     def read_file(self, path: Any) -> str:
         content, _ = self._read_text(path)
-        if len(content) > MAX_READ_CHARS:
-            return content[:MAX_READ_CHARS] + "\n\n[内容过长，已截断]"
+        if count_tokens(content) > MAX_READ_TOKENS:
+            return truncate_tokens(content, MAX_READ_TOKENS) + "\n\n[内容过长，已截断]"
         return content
 
     @staticmethod
@@ -700,7 +702,7 @@ class ConversationWorkspace:
                 continue
             for number, line in enumerate(lines, 1):
                 if folded in line.casefold():
-                    matches.append({"path": file_path.relative_to(self.root).as_posix(), "line": number, "text": line[:300]})
+                    matches.append({"path": file_path.relative_to(self.root).as_posix(), "line": number, "text": truncate_tokens(line, 300)})
                     if len(matches) >= MAX_SEARCH_RESULTS:
                         return {"matches": matches, "truncated": True}
         return {"matches": matches, "truncated": False}

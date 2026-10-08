@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .text_tokens import count_tokens, truncate_tokens, upstream_char_ceiling
+
 import json
 import re
 from typing import Any
@@ -8,7 +10,7 @@ import httpx
 
 
 MCP_PROTOCOL = "2025-03-26"
-MAX_PAGE_CHARS = 8000
+MAX_PAGE_TOKENS = 8000
 
 PROVIDERS: dict[str, dict[str, Any]] = {
     "keenable": {
@@ -77,7 +79,7 @@ KEYLESS_FETCH_WEBPAGE_TOOL = {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "要读取的公开 http/https 内容页 URL"},
-                "objective": {"type": "string", "description": "希望从网页中核实的信息，可选，最多 200 字符"},
+                "objective": {"type": "string", "description": "希望从网页中核实的信息，可选，最多 200 token"},
             },
             "required": ["url"],
             "additionalProperties": False,
@@ -122,12 +124,12 @@ class KeylessWebProvider:
         self._client = None
 
     async def search(self, query: str, limit: int = 10) -> list[dict[str, str]]:
-        query = " ".join(str(query or "").split())[:500]
+        query = truncate_tokens(" ".join(str(query or "").split()), 500)
         if not query:
             raise ValueError("搜索词不能为空")
         limit = max(1, min(int(limit), 10))
         if self.provider == "keenable":
-            arguments = {"query": query, "mode": "pro", "snippet_max_length": 500}
+            arguments = {"query": query, "mode": "pro", "snippet_max_length": 10000}
         elif self.provider == "tavily":
             arguments = {
                 "query": query,
@@ -166,8 +168,8 @@ class KeylessWebProvider:
             results.append(
                 {
                     "url": url[:2000],
-                    "title": title[:300],
-                    "snippet": " ".join(snippet.split())[:500],
+                    "title": truncate_tokens(title, 300),
+                    "snippet": truncate_tokens(" ".join(snippet.split()), 500),
                     "publish_date": str(
                         item.get("publish_date")
                         or item.get("published_date")
@@ -184,11 +186,11 @@ class KeylessWebProvider:
         return results
 
     async def fetch(self, url: str, objective: str = "") -> str:
-        objective = " ".join(str(objective or "").split())[:200]
+        objective = truncate_tokens(" ".join(str(objective or "").split()), 200)
         if self.provider == "you":
             raise KeylessWebError("You.com Free 不提供网页抓取，应复用 Jina Reader")
         if self.provider == "keenable":
-            arguments: dict[str, Any] = {"url": url, "live": True, "max_chars": MAX_PAGE_CHARS}
+            arguments: dict[str, Any] = {"url": url, "live": True, "max_chars": upstream_char_ceiling(MAX_PAGE_TOKENS)}
         elif self.provider == "tavily":
             arguments = {
                 "urls": [url],
@@ -211,8 +213,8 @@ class KeylessWebProvider:
         content = _page_content(self.provider, payload, text).strip()
         if not content:
             raise KeylessWebError(f"{self.label} 未返回可用网页正文")
-        if len(content) > MAX_PAGE_CHARS:
-            content = content[:MAX_PAGE_CHARS].rstrip() + "\n\n[网页内容已截断，仅保留前面部分]"
+        if count_tokens(content) > MAX_PAGE_TOKENS:
+            content = truncate_tokens(content, MAX_PAGE_TOKENS).rstrip() + "\n\n[网页内容已截断，仅保留前面部分]"
         return content
 
     async def _initialize(self) -> None:
@@ -270,7 +272,7 @@ class KeylessWebProvider:
             if isinstance(item, dict) and item.get("type") == "text"
         ).strip()
         if result.get("isError"):
-            raise KeylessWebError((text or f"{self.label} 工具 {name} 执行失败")[:1000])
+            raise KeylessWebError(truncate_tokens(text or f"{self.label} 工具 {name} 执行失败", 1000))
         structured = result.get("structuredContent")
         return (structured if isinstance(structured, dict) else {}), text
 
@@ -292,7 +294,7 @@ class KeylessWebProvider:
 
 def _decode_response(response: httpx.Response, label: str) -> dict[str, Any]:
     if response.status_code >= 400:
-        detail = response.text.strip().replace("\n", " ")[:500]
+        detail = truncate_tokens(response.text.strip().replace("\n", " "), 500)
         raise KeylessWebError(f"{label} MCP HTTP {response.status_code}{'：' + detail if detail else ''}")
     if "text/event-stream" in response.headers.get("content-type", "").casefold():
         events: list[dict[str, Any]] = []
@@ -319,7 +321,7 @@ def _raise_rpc_error(data: dict[str, Any], label: str) -> None:
     if not error:
         return
     message = str(error.get("message") or error) if isinstance(error, dict) else str(error)
-    raise KeylessWebError(f"{label} MCP：{message[:1000]}")
+    raise KeylessWebError(f"{label} MCP：{truncate_tokens(message, 1000)}")
 
 
 def _payload(structured: dict[str, Any], text: str) -> dict[str, Any]:
@@ -337,7 +339,7 @@ def _raise_service_error(label: str, payload: dict[str, Any]) -> None:
         return
     if payload.get("success") is False or (payload.get("code") and not payload.get("results")):
         message = payload.get("message") or payload.get("error") or payload.get("code")
-        raise KeylessWebError(f"{label}：{str(message)[:1000]}")
+        raise KeylessWebError(f"{label}：{truncate_tokens(str(message), 1000)}")
 
 
 def _search_items(provider: str, payload: dict[str, Any], text: str) -> list[dict[str, Any]]:

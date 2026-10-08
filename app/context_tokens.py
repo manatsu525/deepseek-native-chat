@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from typing import Any
+from .text_tokens import count_tokens
 
 DEFAULT_TOKEN_BUDGET = 250_000
 MIN_TOKEN_BUDGET = 8192
@@ -51,5 +51,4 @@ def estimate_tokens(value: Any) -> int:
                 result[key] = project(part)
         return result
     text = json.dumps(project(value), ensure_ascii=False, separators=(",", ":"))
-    cjk = len(re.findall(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]", text))
-    return extras + math.ceil((len(text) - cjk) / 4 + cjk)
+    return extras + count_tokens(text)

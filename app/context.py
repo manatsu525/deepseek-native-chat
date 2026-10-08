@@ -15,6 +15,8 @@ and the sources it found. It is rebuilt only when compaction runs.
 
 from __future__ import annotations
 
+from .text_tokens import count_tokens, truncate_tokens
+
 import json
 from collections.abc import Callable
 from typing import Any
@@ -25,8 +27,8 @@ from .file_knowledge import FileKnowledge
 DEFAULT_CONTEXT_BUDGET_CHARS = 240_000
 MIN_CONTEXT_BUDGET_CHARS = 40_000
 MAX_CONTEXT_BUDGET_CHARS = 4_000_000
-# Snapshots in the checkpoint never take more than this many characters.
-SNAPSHOT_MAX_CHARS = 200_000
+# Snapshots in the runtime checkpoint never take more than this many tokens.
+SNAPSHOT_MAX_TOKENS = 200_000
 LOW_WATER_RATIO = 0.6
 # The newest exchanges are never stubbed: the model is acting on them now.
 PROTECTED_RECENT_EXCHANGES = 2
@@ -35,7 +37,7 @@ STUB_MIN_CHARS = 400
 # Share of the budget the checkpoint's file snapshots may use.
 SNAPSHOT_BUDGET_RATIO = 0.35
 PROGRESS_NOTE_COUNT = 12
-PROGRESS_NOTE_CHARS = 400
+PROGRESS_NOTE_TOKENS = 400
 CONTEXT_CHECKPOINT_MARKER = "\n\nCONTEXT CHECKPOINT:\n"
 STUB_PREFIX = "[已省略的工具结果] "
 READ_TOOLS = {"read_file", "host_read_file", "frontend_read_page"}
@@ -213,8 +215,8 @@ def compact_request(
     internal = [dict(message) for message in conversation[base_message_count:]]
     previous = checkpoint_payload(base)
 
-    snapshot_chars = int(budget * SNAPSHOT_BUDGET_RATIO) * (4 if measure else 1)
-    snapshots = knowledge.snapshots(min(snapshot_chars, SNAPSHOT_MAX_CHARS)) if knowledge is not None else []
+    snapshot_budget = int(budget * SNAPSHOT_BUDGET_RATIO)
+    snapshots = knowledge.snapshots(min(snapshot_budget, SNAPSHOT_MAX_TOKENS), measure=count_tokens if measure else len) if knowledge is not None else []
     base_instruction = (
         "Older tool results were replaced by one-line stubs to fit the context budget; your own messages and "
         "tool calls are intact. file_snapshots hold the exact current content of files you read or wrote "
@@ -226,7 +228,7 @@ def compact_request(
         "instruction": base_instruction,
         "file_snapshots": snapshots,
         "sources": [
-            {"url": item.get("url", ""), "title": item.get("title", ""), "summary": str(item.get("summary") or "")[:200]}
+            {"url": item.get("url", ""), "title": item.get("title", ""), "summary": truncate_tokens(str(item.get("summary") or ""), 200)}
             for item in list((sources or {}).values())[:30]
         ],
     }
@@ -282,7 +284,7 @@ def compact_request(
             if message.get("role") == "assistant":
                 text = " ".join(str(message.get("content") or "").split())
                 if text:
-                    notes.append(text[:PROGRESS_NOTE_CHARS])
+                    notes.append(truncate_tokens(text, PROGRESS_NOTE_TOKENS))
         if preserve_user_messages:
             # Cross-turn Agent replay contains user requests between tool
             # exchanges. Never drop those requests together with old tools.

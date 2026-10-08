@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .text_tokens import count_tokens, truncate_tokens, upstream_char_ceiling
+
 import asyncio
 import re
 import time
@@ -23,8 +25,8 @@ MIMO_MAX_SEARCHES = 8
 MIMO_MAX_SEARCH_RESULTS = 10
 JINA_READER_PREFIX = "https://r.jina.ai/"
 JINA_MAX_FETCHES_PER_RESPONSE = 8
-JINA_MAX_CHARS = 8000
-JINA_MAX_BYTES = 40000
+JINA_MAX_TOKENS = 8000
+JINA_MAX_BYTES = upstream_char_ceiling(JINA_MAX_TOKENS)
 JINA_RATE_LIMIT = 20
 JINA_RATE_WINDOW = 60.0
 DDG_SEARCH_ENDPOINTS = (
@@ -36,7 +38,7 @@ DDG_CONNECT_TIMEOUT = 3
 DDG_RATE_LIMIT = 12
 DDG_RATE_WINDOW = 60.0
 DDG_COOLDOWN_SECONDS = 120.0
-DDG_MAX_SNIPPET_CHARS = 500
+DDG_MAX_SNIPPET_TOKENS = 500
 DDG_BROWSER_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -295,7 +297,7 @@ def _parse_ddg_results(html: str, limit: int) -> list[dict[str, str]]:
             re.IGNORECASE | re.DOTALL,
         )
         snippet = _html_text(snippet_match.group(2)) if snippet_match else ""
-        results.append({"title": title[:300], "url": url[:2000], "snippet": snippet[:DDG_MAX_SNIPPET_CHARS]})
+        results.append({"title": truncate_tokens(title, 300), "url": url[:2000], "snippet": truncate_tokens(snippet, DDG_MAX_SNIPPET_TOKENS)})
         if len(results) >= limit:
             break
     return results
@@ -348,7 +350,7 @@ async def _duckduckgo_search(
     limit: int,
     stopped: Callable[[], bool],
 ) -> list[dict[str, str]]:
-    query = " ".join(str(query or "").split())[:500]
+    query = truncate_tokens(" ".join(str(query or "").split()), 500)
     if not query:
         raise ValueError("搜索词不能为空")
     errors: list[str] = []
@@ -538,15 +540,15 @@ async def _read_with_jina(client: Any, url: str, stopped: Callable[[], bool]) ->
     header, separator, markdown_body = content.partition("Markdown Content:")
     if separator and not markdown_body.strip() and ("warning:" in header.casefold() or "error" in header.casefold()):
         raise RuntimeError("Jina Reader 未返回可用网页正文")
-    if len(content) > JINA_MAX_CHARS:
-        content = content[:JINA_MAX_CHARS].rstrip() + "\n\n[网页内容已截断，仅保留前面部分]"
+    if count_tokens(content) > JINA_MAX_TOKENS:
+        content = truncate_tokens(content, JINA_MAX_TOKENS).rstrip() + "\n\n[网页内容已截断，仅保留前面部分]"
     return content
 
 
 def _page_title(content: str, url: str) -> str:
     match = re.search(r"^#\s+(.+?)\s*$", content, re.MULTILINE)
     if match:
-        return match.group(1)[:160]
+        return truncate_tokens(match.group(1), 160)
     return urlsplit(url).netloc.removeprefix("www.") or url
 
 
@@ -555,7 +557,7 @@ def _page_source(url: str, content: str) -> dict[str, str]:
     return {
         "url": url,
         "title": _page_title(content, url),
-        "summary": compact[:320],
+        "summary": truncate_tokens(compact, 320),
         "site_name": urlsplit(url).netloc.removeprefix("www."),
         "publish_time": "",
         "logo_url": "",
@@ -678,7 +680,7 @@ PARALLEL_FETCH_WEBPAGE_TOOL = {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "要读取的公开 http/https 内容页 URL"},
-                "objective": {"type": "string", "description": "希望从该网页中找到的信息，最多 200 字符"},
+                "objective": {"type": "string", "description": "希望从该网页中找到的信息，最多 200 token"},
             },
             "required": ["url"],
             "additionalProperties": False,

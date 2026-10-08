@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .text_tokens import count_tokens, truncate_tokens
+
 import asyncio
 import hashlib
 import io
@@ -56,8 +58,8 @@ secret = b""
 tasks: dict[str, asyncio.Task[Any]] = {}
 MAX_CONCURRENT_JOBS = 2
 WEB_EVIDENCE_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
-WEB_EVIDENCE_CONTEXT_MAX_CHARS = 16_000
-WEB_EVIDENCE_PER_SOURCE_MAX_CHARS = 6_000
+WEB_EVIDENCE_CONTEXT_MAX_TOKENS = 16_000
+WEB_EVIDENCE_PER_SOURCE_MAX_TOKENS = 6_000
 job_slots: Optional[asyncio.Semaphore] = None
 attachment_cleanup_task: Optional[asyncio.Task[Any]] = None
 attachment_upload_locks: dict[int, asyncio.Lock] = {}
@@ -190,7 +192,7 @@ class CustomModelSettingsBody(CustomSettingsBody):
 
 class ChatBody(BaseModel):
     conversation_id: Optional[str] = None
-    content: str = Field(default="", max_length=100_000)
+    content: str = Field(default="")
     attachment_ids: list[str] = Field(default_factory=list, max_length=attachments.MAX_ATTACHMENTS)
     provider_id: int
     model: str = ""
@@ -564,25 +566,25 @@ def _build_web_evidence_context(
         "you may search or read a genuinely new source.\n\n"
     )
     blocks: list[str] = []
-    used = len(header)
+    used = count_tokens(header)
     for index, item in enumerate(ranked, 1):
         content = str(item.get("content") or item.get("summary") or "").strip()
         if not content:
             continue
-        content = content[:WEB_EVIDENCE_PER_SOURCE_MAX_CHARS]
+        content = truncate_tokens(content, WEB_EVIDENCE_PER_SOURCE_MAX_TOKENS)
         block = (
             f"[Previously read source {index}]\n"
             f"URL: {str(item.get('url') or item.get('canonical_url') or '')[:2048]}\n"
             f"Title: {str(item.get('title') or '')[:160]}\n"
             f"Content:\n{content}\n\n"
         )
-        if used + len(block) > WEB_EVIDENCE_CONTEXT_MAX_CHARS:
-            remaining = WEB_EVIDENCE_CONTEXT_MAX_CHARS - used
+        if used + count_tokens(block) > WEB_EVIDENCE_CONTEXT_MAX_TOKENS:
+            remaining = WEB_EVIDENCE_CONTEXT_MAX_TOKENS - used
             if remaining > 300:
-                blocks.append(block[:remaining].rstrip() + "\n[Earlier evidence block truncated]\n")
+                blocks.append(truncate_tokens(block, remaining).rstrip() + "\n[Earlier evidence block truncated]\n")
             break
         blocks.append(block)
-        used += len(block)
+        used += count_tokens(block)
     return header + "".join(blocks) if blocks else ""
 
 
@@ -980,7 +982,7 @@ async def _execute_job(job_id: str) -> None:
             )
         db.update_job(job_id, status="stopped", error="")
     except Exception as exc:
-        error = str(exc)[:3000]
+        error = truncate_tokens(str(exc), 3000)
         partial = db.one(
             "SELECT answer,reasoning,searches_json,sources_json,usage_json,agents_json FROM jobs WHERE id=?",
             (job_id,),
@@ -1139,7 +1141,7 @@ def install_skill(body: SkillInstallBody, _: dict[str, Any] = Depends(admin_user
         skill = registry.install(body.source, body.name)
         registry.set_enabled(skill.skill_id, True)
     except (ValueError, RuntimeError, OSError) as exc:
-        raise HTTPException(400, str(exc)[:4_000]) from exc
+        raise HTTPException(400, truncate_tokens(str(exc), 4000)) from exc
     return {"skill": public_skill(skill, True)}
 
 
@@ -1152,7 +1154,7 @@ def read_skill(skill_id: str, _: dict[str, Any] = Depends(current_user)) -> dict
     try:
         content = registry.read(skill.skill_id)
     except (OSError, UnicodeDecodeError, ValueError) as exc:
-        raise HTTPException(400, str(exc)[:4_000]) from exc
+        raise HTTPException(400, truncate_tokens(str(exc), 4000)) from exc
     return {"skill": public_skill(skill, skill.skill_id in set(registry.enabled_ids())), "content": content}
 
 
@@ -1163,7 +1165,7 @@ def set_skill_enabled(skill_id: str, body: SkillEnabledBody, _: dict[str, Any] =
         enabled = registry.set_enabled(skill_id, body.enabled)
         skill = registry.find(skill_id)
     except ValueError as exc:
-        raise HTTPException(404, str(exc)[:4_000]) from exc
+        raise HTTPException(404, truncate_tokens(str(exc), 4000)) from exc
     if skill is None:
         raise HTTPException(404, "Skill 不存在")
     return {"skill": public_skill(skill, skill.skill_id in set(enabled)), "enabled": enabled}
@@ -1176,7 +1178,7 @@ def remove_skill(skill_id: str, _: dict[str, Any] = Depends(admin_user)) -> dict
     except ValueError as exc:
         message = str(exc)
         status = 404 if "不存在" in message else 400
-        raise HTTPException(status, message[:4_000]) from exc
+        raise HTTPException(status, truncate_tokens(message, 4000)) from exc
     return {"ok": True, "skill_id": skill_id}
 
 
@@ -1891,6 +1893,8 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
     validate_provider_selection(kind, model, provider)
     validate_effort(body.effort)
     content = body.content.strip()
+    if count_tokens(content) > 100_000:
+        raise HTTPException(400, "消息不能超过 100000 token")
     attachment_ids = list(dict.fromkeys(body.attachment_ids))
     if any(not re.fullmatch(r"[a-f0-9]{32}", item) for item in attachment_ids):
         raise HTTPException(400, "无效的附件标识")

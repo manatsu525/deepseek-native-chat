@@ -124,7 +124,7 @@ class FileKnowledge:
             )
         return result
 
-    def snapshots(self, budget: int) -> list[dict[str, Any]]:
+    def snapshots(self, budget: int, *, measure=len) -> list[dict[str, Any]]:
         """Current content for a checkpoint, newest first within ``budget``.
 
         Entries that do not fit, or whose file changed behind our back, are
@@ -140,7 +140,7 @@ class FileKnowledge:
             for first, through, content in sorted(entry["ranges"]):
                 snapshot = {"path": path, "revision": entry["revision"], "line_count": entry["line_count"],
                             "from_line": first, "through_line": through, "content": content}
-                size = len(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")))
+                size = measure(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")))
                 if used + size > budget:
                     entry["ranges"] = [item for item in entry["ranges"] if item[0] != first or item[1] != through]
                     continue
