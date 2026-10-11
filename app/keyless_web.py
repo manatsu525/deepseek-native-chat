@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .page_focus import focus_page
+from .page_documents import READ_PROPERTIES, READ_DESCRIPTION
 from .text_tokens import truncate_tokens, upstream_char_ceiling
 
 import json
@@ -75,12 +75,13 @@ KEYLESS_FETCH_WEBPAGE_TOOL = {
     "type": "function",
     "function": {
         "name": "fetch_webpage",
-        "description": "使用当前选定的网页抓取服务读取一个公开内容页并返回 Markdown 正文。这不是搜索工具；URL 应来自用户或 web_search 的结果。",
+        "description": "URL 应来自用户或 web_search 的结果。" + READ_DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "要读取的公开 http/https 内容页 URL"},
                 "objective": {"type": "string", "description": "希望从网页中核实的信息，可选，最多 200 token"},
+                **READ_PROPERTIES,
             },
             "required": ["url"],
             "additionalProperties": False,
@@ -199,8 +200,6 @@ class KeylessWebProvider:
                 "format": "markdown",
                 "include_images": False,
             }
-            if objective:
-                arguments["query"] = objective
         else:
             arguments = {
                 "url": url,
@@ -221,7 +220,11 @@ class KeylessWebProvider:
         content = _page_content(self.provider, payload, text).strip()
         if not content:
             raise KeylessWebError(f"{self.label} 未返回可用网页正文")
-        return focus_page(content, MAX_PAGE_TOKENS, objective, queries)
+        if self.provider == "keenable" and len(content) >= arguments["max_chars"]:
+            content += "\n[PROVIDER_SOURCE_TRUNCATED]"
+        if self.provider == "tavily" and not (payload.get("results") or [{}])[0].get("raw_content"):
+            content += "\n[PROVIDER_SOURCE_TRUNCATED]"
+        return content
 
     async def _initialize(self) -> None:
         if self._initialized:

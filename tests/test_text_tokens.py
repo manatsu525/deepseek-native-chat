@@ -39,7 +39,7 @@ class ContentTokenLimitsTests(unittest.IsolatedAsyncioTestCase):
         page = await provider.fetch('https://example.com')
         body = page.split('\n\n[网页内容已截断')[0]
         self.assertGreater(len(body), 8000)
-        self.assertLessEqual(count_tokens(body), 8000)
+        self.assertEqual(page, content.strip())  # raw source retained; reads have their own budget
         self.assertGreater(provider._call_tool.call_args.args[1]['max_chars'], 8000)
 
     def check_files_and_command_output_keep_more_text_without_changing_numbers(self):

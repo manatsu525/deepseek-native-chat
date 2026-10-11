@@ -514,6 +514,8 @@ def public_attachment(row: dict[str, Any]) -> dict[str, Any]:
 async def periodic_attachment_cleanup() -> None:
     while True:
         try:
+            from .page_documents import cleanup_page_documents
+            await asyncio.to_thread(cleanup_page_documents)
             expired = await asyncio.to_thread(
                 db.cleanup_expired_attachments,
                 now() - attachments.ATTACHMENT_TTL_SECONDS,

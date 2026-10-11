@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .page_focus import focus_page
+from .page_documents import READ_PROPERTIES, READ_DESCRIPTION
 from .text_tokens import truncate_tokens, upstream_char_ceiling
 
 import asyncio
@@ -544,8 +544,10 @@ async def _read_with_jina(
     if separator and not markdown_body.strip() and ("warning:" in header.casefold() or "error" in header.casefold()):
         raise RuntimeError("Jina Reader 未返回可用网页正文")
     # Jina serves its cache by default (no X-No-Cache), so there is no
-    # cached-copy retry here; long pages are fitted around the objective.
-    return focus_page(content, JINA_MAX_TOKENS, objective, queries)
+    # cached-copy retry here; the returned source is retained in the local cache.
+    if size >= JINA_MAX_BYTES:
+        content += "\n[PROVIDER_SOURCE_TRUNCATED]"
+    return content
 
 
 def _page_title(content: str, url: str) -> str:
@@ -635,12 +637,13 @@ FETCH_WEBPAGE_TOOL = {
     "type": "function",
     "function": {
         "name": "fetch_webpage",
-        "description": "读取一个已经找到的公开内容页、文档页或 PDF，并转换成干净 Markdown。这不是搜索工具。只能传入用户消息或本地 web_search 返回的精确 URL；禁止编造 URL，禁止传入搜索引擎结果页。没有合格 URL 时应先使用 web_search。",
+        "description": "URL 必须来自用户或 web_search。" + READ_DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "要读取的公开 http/https URL"},
-                "objective": {"type": "string", "description": "希望从该网页中找到的具体信息。长网页超过读取上限时，按它保留最相关的片段"},
+                "objective": {"type": "string", "description": "本次读取要查明的具体信息"},
+                **READ_PROPERTIES,
             },
             "required": ["url"],
             "additionalProperties": False,
@@ -679,12 +682,13 @@ PARALLEL_FETCH_WEBPAGE_TOOL = {
     "type": "function",
     "function": {
         "name": "fetch_webpage",
-        "description": "通过 Parallel Search MCP 读取一个真实内容页的正文；长网页超过读取上限时按 objective 保留最相关的片段。仅当搜索摘录不足、需要原文细节或用户指定了 URL 时使用；不要默认读取每条搜索结果。URL 必须来自用户或本地 web_search。",
+        "description": "通过 Parallel 读取，URL 必须来自用户或 web_search。" + READ_DESCRIPTION,
         "parameters": {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "要读取的公开 http/https 内容页 URL"},
-                "objective": {"type": "string", "description": "希望从该网页中找到的具体信息，最多 200 token。长网页按它保留最相关的片段"},
+                "objective": {"type": "string", "description": "希望从网页中查明的信息，最多200 token"},
+                **READ_PROPERTIES,
             },
             "required": ["url"],
             "additionalProperties": False,

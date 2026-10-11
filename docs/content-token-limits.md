@@ -37,18 +37,31 @@ ceiling, then the application applies its 8,000-token allowance. Keenable
 search requests the provider's maximum supported 10,000-character snippet,
 then applies 500 tokens locally. Providers can still impose their own limits.
 
-A fetched page longer than its 8,000-token allowance is no longer cut to its
-first 8,000 tokens. Parallel (full content), Keenable and Jina (You) pages keep
-their beginning plus the passages matching the fetch `objective` and the last
-search queries, in document order with explicit gaps (`app/page_focus.py`).
+A fetched page's entire provider-returned text is saved outside the model's
+context in `data/page-cache`, isolated by conversation. Short pages return in
+full. Long pages initially return a directory, relevant headings and a short
+preview rather than an unrelated 8,000-token prefix. Subsequent reads return
+contiguous numbered text; the model
+can use `fetch_webpage(mode="find", query=...)` to locate a chapter and then
+`start_line` / `end_line` to read it completely. Each read defaults to 8,000
+tokens and can request up to 32,000; `complete=false` and `next_line` explicitly
+identify unread text. Subsequent reads use the full local source, even after
+network fetch quota is exhausted, without issuing a provider request.
+Legacy excerpt caches and known provider truncation are marked
+`source_complete=false`; `refresh=true` explicitly requests a new network
+fetch when that partial source is insufficient. No local retrieval scheme can
+recover content that the provider itself did not return.
+Cache files expire after seven days without use. Cleanup runs every six hours
+and evicts oldest files if the cache exceeds 512 MB. Only owned cache files
+are removed; uploaded files and workspace files are not affected.
 When Keenable's live crawl is refused it retries from Keenable's cache
 (`live: false`); Parallel retries with `allow_live_fetch: false`. Jina already
 serves its cache by default.
 
 Already-truncated uploaded files and cached records are preserved, not silently
 deleted or regenerated. Re-upload/re-fetch when the missing original content
-is needed. This change does not alter live-fetch policy, objective forwarding,
-tool quotas, retry policy, permissions or history-replay strategy.
+is needed. Search providers, network quotas, permissions and history-replay
+strategy remain unchanged; local reads do not consume network fetch quota.
 
 Verification is offline: Unicode and special-token text, head/tail clipping,
 char-only MCP requests, numbered-file continuation, uploads, caches and the
