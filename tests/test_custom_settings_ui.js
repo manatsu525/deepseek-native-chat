@@ -4,7 +4,7 @@ const vm=require('vm');
 const source=fs.readFileSync('static/app.js','utf8');
 const nodes=new Map(),pending=[];
 const node=id=>{if(!nodes.has(id))nodes.set(id,{value:'',checked:false,disabled:false,readOnly:false,textContent:'',close(){}});return nodes.get(id)};
-const provider={id:1,provider_type:'custom',model_settings:{a:{temperature_enabled:true,temperature:0.8,top_p_enabled:true,top_p:0.9},b:{temperature_enabled:true,temperature:0.6,top_p_enabled:true,top_p:0.9}}};
+const provider={id:1,provider_type:'custom',model_settings:{a:{temperature_enabled:true,temperature:0.8,top_p_enabled:true,top_p:0.9,context_budget_tokens:100000},b:{temperature_enabled:true,temperature:0.6,top_p_enabled:true,top_p:0.9}}};
 let model='a';
 const context=vm.createContext({console,JSON,Number,Set,setTimeout,clearTimeout,
   $:node,selectedModel:()=>model,selectedProvider:()=>provider,syncCustomThinkingFields:()=>{},syncCustomToolFields:()=>{},
@@ -19,6 +19,8 @@ const run=code=>vm.runInContext(code,context);
   assert.equal(node('#customAdvancedEnabled').checked,false);
   assert.equal(node('#customRequestOverrides').readOnly,true);
   assert.equal(JSON.parse(node('#customRequestOverrides').value).temperature,0.8);
+  assert.equal(node('#customContextBudget').value,100000);
+  assert.equal(pending[0].options.body.context_budget_tokens,100000);
 
   node('#customTemperature').value='0.4';
   const old=run('refreshCustomPreview()');
@@ -57,6 +59,8 @@ const run=code=>vm.runInContext(code,context);
   const saved=run('saveCustomSettings({preventDefault(){}})');
   assert.equal(pending[4].options.body.advanced_enabled,true);
   assert.equal(pending[4].options.body.advanced_request.temperature,0.15);
+  assert.equal(pending[4].options.body.context_budget_tokens,100000);
+  assert.equal(pending[4].options.body.advanced_request.context_budget_tokens,undefined);
   pending[4].resolve(provider);await saved;
 
   const late=run('refreshCustomPreview()');await late;
@@ -64,5 +68,6 @@ const run=code=>vm.runInContext(code,context);
   pending[5].resolve({parameters:{model:'b',temperature:0.6}});await opening;
   assert.equal(node('#customAdvancedEnabled').checked,false);
   assert.equal(JSON.parse(node('#customRequestOverrides').value).model,'b');
+  assert.equal(node('#customContextBudget').value,250000);
   console.log('PASS: read-only preview, stale responses, current-form toggle handoff, validation and model isolation');
 })().catch(error=>{console.error(error);process.exitCode=1});

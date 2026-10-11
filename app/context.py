@@ -15,25 +15,20 @@ and the sources it found. It is rebuilt only when compaction runs.
 
 from __future__ import annotations
 
+from .text_tokens import count_tokens, truncate_tokens
+
 import json
 from collections.abc import Callable
 from typing import Any
 
 from .file_knowledge import FileKnowledge
 
-# The settings value. Left at the default it means "size the budget from the
-# model's context window"; any other value is an explicit character budget.
+# Every configured number is a fixed compaction threshold, including default.
 DEFAULT_CONTEXT_BUDGET_CHARS = 240_000
 MIN_CONTEXT_BUDGET_CHARS = 40_000
 MAX_CONTEXT_BUDGET_CHARS = 4_000_000
-# Automatic sizing: this share of the model's window, capped in tokens.
-# Compaction throws away work the model has done, so on large-window models
-# it starts only past 512K tokens; smaller windows stay bounded by the share.
-CONTEXT_WINDOW_SHARE = 0.6
-CONTEXT_TOKEN_CAP = 512_000
-ASSUMED_WINDOW_TOKENS = 128_000
-# Snapshots in the checkpoint never take more than this many characters.
-SNAPSHOT_MAX_CHARS = 200_000
+# Snapshots in the runtime checkpoint never take more than this many tokens.
+SNAPSHOT_MAX_TOKENS = 200_000
 LOW_WATER_RATIO = 0.6
 # The newest exchanges are never stubbed: the model is acting on them now.
 PROTECTED_RECENT_EXCHANGES = 2
@@ -42,7 +37,7 @@ STUB_MIN_CHARS = 400
 # Share of the budget the checkpoint's file snapshots may use.
 SNAPSHOT_BUDGET_RATIO = 0.35
 PROGRESS_NOTE_COUNT = 12
-PROGRESS_NOTE_CHARS = 400
+PROGRESS_NOTE_TOKENS = 400
 CONTEXT_CHECKPOINT_MARKER = "\n\nCONTEXT CHECKPOINT:\n"
 STUB_PREFIX = "[已省略的工具结果] "
 READ_TOOLS = {"read_file", "host_read_file", "frontend_read_page"}
@@ -85,26 +80,13 @@ def effective_context_budget(
     request_chars: int,
     input_tokens: int,
 ) -> int:
-    """The character budget for the next request.
+    """Fixed character threshold; default is a value, not an auto-mode flag.
 
-    A character count is only a proxy for tokens, so the budget is derived from
-    the model's window using the ratio the provider itself reported for the
-    last request (characters sent versus input tokens billed). Before any
-    round has reported usage, or when the user set an explicit budget, the
-    settings value is used as is. A 50K-token budget on a 1M-token model was
-    dropping whole rounds of finished work mid-task.
+    Measurement arguments remain accepted for existing callers/diagnostics,
+    but neither upstream usage nor window metadata can change the setting.
+    This triggers compaction, not truncation of protected recent exchanges.
     """
-    if setting != DEFAULT_CONTEXT_BUDGET_CHARS:
-        return setting
-    if input_tokens <= 0 or request_chars <= 0:
-        if window_tokens and window_tokens > 0:
-            cold_tokens = min(int(window_tokens * CONTEXT_WINDOW_SHARE), CONTEXT_TOKEN_CAP)
-            estimated_chars = int(cold_tokens * 3.0)
-            return int(max(MIN_CONTEXT_BUDGET_CHARS, min(setting, estimated_chars)))
-        return setting
-    ratio = request_chars / input_tokens
-    tokens = min(int((window_tokens or ASSUMED_WINDOW_TOKENS) * CONTEXT_WINDOW_SHARE), CONTEXT_TOKEN_CAP)
-    return int(max(MIN_CONTEXT_BUDGET_CHARS, min(MAX_CONTEXT_BUDGET_CHARS, tokens * ratio)))
+    return normalize_budget(setting)
 
 
 def with_message_block(message: dict[str, Any], marker: str, text: str) -> dict[str, Any]:
@@ -211,21 +193,30 @@ def compact_request(
     workspace_files: Callable[[], list[dict[str, Any]]] | None = None,
     sources: dict[str, dict[str, str]] | None = None,
     plan: dict[str, Any] | None = None,
+    preserve_user_messages: bool = False,
+    measure: Callable[[list[dict[str, Any]]], int] | None = None,
+    fixed_tokens: int = 0,
+    trigger_tokens: int | None = None,
 ) -> dict[str, Any] | None:
-    """Bring the request under ``budget`` chars; return what was done, or None.
+    """Reduce old results toward the budget in the supplied measurement unit.
+
+    Runtime callers measure tokens; legacy utility callers can measure chars.
 
     The returned ``stubbed`` list holds (tool name, arguments) of every result
     replaced this time, so the caller can lift dedupe marks that pointed at
     content which is no longer in the request.
     """
-    if serialized_chars(conversation) <= budget:
+    size = measure or serialized_chars
+    current = trigger_tokens if trigger_tokens is not None else size(conversation) + fixed_tokens
+    if current <= budget:
         return None
-    target = int(budget * LOW_WATER_RATIO)
+    target = max(0, int(budget * LOW_WATER_RATIO) - fixed_tokens)
     base = [dict(message) for message in conversation[:base_message_count]]
     internal = [dict(message) for message in conversation[base_message_count:]]
     previous = checkpoint_payload(base)
 
-    snapshots = knowledge.snapshots(min(int(budget * SNAPSHOT_BUDGET_RATIO), SNAPSHOT_MAX_CHARS)) if knowledge is not None else []
+    snapshot_budget = int(budget * SNAPSHOT_BUDGET_RATIO)
+    snapshots = knowledge.snapshots(min(snapshot_budget, SNAPSHOT_MAX_TOKENS), measure=count_tokens if measure else len) if knowledge is not None else []
     base_instruction = (
         "Older tool results were replaced by one-line stubs to fit the context budget; your own messages and "
         "tool calls are intact. file_snapshots hold the exact current content of files you read or wrote "
@@ -237,7 +228,7 @@ def compact_request(
         "instruction": base_instruction,
         "file_snapshots": snapshots,
         "sources": [
-            {"url": item.get("url", ""), "title": item.get("title", ""), "summary": str(item.get("summary") or "")[:200]}
+            {"url": item.get("url", ""), "title": item.get("title", ""), "summary": truncate_tokens(str(item.get("summary") or ""), 200)}
             for item in list((sources or {}).values())[:30]
         ],
     }
@@ -265,13 +256,13 @@ def compact_request(
             base[0] = {**base[0], "content": f"{original}{CONTEXT_CHECKPOINT_MARKER}{text}"}
 
     attach(notes)
-    room = target - serialized_chars(base)
+    room = target - size(base)
     stubbed: list[tuple[str, dict[str, Any]]] = []
     exchanges = _exchanges(internal)
 
     # Pass 1: stub old tool results, oldest exchange first.
     for start, end in exchanges[: max(0, len(exchanges) - PROTECTED_RECENT_EXCHANGES)]:
-        if serialized_chars(internal) <= room:
+        if size(internal) <= room:
             break
         calls = _call_index(internal[start])
         for index in range(start + 1, end):
@@ -287,14 +278,19 @@ def compact_request(
 
     # Pass 2: drop whole old exchanges, keeping the model's words as notes.
     dropped_rounds = 0
-    while serialized_chars(internal) > room and len(_exchanges(internal)) > 1:
+    while size(internal) > room and len(_exchanges(internal)) > 1:
         start, end = _exchanges(internal)[0]
         for message in internal[start:end]:
             if message.get("role") == "assistant":
                 text = " ".join(str(message.get("content") or "").split())
                 if text:
-                    notes.append(text[:PROGRESS_NOTE_CHARS])
-        del internal[start:end]
+                    notes.append(truncate_tokens(text, PROGRESS_NOTE_TOKENS))
+        if preserve_user_messages:
+            # Cross-turn Agent replay contains user requests between tool
+            # exchanges. Never drop those requests together with old tools.
+            internal[start:end] = [message for message in internal[start:end] if message.get("role") == "user"]
+        else:
+            del internal[start:end]
         dropped_rounds += 1
     if dropped_rounds:
         attach(notes)

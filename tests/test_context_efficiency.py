@@ -70,21 +70,20 @@ class ContextEfficiencyTests(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(function["arguments"], raw)
 
-    def test_very_large_successful_write_is_compacted_before_replay(self) -> None:
+    def test_very_large_successful_write_is_preserved_before_replay(self) -> None:
         function = {
             "name": "write_file",
             "arguments": json.dumps({"path": "app.js", "content": "x" * 100_000}),
         }
+        raw = function["arguments"]
         changed = _compact_workspace_call_arguments(
             function,
             name="write_file",
             path="app.js",
             succeeded=True,
         )
-        self.assertTrue(changed)
-        compact = json.loads(function["arguments"])
-        self.assertEqual(compact["path"], "app.js")
-        self.assertLess(len(function["arguments"]), 200)
+        self.assertFalse(changed)
+        self.assertEqual(function["arguments"], raw)
 
     def test_small_patch_stays_byte_identical_for_cache(self) -> None:
         raw = json.dumps({"path": "a.py", "old_text": "x", "new_text": "y"})
@@ -99,7 +98,7 @@ class ContextEfficiencyTests(unittest.TestCase):
         )
         self.assertEqual(function["arguments"], raw)
 
-    def test_large_edit_is_compacted_after_success(self) -> None:
+    def test_large_edit_is_preserved_after_success(self) -> None:
         function = {
             "name": "edit_file",
             "arguments": json.dumps(
@@ -109,7 +108,8 @@ class ContextEfficiencyTests(unittest.TestCase):
                 }
             ),
         }
-        self.assertTrue(
+        raw = function["arguments"]
+        self.assertFalse(
             _compact_workspace_call_arguments(
                 function,
                 name="edit_file",
@@ -117,26 +117,22 @@ class ContextEfficiencyTests(unittest.TestCase):
                 succeeded=True,
             )
         )
-        compact = json.loads(function["arguments"])
-        self.assertEqual(compact["path"], "app.js")
-        self.assertIn("edits", compact)
-        self.assertLess(len(function["arguments"]), 250)
+        self.assertEqual(function["arguments"], raw)
 
-    def test_host_mutation_tools_are_compacted(self) -> None:
+    def test_host_mutation_tools_are_preserved(self) -> None:
         function = {
             "name": "write_file",
             "arguments": json.dumps({"path": "/home/share/app.js", "content": "x" * 100_000}),
         }
+        raw = function["arguments"]
         changed = _compact_workspace_call_arguments(
             function,
             name="write_file",
             path="/home/share/app.js",
             succeeded=True,
         )
-        self.assertTrue(changed)
-        compact = json.loads(function["arguments"])
-        self.assertEqual(compact["path"], "/home/share/app.js")
-        self.assertEqual(compact["content"], "[successful write body omitted from repeated context]")
+        self.assertFalse(changed)
+        self.assertEqual(function["arguments"], raw)
 
         function_edit = {
             "name": "host_edit_file",
@@ -145,15 +141,15 @@ class ContextEfficiencyTests(unittest.TestCase):
                 "edits": [{"old_text": "old", "new_text": "x" * 10_000}],
             }),
         }
+        raw_edit = function_edit["arguments"]
         changed_edit = _compact_workspace_call_arguments(
             function_edit,
             name="host_edit_file",
             path="/home/share/app.js",
             succeeded=True,
         )
-        self.assertTrue(changed_edit)
-        compact_edit = json.loads(function_edit["arguments"])
-        self.assertIn("edits", compact_edit)
+        self.assertFalse(changed_edit)
+        self.assertEqual(function_edit["arguments"], raw_edit)
 
 class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_identical_validation_is_skipped_until_workspace_changes(self) -> None:
@@ -669,7 +665,7 @@ class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("只读操作已暂停", item["error"])
         self.assertEqual(result["answer"], "审查完成")
 
-    def test_cold_start_budget_adapts_to_small_context_window(self) -> None:
+    def test_fixed_budget_is_not_reinterpreted_for_small_context_window(self) -> None:
         from app.context import DEFAULT_CONTEXT_BUDGET_CHARS, effective_context_budget
         # 32K token model cold start (no request_chars or input_tokens yet)
         cold_budget_32k = effective_context_budget(
@@ -678,7 +674,7 @@ class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
             request_chars=0,
             input_tokens=0,
         )
-        self.assertEqual(cold_budget_32k, 57_600)
+        self.assertEqual(cold_budget_32k, DEFAULT_CONTEXT_BUDGET_CHARS)
 
         # 64K token model cold start
         cold_budget_64k = effective_context_budget(
@@ -687,9 +683,9 @@ class WorkspaceLoopGuardTests(unittest.IsolatedAsyncioTestCase):
             request_chars=0,
             input_tokens=0,
         )
-        self.assertEqual(cold_budget_64k, 115_200)
+        self.assertEqual(cold_budget_64k, DEFAULT_CONTEXT_BUDGET_CHARS)
 
-        # Explicit user budget setting overrides automatic window sizing
+        # Every numeric setting is an explicit threshold.
         user_budget = effective_context_budget(
             80_000,
             window_tokens=32_000,

@@ -71,6 +71,16 @@ class CompactRequestTests(unittest.TestCase):
         self.assertEqual(checkpoint_payload(conversation)["progress_notes"][0], "决定：新建独立兵种")
 
     def test_checkpoint_carries_files_plan_and_sources(self):
+        from app.context_tokens import estimate_tokens, legacy_token_budget
+        self.assertEqual(legacy_token_budget(240_000), 250_000)
+        self.assertEqual(legacy_token_budget(80_000), 20_000)
+        ascii_history = BASE + exchange("ascii", "read_file", {}, "x" * 10_000)
+        cjk_history = BASE + exchange("cjk", "read_file", {}, "中" * 10_000)
+        self.assertLess(estimate_tokens(ascii_history), 8192)
+        self.assertGreater(estimate_tokens(cjk_history), 8192)
+        self.assertIsNone(compact_request(ascii_history, base_message_count=2, budget=8192, measure=estimate_tokens))
+        self.assertIsNotNone(compact_request(cjk_history, base_message_count=2, budget=8192, measure=estimate_tokens))
+        self.assertIn("中" * 10_000, cjk_history[-1]["content"])
         knowledge = FileKnowledge()
         knowledge.record_read({"path": "a.js", "revision": "r1", "line_count": 1, "from_line": 1,
                                "through_line": 1, "truncated": False, "content": "1|x();"})
@@ -150,22 +160,18 @@ class TaskPlanTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             plan.apply({"steps": [{"id": 1}, ""]})
 
-    def test_budget_follows_the_model_window_and_measured_token_ratio(self):
-        from app.context import CONTEXT_TOKEN_CAP, effective_context_budget
+    def test_budget_is_fixed_including_default_after_usage(self):
+        from app.context import effective_context_budget
 
-        # Explicit setting wins; default without usage stays as is.
         self.assertEqual(effective_context_budget(100_000, window_tokens=1_000_000, request_chars=50_000, input_tokens=10_000), 100_000)
         self.assertEqual(effective_context_budget(DEFAULT_CONTEXT_BUDGET_CHARS, window_tokens=1_000_000, request_chars=0, input_tokens=0),
                          DEFAULT_CONTEXT_BUDGET_CHARS)
-        # 1M window: 60% share is capped at 512K tokens, times 4.6 chars/token.
         budget = effective_context_budget(DEFAULT_CONTEXT_BUDGET_CHARS, window_tokens=1_048_576, request_chars=239_000, input_tokens=52_000)
-        self.assertEqual(budget, int(CONTEXT_TOKEN_CAP * 239_000 / 52_000))
-        # Unknown window: assume 128K tokens.
+        self.assertEqual(budget, DEFAULT_CONTEXT_BUDGET_CHARS)
         budget = effective_context_budget(DEFAULT_CONTEXT_BUDGET_CHARS, window_tokens=None, request_chars=40_000, input_tokens=10_000)
-        self.assertEqual(budget, int(128_000 * 0.6 * 4))
-        # A small window with CJK-heavy text (few chars per token) shrinks the budget.
+        self.assertEqual(budget, DEFAULT_CONTEXT_BUDGET_CHARS)
         budget = effective_context_budget(DEFAULT_CONTEXT_BUDGET_CHARS, window_tokens=32_000, request_chars=15_000, input_tokens=10_000)
-        self.assertEqual(budget, 40_000)
+        self.assertEqual(budget, DEFAULT_CONTEXT_BUDGET_CHARS)
 
     def test_round_text_is_joined_as_paragraphs(self):
         from app.mimo_local import _join_round_text

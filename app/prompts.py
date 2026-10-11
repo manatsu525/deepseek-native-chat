@@ -138,7 +138,16 @@ def build_system_prompt(
     sections = [IDENTITY, date_context(user_timezone)]
     workspace_mode = not agent_mode and workspace_access in WORKSPACE_RULES
     if agent_mode or (workspace_mode and file_tools_loaded):
-        sections.append(TOOL_RULES)
+        rules = TOOL_RULES
+        if agent_mode:
+            rules = "\n".join(
+                "- For multi-step work, maintain a visible checklist with update_plan. Send the entire list; "
+                "update statuses as work progresses or revise it when the approach changes. "
+                "Several tasks can be in progress. Report actual results and remaining limitations honestly."
+                if line.startswith("- For multi-step work,") else line
+                for line in rules.splitlines()
+            )
+        sections.append(rules)
     if agent_mode:
         sections.append(AGENT_RULES)
         if skills_prompt.strip():

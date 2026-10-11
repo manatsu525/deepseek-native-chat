@@ -290,7 +290,7 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
         c = mimo_local._query_terms("比亚迪 元UP 电机功率")
         self.assertIsNone(mimo_local._similar_search(c, [(1, a, "first")]))
 
-    async def test_web_calls_without_progress_are_warned_then_refused(self):
+    async def test_web_calls_do_not_require_mutation_progress(self):
         class Web:
             calls = 0
 
@@ -317,17 +317,10 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
                 max_tool_rounds=96, web_search_limit=96, web_fetch_limit=96, web_tool_round_limit=96,
             )
         trace = result["tool_trace"]
-        self.assertEqual(Web.calls, mimo_local.WEB_STALL_REFUSE_CALLS)
-        self.assertEqual([item["status"] for item in trace[:8]], ["completed"] * 8)
-        self.assertEqual([item["status"] for item in trace[8:]], ["failed", "failed"])
-        self.assertIn("联网查询已暂停", trace[8]["error"])
-        self.assertIn("git clone", trace[8]["error"])
-        self.assertEqual(trace[3]["web_stall_warning"], mimo_local.WEB_STALL_WARN_CALLS)
-        self.assertNotIn("web_stall_warning", trace[2])
+        self.assertEqual(Web.calls, len(topics))
+        self.assertTrue(all(item["status"] == "completed" for item in trace))
         tool_results = [m["content"] for m in requests[-1]["messages"] if m["role"] == "tool"]
-        self.assertIn("[Runtime note] 已经连续 4 次联网", tool_results[3])
-        # After two refusals the web tools are dropped so the answer finalizes.
-        self.assertNotIn("web_search", {t["function"]["name"] for t in requests[-1].get("tools", [])})
+        self.assertFalse(any("没有任何文件修改" in text for text in tool_results))
 
     async def test_progress_resets_the_web_stall_counter(self):
         class Web:
@@ -356,7 +349,7 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(item["status"] == "completed" for item in result["tool_trace"]))
         self.assertNotIn("web_stall_warning", result["tool_trace"][-1])
 
-    async def test_calls_without_any_mutation_get_a_periodic_nudge(self):
+    async def test_calls_without_mutation_are_not_nagged_to_write(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = ConversationWorkspace(1, "nudge")
             workspace.root = Path(directory)
@@ -368,10 +361,9 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
             result, requests = await run_stream(workspace, rounds)
         trace = result["tool_trace"]
         warned = [item.get("mutation_stall_warning") for item in trace]
-        self.assertEqual(warned, [None] * 9 + [10, None, None])
+        self.assertEqual(warned, [None] * 12)
         tool_results = [m["content"] for m in requests[-1]["messages"] if m["role"] == "tool"]
-        self.assertIn("没有修改任何文件", tool_results[9])
-        self.assertNotIn("没有修改任何文件", tool_results[8])
+        self.assertFalse(any("没有修改任何文件" in text for text in tool_results))
 
     async def test_plan_tool_is_listed_and_survives_compaction(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -461,12 +453,12 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("run_command", {t["function"]["name"] for t in requests[0]["tools"]})
         self.assertIn("discarded", requests[0]["messages"][0]["content"])
 
-    async def test_endless_exploration_is_paused_until_something_is_written(self):
+    async def test_reading_does_not_need_a_write_to_unlock(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = ConversationWorkspace(1, "explore")
             workspace.root = Path(directory)
             workspace.write_file("a.js", "x();\n")
-            limit = mimo_local.MUTATION_STALL_REFUSE_CALLS
+            limit = 20
             rounds = [tool_round(f"s{n}", "search_files", {"query": f"needle{n}"}) for n in range(limit)]
             rounds += [
                 tool_round("r1", "read_file", {"path": "a.js"}),          # refused
@@ -478,41 +470,40 @@ class StreamCacheTests(unittest.IsolatedAsyncioTestCase):
             result, requests = await run_stream(workspace, rounds)
             self.assertTrue((Path(directory) / "b.js").exists())
         statuses = [(item["name"], item["status"]) for item in result["tool_trace"][limit:]]
-        self.assertEqual(statuses, [("read_file", "failed"), ("run_command", "failed"), ("write_file", "completed"), ("read_file", "completed")])
-        self.assertIn("只读操作已暂停", result["tool_trace"][limit]["error"])
+        self.assertTrue(all(status != "failed" for _, status in statuses))
+        self.assertFalse(any("只读操作已暂停" in item["error"] for item in result["tool_trace"]))
         self.assertEqual(result["answer"], "done")
 
-    async def test_three_stall_refusals_force_the_final_answer(self):
+    async def test_read_only_calls_do_not_force_finalization(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = ConversationWorkspace(1, "explore2")
             workspace.root = Path(directory)
             workspace.write_file("a.js", "x();\n")
-            limit = mimo_local.MUTATION_STALL_REFUSE_CALLS
+            limit = 20
             rounds = [tool_round(f"s{n}", "search_files", {"query": f"needle{n}"}) for n in range(limit + 3)]
             rounds.append(answer_round("gave up, here is what I know"))
             result, requests = await run_stream(workspace, rounds)
-        self.assertEqual([item["status"] for item in result["tool_trace"][limit:]], ["failed"] * 3)
-        self.assertTrue(result["round_stats"][-1]["final_only"])
+        self.assertFalse(any(item["status"] == "failed" for item in result["tool_trace"]))
+        self.assertFalse(result["round_stats"][-1]["final_only"])
         self.assertEqual(result["answer"], "gave up, here is what I know")
 
-    async def test_endless_rechecking_after_the_files_are_written_ends_with_the_answer(self):
+    async def test_checks_after_writing_are_not_blocked_by_a_mutation_counter(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = ConversationWorkspace(1, "recheck")
             workspace.root = Path(directory)
-            limit = mimo_local.MUTATION_STALL_REFUSE_CALLS
+            limit = 20
             rounds = [tool_round("w1", "write_file", {"path": "a.js", "content": "x();\n"})]
             rounds += [tool_round(f"s{n}", "search_files", {"query": f"needle{n}"}) for n in range(limit + 1)]
             rounds.append(answer_round("Changed a.js; assumptions: none."))
             result, requests = await run_stream(workspace, rounds)
             tool_results = [m["content"] for r in requests for m in r["messages"] if m["role"] == "tool"]
         # The nudge after a write asks for the answer, not for more files.
-        self.assertTrue(any("文件已经改好之后又连续 10 次" in text for text in tool_results))
+        self.assertFalse(any("文件已经改好之后又连续" in text for text in tool_results))
         self.assertFalse(any("现在就写文件" in text for text in tool_results))
         # The 17th read-only call is refused and the loop takes the answer:
         # the work exists, so this is a complete answer, not a budget failure.
-        self.assertEqual(result["tool_trace"][limit + 1]["status"], "failed")
-        self.assertIn("只读操作已结束", result["tool_trace"][limit + 1]["error"])
-        self.assertTrue(result["round_stats"][-1]["final_only"])
+        self.assertTrue(all(t["status"] != "failed" for t in result["tool_trace"]))
+        self.assertFalse(result["round_stats"][-1]["final_only"])
         self.assertEqual(result["answer"], "Changed a.js; assumptions: none.")
         self.assertFalse(result["incomplete"])
 

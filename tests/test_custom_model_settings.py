@@ -21,6 +21,26 @@ from app.db import Database
 class CustomModelSettingsTests(unittest.TestCase):
     admin_password = "custom-settings-test-password"
 
+    def test_token_budget_migration_per_model_and_advanced_preview(self):
+        from app.responses_state import state_scope
+        self.assertEqual(main.normalize_custom_settings({"context_budget_chars": 240_000})["context_budget_tokens"], 250_000)
+        self.assertEqual(main.normalize_custom_settings({"context_budget_chars": 80_000})["context_budget_tokens"], 20_000)
+        self.assertEqual(state_scope({}, {}, {"context_budget_chars": 240_000}),
+                         state_scope({}, {}, {"context_budget_chars": 240_000, "context_budget_tokens": 250_000}))
+        pid = self.add_legacy_provider()
+        main.migrate_custom_provider_settings()
+        body = {**self.settings_body("model-a", temperature=.7, backend="parallel"),
+                "context_budget_tokens": 100_000, "advanced_enabled": True,
+                "advanced_request": {"model": "model-a", "max_completion_tokens": 8192}}
+        saved = self.client.put(f"/api/providers/{pid}/settings", json=body)
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(saved.json()["model_settings"]["model-a"]["context_budget_tokens"], 100_000)
+        self.assertEqual(saved.json()["model_settings"]["model-b"]["context_budget_tokens"], 250_000)
+        preview = self.client.post(f"/api/providers/{pid}/settings/preview", json=body)
+        self.assertEqual(preview.json()["parameters"], body["advanced_request"])
+        bad = self.client.put(f"/api/providers/{pid}/settings", json={**body, "context_budget_tokens": 8191})
+        self.assertEqual(bad.status_code, 422)
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.data_dir = Path(self.temp_dir.name) / "data"

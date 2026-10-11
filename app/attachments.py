@@ -5,6 +5,8 @@ Images are resized JPEGs; documents are bounded plain-text extracts.
 """
 from __future__ import annotations
 
+from .text_tokens import count_tokens, truncate_tokens
+
 import base64
 import ctypes
 import gc
@@ -28,8 +30,8 @@ from .config import settings
 
 MAX_ATTACHMENTS = 10
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
-MAX_FILE_TEXT_CHARS = 30_000
-MAX_TOTAL_TEXT_CHARS = 80_000
+MAX_FILE_TEXT_TOKENS = 30_000
+MAX_TOTAL_TEXT_TOKENS = 80_000
 MAX_IMAGE_PIXELS = 16_000_000
 MAX_IMAGE_SIDE = 1600
 MAX_PROCESSED_IMAGE_BYTES = 1_500_000
@@ -106,11 +108,12 @@ def _extract_docx(path: Path) -> str:
                 value = value.strip()
                 if not value:
                     continue
-                remaining = MAX_FILE_TEXT_CHARS - used
+                remaining = MAX_FILE_TEXT_TOKENS - used
                 if remaining <= 0:
                     break
-                parts.append(value[:remaining])
-                used += min(len(value), remaining) + 1
+                value = truncate_tokens(value, max(0, remaining - 1))
+                parts.append(value)
+                used += count_tokens(value + "\n")
         return "\n".join(parts)
 
 
@@ -144,7 +147,7 @@ def _extract_xlsx(path: Path) -> str:
         lines: list[str] = []
         used = 0
         for sheet_index, sheet_name in enumerate(sheets, start=1):
-            if used >= MAX_FILE_TEXT_CHARS:
+            if used >= MAX_FILE_TEXT_TOKENS:
                 break
             lines.append(f"[工作表 {sheet_index}]")
             with archive.open(sheet_name) as stream:
@@ -172,11 +175,12 @@ def _extract_xlsx(path: Path) -> str:
                         row_values = []
                         rows_seen += 1
                         if line:
-                            remaining = MAX_FILE_TEXT_CHARS - used
+                            remaining = MAX_FILE_TEXT_TOKENS - used
                             if remaining <= 0:
                                 break
-                            lines.append(line[:remaining])
-                            used += min(len(line), remaining) + 1
+                            line = truncate_tokens(line, max(0, remaining - 1))
+                            lines.append(line)
+                            used += count_tokens(line + "\n")
                         if rows_seen >= 2000:
                             break
                     if event == "end":
@@ -211,7 +215,7 @@ def _extract_pdf(path: Path) -> str:
             if completed.returncode:
                 raise AttachmentError("PDF 解析失败或超过了这台服务器的安全资源上限")
             raise AttachmentError("PDF 没有可提取文字；扫描版 PDF 暂不支持 OCR")
-        return text.strip()[:MAX_FILE_TEXT_CHARS]
+        return truncate_tokens(text.strip(), MAX_FILE_TEXT_TOKENS)
     except subprocess.TimeoutExpired as exc:
         raise AttachmentError("PDF 处理超过 45 秒，已停止") from exc
     finally:
@@ -220,7 +224,7 @@ def _extract_pdf(path: Path) -> str:
 
 def _extract_plain_text(path: Path) -> str:
     data = bytearray()
-    maximum = MAX_FILE_TEXT_CHARS * 4
+    maximum = min(MAX_UPLOAD_BYTES, MAX_FILE_TEXT_TOKENS * 256 + 1024)
     with path.open("rb") as stream:
         while len(data) < maximum:
             chunk = stream.read(min(64 * 1024, maximum - len(data)))
@@ -231,10 +235,10 @@ def _extract_plain_text(path: Path) -> str:
         raise AttachmentError("文件不是可识别的纯文本格式")
     for encoding in ("utf-8-sig", "gb18030", "utf-16"):
         try:
-            return bytes(data).decode(encoding)[:MAX_FILE_TEXT_CHARS]
+            return truncate_tokens(bytes(data).decode(encoding), MAX_FILE_TEXT_TOKENS)
         except UnicodeDecodeError:
             continue
-    return bytes(data).decode("utf-8", errors="replace")[:MAX_FILE_TEXT_CHARS]
+    return truncate_tokens(bytes(data).decode("utf-8", errors="replace"), MAX_FILE_TEXT_TOKENS)
 
 
 def _process_image(source: Path, destination: Path) -> dict[str, Any]:
@@ -375,7 +379,7 @@ def process_upload(source: Path, user_id: int, attachment_id: str, filename: str
         if not text:
             raise AttachmentError("文件中没有可读取的文字")
         destination = attachment_path(user_id, attachment_id, ".txt")
-        destination.write_text(text[:MAX_FILE_TEXT_CHARS], encoding="utf-8")
+        destination.write_text(truncate_tokens(text, MAX_FILE_TEXT_TOKENS), encoding="utf-8")
         os.chmod(destination, 0o600)
         return {
             "kind": "document",
@@ -412,11 +416,11 @@ def build_model_messages(messages: list[dict[str, Any]], records: list[dict[str,
         if not path.is_file():
             raise AttachmentError(f"附件已过期或丢失：{record['original_name']}")
         if record["kind"] == "document":
-            remaining = MAX_TOTAL_TEXT_CHARS - text_used
+            remaining = MAX_TOTAL_TEXT_TOKENS - text_used
             if remaining <= 0:
                 continue
-            text = path.read_text(encoding="utf-8", errors="replace")[:remaining]
-            text_used += len(text)
+            text = truncate_tokens(path.read_text(encoding="utf-8", errors="replace"), remaining)
+            text_used += count_tokens(text)
             document_parts.append(f"\n\n--- 附件：{record['original_name']}（提取文本）---\n{text}")
         elif record["kind"] == "image":
             if not allow_images:

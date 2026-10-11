@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .text_tokens import truncate_tokens
+
 import json
 import sqlite3
 import threading
@@ -93,6 +95,15 @@ class Database:
                     updated_at INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS agent_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_events_job ON agent_events(job_id, id);
                 CREATE TABLE IF NOT EXISTS conversation_web_evidence (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -233,8 +244,8 @@ class Database:
                     canonical_url,
                     str(item.get("url") or canonical_url)[:2048],
                     str(item.get("title") or "")[:160],
-                    content[:12000],
-                    str(item.get("summary") or " ".join(content.split())[:320])[:1200],
+                    truncate_tokens(content, 12000),
+                    truncate_tokens(str(item.get("summary") or truncate_tokens(" ".join(content.split()), 320)), 1200),
                     str(item.get("site_name") or "")[:160],
                     str(item.get("publish_time") or "")[:120],
                     timestamp,

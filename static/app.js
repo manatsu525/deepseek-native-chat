@@ -533,7 +533,7 @@ function traceHtml(meta={}, active=false, detailKey='trace') {
   const retryCode = retryStatus.status_code || retryStatus.code || '';
   const retryMessage = retryStatus.message || (retryStatus.active ? `上游返回 HTTP ${retryCode || '错误'}，5 秒后重试（第 ${retryStatus.attempt || 0}/${retryStatus.max_attempts || 60} 次）` : '');
   const retryHtml = retryMessage ? `<div class="retry-status ${retryStatus.status === 'recovered' ? 'recovered' : retryStatus.status === 'failed' ? 'failed' : ''}">${escapeHtml(retryMessage)}</div>` : '';
-  const planLabels = {pending:'待处理',in_progress:'执行中',done:'已完成',blocked:'受阻'};
+  const planLabels = {pending:'待处理',in_progress:'执行中',completed:'已完成',done:'已完成',blocked:'受阻'};
   const planHtml = planSteps.length ? `<div class="search-step"><strong>执行计划</strong><ol>${planSteps.map(s=>`<li>${escapeHtml(planLabels[s.status]||s.status)} · ${escapeHtml(s.step)}${s.outcome?`<div>${escapeHtml(s.outcome)}</div>`:''}</li>`).join('')}</ol></div>` : '';
   if (!reasoning && !searches.length && !active && !planSteps.length && !retryHtml) return '';
   const status = active ? '进行中' : (meta.stopped ? '已停止' : '已完成');
@@ -1004,7 +1004,7 @@ function checkedCustomModels(){return $$('#customModelList input[type="checkbox"
 function providerFormData(){const manual=manualModelList(),selected=[...new Set([...checkedCustomModels(),...manual])];return{name:$('#providerName').value||providerLabel({provider_type:providerType()}),api_key:$('#providerKey').value,provider_type:providerType(),base_url:$('#providerBase').value,model:selected[0]||'',selected_models:selected,manual_models:manual}}
 
 function customSettings(provider,model=selectedModel()){
-  const defaults={thinking:'enabled',reasoning_effort:'high',reasoning_effort_enabled:true,lowest_price_aggregators:[],max_completion_tokens:65536,retry_status_codes:[503],context_budget_chars:240000,temperature_enabled:false,temperature:1,top_p_enabled:false,top_p:.95,web_tool_backend:'parallel',request_overrides:{},advanced_enabled:false,advanced_request:{}};
+  const defaults={thinking:'enabled',reasoning_effort:'high',reasoning_effort_enabled:true,lowest_price_aggregators:[],max_completion_tokens:65536,retry_status_codes:[503],context_budget_tokens:250000,temperature_enabled:false,temperature:1,top_p_enabled:false,top_p:.95,web_tool_backend:'parallel',request_overrides:{},advanced_enabled:false,advanced_request:{}};
   const byModel=provider&&provider.model_settings;
   const saved=byModel&&typeof byModel==='object'&&byModel[model]&&typeof byModel[model]==='object'
     ?byModel[model]
@@ -1014,7 +1014,7 @@ function customSettings(provider,model=selectedModel()){
 const customEditor={draft:null,preview:null,previewSignature:null,requestId:0,timer:null,providerId:null,model:''};
 function parseRetryStatusCodes(value){return [...new Set(String(value||'').split(/[,，\s]+/).map(item=>item.trim()).filter(Boolean).map(Number).filter(code=>Number.isInteger(code)&&code>=400&&code<=599))]}
 function customFormValues(){
-  return {model:customEditor.model,thinking:$('#customThinking').value,reasoning_effort:$('#customReasoningEffort').value,reasoning_effort_enabled:$('#customReasoningEffortEnabled').checked,lowest_price_aggregators:[$('#customLowestPriceOpenRouter').checked?'openrouter':'',$('#customLowestPriceVercel').checked?'vercel':''].filter(Boolean),max_completion_tokens:Number($('#customMaxCompletion').value),retry_status_codes:parseRetryStatusCodes($('#customRetryStatusCodes').value),context_budget_chars:Number($('#customContextBudget').value)||240000,temperature_enabled:$('#customTemperatureEnabled').checked,temperature:Number($('#customTemperature').value),top_p_enabled:$('#customTopPEnabled').checked,top_p:Number($('#customTopP').value),web_tool_backend:$('#customWebToolBackend').value,request_overrides:{},advanced_enabled:false,advanced_request:{}};
+  return {model:customEditor.model,thinking:$('#customThinking').value,reasoning_effort:$('#customReasoningEffort').value,reasoning_effort_enabled:$('#customReasoningEffortEnabled').checked,lowest_price_aggregators:[$('#customLowestPriceOpenRouter').checked?'openrouter':'',$('#customLowestPriceVercel').checked?'vercel':''].filter(Boolean),max_completion_tokens:Number($('#customMaxCompletion').value),retry_status_codes:parseRetryStatusCodes($('#customRetryStatusCodes').value),context_budget_tokens:Number($('#customContextBudget').value)||250000,temperature_enabled:$('#customTemperatureEnabled').checked,temperature:Number($('#customTemperature').value),top_p_enabled:$('#customTopPEnabled').checked,top_p:Number($('#customTopP').value),web_tool_backend:$('#customWebToolBackend').value,request_overrides:{},advanced_enabled:false,advanced_request:{}};
 }
 function syncAdvancedEditor(){
   const enabled=$('#customAdvancedEnabled').checked;
@@ -1070,7 +1070,7 @@ async function fillCustomSettings(){
   clearTimeout(customEditor.timer);++customEditor.requestId;
   customEditor.providerId=selectedProvider().id;customEditor.model=model;customEditor.preview=null;customEditor.previewSignature=null;
   customEditor.draft=config.advanced_enabled?JSON.stringify(config.advanced_request||{},null,2):null;
-  $('#customThinking').value=config.thinking;$('#customReasoningEffort').value=config.reasoning_effort||'high';$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customLowestPriceOpenRouter').checked=aggregators.has('openrouter');$('#customLowestPriceVercel').checked=aggregators.has('vercel');$('#customMaxCompletion').value=config.max_completion_tokens;$('#customRetryStatusCodes').value=(Array.isArray(config.retry_status_codes)?config.retry_status_codes:[503]).join(', ');$('#customContextBudget').value=config.context_budget_chars||240000;$('#customTemperatureEnabled').checked=!!config.temperature_enabled;$('#customTemperature').value=config.temperature;$('#customTopPEnabled').checked=!!config.top_p_enabled;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
+  $('#customThinking').value=config.thinking;$('#customReasoningEffort').value=config.reasoning_effort||'high';$('#customReasoningEffortEnabled').checked=config.reasoning_effort_enabled;$('#customLowestPriceOpenRouter').checked=aggregators.has('openrouter');$('#customLowestPriceVercel').checked=aggregators.has('vercel');$('#customMaxCompletion').value=config.max_completion_tokens;$('#customRetryStatusCodes').value=(Array.isArray(config.retry_status_codes)?config.retry_status_codes:[503]).join(', ');$('#customContextBudget').value=config.context_budget_tokens||250000;$('#customTemperatureEnabled').checked=!!config.temperature_enabled;$('#customTemperature').value=config.temperature;$('#customTopPEnabled').checked=!!config.top_p_enabled;$('#customTopP').value=config.top_p;$('#customWebToolBackend').value=config.web_tool_backend;
   $('#customAdvancedEnabled').checked=!!config.advanced_enabled;$('#customAdvancedEnabled').disabled=false;
   syncCustomThinkingFields();syncCustomToolFields();
   syncAdvancedEditor();

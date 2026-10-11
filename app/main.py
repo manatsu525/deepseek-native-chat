@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .text_tokens import count_tokens, truncate_tokens
+
 import asyncio
 import hashlib
 import io
@@ -25,6 +27,7 @@ from . import attachments
 from .agent import AgentRuntime, build_agent_skills_prompt
 from .config import settings
 from .context import DEFAULT_CONTEXT_BUDGET_CHARS, MAX_CONTEXT_BUDGET_CHARS, MIN_CONTEXT_BUDGET_CHARS
+from .context_tokens import DEFAULT_TOKEN_BUDGET, MIN_TOKEN_BUDGET, MAX_TOKEN_BUDGET, legacy_token_budget
 from .custom_request import validate_request_overrides, validate_advanced_request
 from .responses_state import state_scope, resume_state
 from .db import Database
@@ -46,6 +49,7 @@ from .reasoning_effort import LEVELS as REASONING_EFFORT_LEVELS
 from .security import load_secret, make_token, password_hash, password_ok, read_token
 from .skills import SkillRegistry
 from .work_log import build_work_log, with_work_log
+from .agent_session import AgentJournal
 from .workspace import AgentSharedWorkspace, ConversationWorkspace, WorkspaceError, delete_conversation_workspace, delete_user_workspaces
 
 
@@ -54,8 +58,8 @@ secret = b""
 tasks: dict[str, asyncio.Task[Any]] = {}
 MAX_CONCURRENT_JOBS = 2
 WEB_EVIDENCE_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
-WEB_EVIDENCE_CONTEXT_MAX_CHARS = 16_000
-WEB_EVIDENCE_PER_SOURCE_MAX_CHARS = 6_000
+WEB_EVIDENCE_CONTEXT_MAX_TOKENS = 16_000
+WEB_EVIDENCE_PER_SOURCE_MAX_TOKENS = 6_000
 job_slots: Optional[asyncio.Semaphore] = None
 attachment_cleanup_task: Optional[asyncio.Task[Any]] = None
 attachment_upload_locks: dict[int, asyncio.Lock] = {}
@@ -152,6 +156,7 @@ class CustomSettingsBody(BaseModel):
     max_completion_tokens: int = Field(default=65536, ge=256, le=MIMO_MAX_COMPLETION_TOKENS)
     retry_status_codes: list[int] = Field(default_factory=lambda: [503], max_length=20)
     context_budget_chars: int = Field(default=DEFAULT_CONTEXT_BUDGET_CHARS, ge=MIN_CONTEXT_BUDGET_CHARS, le=MAX_CONTEXT_BUDGET_CHARS)
+    context_budget_tokens: int = Field(default=DEFAULT_TOKEN_BUDGET, ge=MIN_TOKEN_BUDGET, le=MAX_TOKEN_BUDGET)
     temperature_enabled: bool = False
     temperature: float = Field(default=1.0, ge=0, le=1.5)
     top_p_enabled: bool = False
@@ -187,7 +192,7 @@ class CustomModelSettingsBody(CustomSettingsBody):
 
 class ChatBody(BaseModel):
     conversation_id: Optional[str] = None
-    content: str = Field(default="", max_length=100_000)
+    content: str = Field(default="")
     attachment_ids: list[str] = Field(default_factory=list, max_length=attachments.MAX_ATTACHMENTS)
     provider_id: int
     model: str = ""
@@ -224,6 +229,8 @@ def normalize_custom_settings(value: Any = None) -> dict[str, Any]:
         data.update(value.model_dump())
     elif isinstance(value, dict):
         data.update(value)
+        if "context_budget_tokens" not in value and "context_budget_chars" in value:
+            data["context_budget_tokens"] = legacy_token_budget(value["context_budget_chars"])
     raw_aggregators = data.get("lowest_price_aggregators", [])
     if isinstance(raw_aggregators, str):
         raw_aggregators = [raw_aggregators]
@@ -559,25 +566,25 @@ def _build_web_evidence_context(
         "you may search or read a genuinely new source.\n\n"
     )
     blocks: list[str] = []
-    used = len(header)
+    used = count_tokens(header)
     for index, item in enumerate(ranked, 1):
         content = str(item.get("content") or item.get("summary") or "").strip()
         if not content:
             continue
-        content = content[:WEB_EVIDENCE_PER_SOURCE_MAX_CHARS]
+        content = truncate_tokens(content, WEB_EVIDENCE_PER_SOURCE_MAX_TOKENS)
         block = (
             f"[Previously read source {index}]\n"
             f"URL: {str(item.get('url') or item.get('canonical_url') or '')[:2048]}\n"
             f"Title: {str(item.get('title') or '')[:160]}\n"
             f"Content:\n{content}\n\n"
         )
-        if used + len(block) > WEB_EVIDENCE_CONTEXT_MAX_CHARS:
-            remaining = WEB_EVIDENCE_CONTEXT_MAX_CHARS - used
+        if used + count_tokens(block) > WEB_EVIDENCE_CONTEXT_MAX_TOKENS:
+            remaining = WEB_EVIDENCE_CONTEXT_MAX_TOKENS - used
             if remaining > 300:
-                blocks.append(block[:remaining].rstrip() + "\n[Earlier evidence block truncated]\n")
+                blocks.append(truncate_tokens(block, remaining).rstrip() + "\n[Earlier evidence block truncated]\n")
             break
         blocks.append(block)
-        used += len(block)
+        used += count_tokens(block)
     return header + "".join(blocks) if blocks else ""
 
 
@@ -677,7 +684,42 @@ async def _execute_job(job_id: str) -> None:
                 response_state = {"disabled": True, "fallback_reason": RESPONSES_CAPABILITY_CACHED_REASON}
         response_options["responses_state"] = response_state
     history: list[dict[str, Any]] = []
-    for row in reversed(history_rows):
+    journal = AgentJournal(db, job_id, job["conversation_id"]) if agent_job else None
+    journal_scope = state_scope(provider, job, custom_settings_for_model(provider, job["model"])) if agent_job else ""
+    replay_rows = history_rows
+    # Persist tool availability without replaying ordinary tool transcripts.
+    for row in history_rows:
+        if row["role"] != "assistant":
+            continue
+        meta = db.decode(row.get("meta_json", "{}"), {})
+        groups = meta.get("loaded_tool_groups")
+        if groups is None and meta.get("job_id"):
+            old_state = db.one("SELECT payload_json FROM agent_events WHERE job_id=? AND kind='context/state' ORDER BY id DESC LIMIT 1", (meta["job_id"],))
+            if old_state:
+                groups = db.decode(old_state["payload_json"], {}).get("loaded_groups")
+        if isinstance(groups, list):
+            response_options["loaded_tool_groups"] = groups
+            break
+        trace = meta.get("tool_trace") or []
+        if any(item.get("status") == "completed" and (
+                item.get("name") in {"read_file", "write_file", "edit_file", "list_files", "search_files", "run_command", "run_python"}
+                or (item.get("name") == "load_tools" and "files" in str(item.get("path") or "").split(", ")))
+               for item in trace):
+            response_options["loaded_tool_groups"] = ["files"]
+            break
+    if agent_job:
+        # The newest durable projection already contains preceding history.
+        # Load it once, not every older job and its diagnostic request bodies.
+        for index, row in enumerate(history_rows):
+            meta = db.decode(row.get("meta_json", "{}"), {})
+            if row["role"] != "assistant" or not meta.get("job_id"):
+                continue
+            projected = AgentJournal(db, meta["job_id"], job["conversation_id"]).history(scope=journal_scope)
+            if projected is not None:
+                history = projected
+                replay_rows = history_rows[:index]
+                break
+    for row in reversed(replay_rows):
         meta = db.decode(row.get("meta_json", "{}"), {})
         # Failed answers are kept for the user to inspect, but an incomplete
         # status sentence must not pollute the next model request's context.
@@ -709,6 +751,15 @@ async def _execute_job(job_id: str) -> None:
             message["content"] += "\n\n[本轮执行计划记录]\n" + json.dumps(
                 {"steps": prior_plan["steps"], "note": prior_plan.get("note", "")}, ensure_ascii=False)
         history.append(message)
+    resumed_execution = journal.history(scope=journal_scope) if journal else None
+    if resumed_execution is not None:
+        history = resumed_execution
+        # Resume from committed local operations, not an earlier server chain.
+        if kind == "custom_response":
+            response_options["responses_state"] = {}
+    if journal:
+        journal.append("turn/start", {"scope": journal_scope, "model": job["model"],
+                                      "provider_type": kind, "resumed": resumed_execution is not None})
     prior_web_evidence = db.web_evidence_for_conversation(
         job["user_id"],
         job["conversation_id"],
@@ -723,7 +774,7 @@ async def _execute_job(job_id: str) -> None:
         (str(item.get("content") or "") for item in reversed(history) if item.get("role") == "user"),
         "",
     )
-    web_evidence_context = _build_web_evidence_context(prior_web_evidence, latest_user_text)
+    web_evidence_context = "" if agent_job else _build_web_evidence_context(prior_web_evidence, latest_user_text)
     db.update_job(job_id, status="running", error="", stop_requested=0)
     last_write = 0.0
     attachment_lock_acquired = False
@@ -736,7 +787,7 @@ async def _execute_job(job_id: str) -> None:
         return not state or bool(state["stop_requested"])
 
     def diagnostics_meta() -> dict[str, Any]:
-        return {key: value for key, value in live_diagnostics.items() if value}
+        return {key: value for key, value in live_diagnostics.items() if value or key == "loaded_tool_groups"}
 
     async def update(state: dict[str, Any]) -> None:
         nonlocal last_write
@@ -744,7 +795,7 @@ async def _execute_job(job_id: str) -> None:
             live_diagnostics["plan"] = state["plan"]
             # Progress checkpoints must not be lost to UI streaming throttling.
             db.update_job(job_id, plan_json=json.dumps(state["plan"] or {}, ensure_ascii=False))
-        for key in ("tool_trace", "round_stats"):
+        for key in ("tool_trace", "round_stats", "loaded_tool_groups"):
             if key in state:
                 live_diagnostics[key] = list(state[key])
         retry_state = state.get("retry_status")
@@ -779,7 +830,7 @@ async def _execute_job(job_id: str) -> None:
         )
 
     try:
-        if attachment_records:
+        if attachment_records and resumed_execution is None:
             await attachment_job_lock.acquire()
             attachment_lock_acquired = True
             history = await asyncio.to_thread(
@@ -825,6 +876,7 @@ async def _execute_job(job_id: str) -> None:
                 **response_options,
                 system_addendum=build_agent_skills_prompt(),
                 user_context_addendum=web_evidence_context,
+                record_event=journal.append,
             )
         elif is_custom_provider(kind):
             provider_settings = custom_settings_for_model(provider, job["model"])
@@ -867,6 +919,7 @@ async def _execute_job(job_id: str) -> None:
                 )
         display_files = agent_workspace.list_files() if agent_job else job_workspace.list_files()
         meta = {"job_id": job_id, "conversation_id": job["conversation_id"], "provider_id": job["provider_id"], "provider_type": kind, "model": job["model"], "chat_mode": job.get("chat_mode") or "standard", "reasoning": result["reasoning"], "searches": result["searches"], "sources": result["sources"], "usage": result["usage"], "agents": result.get("agents", []), "workspace_files": display_files}
+        meta["loaded_tool_groups"] = result.get("loaded_tool_groups", response_options.get("loaded_tool_groups", []))
         if result.get("tool_trace"):
             meta["tool_trace"] = result["tool_trace"]
             work_log = build_work_log(result["tool_trace"])
@@ -929,7 +982,7 @@ async def _execute_job(job_id: str) -> None:
             )
         db.update_job(job_id, status="stopped", error="")
     except Exception as exc:
-        error = str(exc)[:3000]
+        error = truncate_tokens(str(exc), 3000)
         partial = db.one(
             "SELECT answer,reasoning,searches_json,sources_json,usage_json,agents_json FROM jobs WHERE id=?",
             (job_id,),
@@ -975,6 +1028,8 @@ async def _execute_job(job_id: str) -> None:
     finally:
         if attachment_lock_acquired:
             attachment_job_lock.release()
+        if journal:
+            journal.flush_preview()
 
 
 async def run_job(job_id: str) -> None:
@@ -987,6 +1042,12 @@ async def run_job(job_id: str) -> None:
             async with slots:
                 await _execute_job(job_id)
     finally:
+        current = db.one("SELECT * FROM jobs WHERE id=?", (job_id,))
+        if current and current.get("chat_mode") == "agent":
+            AgentJournal(db, job_id, current["conversation_id"]).append("turn/end", {
+                "status": current["status"], "error": current.get("error") or "",
+                "preview": current.get("answer") or "", "reasoning": current.get("reasoning") or "",
+            })
         tasks.pop(job_id, None)
 
 
@@ -1080,7 +1141,7 @@ def install_skill(body: SkillInstallBody, _: dict[str, Any] = Depends(admin_user
         skill = registry.install(body.source, body.name)
         registry.set_enabled(skill.skill_id, True)
     except (ValueError, RuntimeError, OSError) as exc:
-        raise HTTPException(400, str(exc)[:4_000]) from exc
+        raise HTTPException(400, truncate_tokens(str(exc), 4000)) from exc
     return {"skill": public_skill(skill, True)}
 
 
@@ -1093,7 +1154,7 @@ def read_skill(skill_id: str, _: dict[str, Any] = Depends(current_user)) -> dict
     try:
         content = registry.read(skill.skill_id)
     except (OSError, UnicodeDecodeError, ValueError) as exc:
-        raise HTTPException(400, str(exc)[:4_000]) from exc
+        raise HTTPException(400, truncate_tokens(str(exc), 4000)) from exc
     return {"skill": public_skill(skill, skill.skill_id in set(registry.enabled_ids())), "content": content}
 
 
@@ -1104,7 +1165,7 @@ def set_skill_enabled(skill_id: str, body: SkillEnabledBody, _: dict[str, Any] =
         enabled = registry.set_enabled(skill_id, body.enabled)
         skill = registry.find(skill_id)
     except ValueError as exc:
-        raise HTTPException(404, str(exc)[:4_000]) from exc
+        raise HTTPException(404, truncate_tokens(str(exc), 4000)) from exc
     if skill is None:
         raise HTTPException(404, "Skill 不存在")
     return {"skill": public_skill(skill, skill.skill_id in set(enabled)), "enabled": enabled}
@@ -1117,7 +1178,7 @@ def remove_skill(skill_id: str, _: dict[str, Any] = Depends(admin_user)) -> dict
     except ValueError as exc:
         message = str(exc)
         status = 404 if "不存在" in message else 400
-        raise HTTPException(status, message[:4_000]) from exc
+        raise HTTPException(status, truncate_tokens(message, 4000)) from exc
     return {"ok": True, "skill_id": skill_id}
 
 
@@ -1832,6 +1893,8 @@ async def chat(body: ChatBody, user: dict[str, Any] = Depends(current_user)) -> 
     validate_provider_selection(kind, model, provider)
     validate_effort(body.effort)
     content = body.content.strip()
+    if count_tokens(content) > 100_000:
+        raise HTTPException(400, "消息不能超过 100000 token")
     attachment_ids = list(dict.fromkeys(body.attachment_ids))
     if any(not re.fullmatch(r"[a-f0-9]{32}", item) for item in attachment_ids):
         raise HTTPException(400, "无效的附件标识")
@@ -1884,6 +1947,17 @@ def get_job(job_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[s
     if not job:
         raise HTTPException(404, "任务不存在")
     return public_job(job)
+
+
+@app.get("/api/jobs/{job_id}/execution")
+def get_execution(job_id: str, after: int = 0, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    job = db.one("SELECT conversation_id FROM jobs WHERE id=? AND user_id=?", (job_id, user["id"]))
+    if not job:
+        raise HTTPException(404, "任务不存在")
+    rows = db.all("SELECT * FROM agent_events WHERE job_id=? AND id>? ORDER BY id LIMIT 100", (job_id, after))
+    events = [{"id": row["id"], "kind": row["kind"], "payload": db.decode(row["payload_json"], {}),
+               "created_at": row["created_at"]} for row in rows]
+    return {"events": events, "next_after": events[-1]["id"] if events else after}
 
 
 @app.post("/api/jobs/{job_id}/stop")

@@ -7,6 +7,8 @@ minimal: YAML front matter is parsed only for name and description.
 
 from __future__ import annotations
 
+from .text_tokens import truncate_tokens
+
 import json
 import re
 import shutil
@@ -71,7 +73,7 @@ def _frontmatter(text: str, fallback_name: str) -> tuple[str, str]:
             if line.strip() and not line.startswith("#") and line.strip() != "---":
                 description = line.strip()
                 break
-    return name[:120], description[:500]
+    return name[:120], truncate_tokens(description, 500)
 
 
 def _safe_id(value: str) -> str:
@@ -162,7 +164,7 @@ class SkillRegistry:
             skill = self.find(skill_id)
             if skill is None:
                 continue
-            description = " ".join(str(skill.description or "").split())[:200]
+            description = truncate_tokens(" ".join(str(skill.description or "").split()), 200)
             sections.append(f"- {skill.skill_id}: {description}" if description else f"- {skill.skill_id}")
         if not sections:
             return ""

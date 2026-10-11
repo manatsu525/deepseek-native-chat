@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .text_tokens import count_tokens, truncate_tokens
+
 import os
 import shutil
 import subprocess
@@ -12,8 +14,8 @@ from urllib.parse import unquote, urlsplit
 
 RUN_ROOT = Path("/run/custom-code-runs")
 MAX_ARGUMENTS = 20
-MAX_ARGUMENT_CHARS = 1000
-MAX_OUTPUT_CHARS = 12_000
+MAX_ARGUMENT_TOKENS = 1000
+MAX_OUTPUT_TOKENS = 12_000
 RUN_TIMEOUT_SECONDS = 12
 
 
@@ -130,8 +132,8 @@ def _run_isolated(run_root: Path, executable: str, args: list[str], timeout: int
     return {
         "ok": completed.returncode == 0,
         "exit_code": int(completed.returncode),
-        "stdout": completed.stdout.decode("utf-8", errors="replace")[-MAX_OUTPUT_CHARS:],
-        "stderr": completed.stderr.decode("utf-8", errors="replace")[-MAX_OUTPUT_CHARS:],
+        "stdout": truncate_tokens(completed.stdout.decode("utf-8", errors="replace"), MAX_OUTPUT_TOKENS, tail=True),
+        "stderr": truncate_tokens(completed.stderr.decode("utf-8", errors="replace"), MAX_OUTPUT_TOKENS, tail=True),
     }
 
 
@@ -150,7 +152,7 @@ def run_python(source_root: Path, relative_path: str, arguments: Any = None) -> 
     if len(raw_arguments) > MAX_ARGUMENTS:
         raise CodeRunnerError(f"运行参数最多 {MAX_ARGUMENTS} 个")
     args = [str(item) for item in raw_arguments]
-    if any(len(item) > MAX_ARGUMENT_CHARS or "\x00" in item for item in args):
+    if any(count_tokens(item) > MAX_ARGUMENT_TOKENS or "\x00" in item for item in args):
         raise CodeRunnerError("运行参数无效或过长")
 
     run_root = _prepare_copy(source_root)
@@ -172,7 +174,7 @@ def run_python(source_root: Path, relative_path: str, arguments: Any = None) -> 
 
 
 COMMAND_TIMEOUT_MAX = 60
-MAX_COMMAND_CHARS = 4_000
+MAX_COMMAND_TOKENS = 4_000
 
 
 def run_command(source_root: Path, command: Any, timeout_seconds: Any = None) -> dict[str, Any]:
@@ -184,7 +186,7 @@ def run_command(source_root: Path, command: Any, timeout_seconds: Any = None) ->
     text = str(command or "").strip()
     if not text:
         raise CodeRunnerError("command 不能为空")
-    if len(text) > MAX_COMMAND_CHARS or "\x00" in text:
+    if count_tokens(text) > MAX_COMMAND_TOKENS or "\x00" in text:
         raise CodeRunnerError("命令过长或无效")
     try:
         timeout = int(timeout_seconds) if timeout_seconds not in (None, "") else RUN_TIMEOUT_SECONDS

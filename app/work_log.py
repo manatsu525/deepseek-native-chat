@@ -9,10 +9,12 @@ across turns. The stored message and the UI are not changed.
 
 from __future__ import annotations
 
+from .text_tokens import truncate_tokens
+
 from typing import Any
 
 WORK_LOG_HEADER = "[工具操作记录（应用自动生成，仅供后续对话参考，不是回答内容）]"
-WORK_LOG_MAX_CHARS = 1_500
+WORK_LOG_MAX_TOKENS = 1_500
 MAX_ITEMS_PER_LINE = 12
 
 WRITE_TOOLS = {"write_file", "host_write_file", "frontend_write_page"}
@@ -56,7 +58,7 @@ def build_work_log(tool_trace: list[dict[str, Any]] | None) -> str:
             checks.append(f"{name} {path} {'已执行' if ok else '未通过或出错'}".strip())
             continue
         if name in COMMAND_TOOLS:
-            command = " ".join(path.split())[:120]
+            command = truncate_tokens(" ".join(path.split()), 120)
             commands.append(f"`{command}` {'成功' if ok else '失败'}")
             continue
         if not ok:
@@ -84,7 +86,7 @@ def build_work_log(tool_trace: list[dict[str, Any]] | None) -> str:
     if not lines:
         return ""
     text = WORK_LOG_HEADER + "\n" + "\n".join(lines)
-    return text[:WORK_LOG_MAX_CHARS]
+    return truncate_tokens(text, WORK_LOG_MAX_TOKENS)
 
 
 def with_work_log(content: Any, work_log: str) -> Any:

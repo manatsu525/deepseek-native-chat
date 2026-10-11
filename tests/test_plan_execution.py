@@ -137,7 +137,8 @@ class ExecutionPlanTests(unittest.TestCase):
 
 
 class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
-    async def run_loop(self, rounds, protocol="chat_completions", status_sequence=None, settings=None):
+    async def run_loop(self, rounds, protocol="chat_completions", status_sequence=None, settings=None,
+                       record_event=None, messages=None, agent_mode=True, workspace=None, loaded_tool_groups=None, usage_sequence=None, web_enabled=False):
         payloads, executed, updates = [], [], []
         statuses = list(status_sequence or [])
         def event(obj):
@@ -147,6 +148,7 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
                 self.status_code = status_code
             async def aiter_lines(self):
                 actions = rounds.pop(0)
+                sample_usage = (usage_sequence or []).pop(0) if usage_sequence else {}
                 if protocol == "responses":
                     output = []
                     for i, action in enumerate(actions):
@@ -157,7 +159,7 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
                             item = {"type": "function_call", "id": "fc_"+ident, "call_id": ident, "name": name, "arguments": json.dumps(args)}
                             output.append(item)
                             yield event({"type": "response.output_item.done", "output_index": i, "item": item})
-                    yield event({"type": "response.completed", "response": {"id": "resp_"+str(len(payloads)), "output": output, "usage": {}}})
+                    yield event({"type": "response.completed", "response": {"id": "resp_"+str(len(payloads)), "output": output, "usage": sample_usage}})
                 elif protocol == "messages":
                     for i, action in enumerate(actions):
                         if isinstance(action, str):
@@ -167,10 +169,14 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
                             yield event({"type": "content_block_start", "index": i, "content_block": {"type": "tool_use", "id": ident, "name": name, "input": {}}})
                             yield event({"type": "content_block_delta", "index": i, "delta": {"type": "input_json_delta", "partial_json": json.dumps(args)}})
                     yield event({"type": "message_stop"})
+                    if sample_usage:
+                        yield event({"type": "message_delta", "usage": {"input_tokens": sample_usage["input_tokens"], "output_tokens": 1}})
                 else:
                     for i, action in enumerate(actions):
                         delta = {"content": action} if isinstance(action, str) else {"tool_calls": [{"index": i, "id": action[0], "type": "function", "function": {"name": action[1], "arguments": json.dumps(action[2])}}]}
                         yield event({"choices": [{"delta": delta}]})
+                    if sample_usage:
+                        yield event({"usage": {"prompt_tokens": sample_usage["input_tokens"], "completion_tokens": 1}})
                 yield "data: [DONE]"
             async def aread(self):
                 return b""
@@ -192,45 +198,48 @@ class PlanLoopTests(unittest.IsolatedAsyncioTestCase):
             return json.dumps({"exit_code": 0, "stdout": "ok"})
         with patch.object(mimo_local.httpx, "AsyncClient", Client):
             result = await mimo_local.stream_response(
-                base_url="https://example.invalid/v1", api_key="test", model="test", messages=[{"role":"user","content":"edit files"}],
-                timeout=5, stopped=lambda:False, update=update, web_enabled=False, agent_mode=True,
+                base_url="https://example.invalid/v1", api_key="test", model="test", messages=messages or [{"role":"user","content":"edit files"}],
+                timeout=5, stopped=lambda:False, update=update, web_enabled=web_enabled, agent_mode=agent_mode,
+                workspace=workspace, loaded_tool_groups=loaded_tool_groups,
                 max_tool_rounds=15, api_protocol=protocol, settings=settings,
                 extra_tools=[{"type":"function","function":{"name":"run_command","description":"run","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}],
-                extra_tool_handler=execute)
+                extra_tool_handler=execute, record_event=record_event)
         self.assertFalse(rounds)
         return result, payloads, executed, updates
 
     async def test_gate_execute_verify_and_finish_all_protocols(self):
         for protocol in ("chat_completions", "responses", "messages"):
             with self.subTest(protocol=protocol):
-                first = steps()
-                second = [{"id":"s1","step":"implement","status":"done","outcome":"saved","evidence":["write"]},
-                          {"id":"s2","step":"verify","status":"in_progress"}]
+                first = [{"content": "implement", "status": "in_progress"},
+                         {"content": "verify", "status": "in_progress"}]
+                second = [{"content":"implement","status":"completed"},
+                          {"content":"verify","status":"in_progress"}]
                 final = copy.deepcopy(second)
-                final[1].update(status="done",outcome="passed",evidence=["check"])
+                final[1].update(status="completed")
                 result, payloads, executed, updates = await self.run_loop([
                     [("a","run_command",{"command":"inspect a"}),("b","run_command",{"command":"inspect b"}), ("batch-third","run_command",{"command":"should run"})],
-                    [("p","update_plan",{"steps":first})],
+                    [("p","update_plan",{"todos":first})],
                     [("write","run_command",{"command":"implement"})],
-                    [("p2","update_plan",{"steps":second}), ("check","run_command",{"command":"verify"})],
-                    [("p3","update_plan",{"steps":final})], ["done"]], protocol)
+                    [("p2","update_plan",{"todos":second}), ("check","run_command",{"command":"verify"})],
+                    [("p3","update_plan",{"todos":final})], ["done"]], protocol)
                 self.assertEqual(executed, ["inspect a","inspect b","should run","implement","verify"])
                 names = [t.get("name", t.get("function",{}).get("name")) for t in payloads[1]["tools"]]
                 self.assertEqual(names,["run_command","update_plan"])
                 self.assertFalse(result["incomplete"])
-                self.assertEqual(result["plan"]["steps"][1]["evidence"],["check"])
-                self.assertTrue(any(u.get("plan",{}).get("steps") for u in updates))
+                self.assertEqual(result["plan"]["steps"][1]["status"], "completed")
+                self.assertNotIn("evidence", result["plan"]["steps"][1])
+                self.assertTrue(any((u.get("plan") or {}).get("steps") for u in updates))
                 self.assertIn("write", json.dumps(payloads[3]))
                 if protocol == "responses":
                     self.assertIn("previous_response_id",payloads[2])
-                    self.assertIn("服务端执行状态",json.dumps(payloads[3],ensure_ascii=False))
+                    self.assertNotIn("服务端执行状态",json.dumps(payloads[3],ensure_ascii=False))
 
-    async def test_unfinished_final_is_reconciled_and_bounded(self):
+    async def test_unfinished_checklist_does_not_force_extra_rounds(self):
         result, payloads, executed, _ = await self.run_loop([
-            [("p","update_plan",{"steps":steps()})], ["done"], ["done"], ["done"]])
-        self.assertTrue(result["incomplete"])
-        self.assertEqual(result["incomplete_reason"], "plan_unfinished")
-        self.assertEqual(len(payloads),4)
+            [("p","update_plan",{"todos":[{"content": "inspect", "status": "in_progress"}]})], ["done"]])
+        self.assertFalse(result["incomplete"])
+        self.assertEqual(result["incomplete_reason"], "")
+        self.assertEqual(len(payloads),2)
         self.assertFalse(executed)
 
     async def test_simple_answer_has_no_planning_overhead(self):

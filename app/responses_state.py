@@ -10,9 +10,11 @@ from typing import Any
 def state_scope(provider: dict, job: dict, settings: dict) -> str:
     # Never persist credentials themselves. Changing any routing/configuration
     # input starts a new chain, as does switching user, conversation or mode.
+    # The token budget is local policy, not a provider reasoning signature.
+    route_settings = {k: v for k, v in settings.items() if k != "context_budget_tokens"}
     value = [provider.get("id"), provider.get("base_url"), provider.get("api_key"),
              job.get("user_id"), job.get("conversation_id"), job.get("model"),
-             job.get("chat_mode"), job.get("effort"), job.get("timezone"), settings]
+             job.get("chat_mode"), job.get("effort"), job.get("timezone"), route_settings]
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
@@ -97,6 +99,8 @@ class ResponsesState:
         json,
         full_input,
         retry_status_codes: set[int] | None = None,
+        observe_request=None,
+        observe_error=None,
     ):
         # Retry once only for explicit state-field rejection, before consuming
         # any generated output. Configured HTTP statuses are yielded to the
@@ -106,6 +110,8 @@ class ResponsesState:
         # empty set when the user disabled retries).
         retry_status_codes = {503} if retry_status_codes is None else set(retry_status_codes)
         for attempt in range(2):
+            if observe_request is not None:
+                observe_request(json)
             async with client.stream(method, url, headers=headers, json=json) as response:
                 # Let the shared retry controller observe every configured
                 # status. Other HTTP errors remain handled here because
@@ -115,6 +121,8 @@ class ResponsesState:
                     return
                 if response.status_code >= 400:
                     body = (await response.aread()).decode(errors="replace")[:2000]
+                    if observe_error is not None:
+                        observe_error(response.status_code, body)
                     lowered = body.lower()
                     field_error = any(word in lowered for word in (
                         "previous_response_id", "previous response", "store", "storage"))

@@ -7,6 +7,8 @@ that mode host-level file, shell, Skill, conversation, and frontend tools.
 
 from __future__ import annotations
 
+from .text_tokens import count_tokens, truncate_tokens
+
 import json
 import asyncio
 import hashlib
@@ -46,15 +48,16 @@ from .code_runner import _HtmlScripts
 # path keeps its own per-conversation workspace under data/workspaces.
 AGENT_PROJECT_ROOT = Path(os.getenv("AGENT_WORKSPACE_ROOT", os.getenv("AGENT_PROJECT_ROOT", "/home/share")))
 HOST_READ_MAX_BYTES = 8 * 1024 * 1024
-HOST_READ_MAX_CHARS = 100_000
+HOST_READ_MAX_TOKENS = 100_000
 HOST_WRITE_MAX_BYTES = 32 * 1024 * 1024
 # Command output the model sees. 100K-character outputs pushed every agent
 # history over the checkpoint mark within a few rounds, so the model kept
 # losing what it had just found; 12K made it page through files with
 # sed -n instead. Long output keeps its head and tail; context aging in
 # app/context.py retires old results when the request grows.
-HOST_OUTPUT_MAX_CHARS = 40_000
-HOST_OUTPUT_READ_CHARS = 400_000
+HOST_OUTPUT_MAX_TOKENS = 40_000
+# Internal byte safety guard, separate from the model-visible token limit.
+HOST_OUTPUT_READ_BYTES = 400_000
 # A listing larger than this (one call on a cloned repository produced 300K
 # characters) collapses to the first level with per-directory counts.
 HOST_LIST_MAX_ENTRIES = 300
@@ -86,19 +89,19 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def bounded_output(text: str, limit: int = HOST_OUTPUT_MAX_CHARS) -> str:
+def bounded_output(text: str, limit: int = HOST_OUTPUT_MAX_TOKENS) -> str:
     """Keep the head and tail of long command output with an explicit gap."""
-    if len(text) <= limit:
+    if count_tokens(text) <= limit:
         return text
     head = limit * 2 // 5
     tail = limit - head
-    omitted = len(text) - head - tail
+    omitted = count_tokens(text) - head - tail
     return (
-        text[:head]
-        + f"\n\n[... 输出过长，中间省略 {omitted} 字符（共 {len(text)} 字符）。"
+        truncate_tokens(text, head)
+        + f"\n\n[... 输出过长，中间省略约 {omitted} token（共 {count_tokens(text)} token）。"
         "要看一个文件的全文请用 read_file(path)，它一次返回整个文件；要定位内容请用 search_files 或 grep -n。"
         "不要用 sed -n / head / tail 分段查看 ...]\n\n"
-        + text[-tail:]
+        + truncate_tokens(text, tail, tail=True)
     )
 
 
@@ -340,7 +343,7 @@ class AgentRuntime:
         return {
             "path": str(path),
             "revision": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-            **numbered_window(content, arguments.get("start_line"), HOST_READ_MAX_CHARS),
+            **numbered_window(content, arguments.get("start_line"), HOST_READ_MAX_TOKENS),
         }
 
     @staticmethod
@@ -406,7 +409,7 @@ class AgentRuntime:
                 continue
             for line_number, line in enumerate(lines, 1):
                 if folded in line.casefold():
-                    matches.append({"path": str(path), "line": line_number, "text": line[:500]})
+                    matches.append({"path": str(path), "line": line_number, "text": truncate_tokens(line, 500)})
                     if len(matches) >= limit:
                         return {"matches": matches, "truncated": True}
         return {"matches": matches, "truncated": False}
@@ -462,9 +465,9 @@ class AgentRuntime:
             def tail(stream: Any) -> str:
                 stream.seek(0, os.SEEK_END)
                 total = stream.tell()
-                stream.seek(max(0, total - HOST_OUTPUT_READ_CHARS))
+                stream.seek(max(0, total - HOST_OUTPUT_READ_BYTES))
                 text = stream.read().decode("utf-8", errors="replace")
-                if total > HOST_OUTPUT_READ_CHARS:
+                if total > HOST_OUTPUT_READ_BYTES:
                     text = "[...]" + text
                 return bounded_output(text)
             result = {
@@ -687,7 +690,7 @@ class AgentRuntime:
         try:
             return _json(handler(arguments))
         except Exception as exc:
-            return _json({"ok": False, "error": str(exc)[:4_000]})
+            return _json({"ok": False, "error": truncate_tokens(str(exc), 4000)})
 
 
 def build_agent_skills_prompt() -> str:
