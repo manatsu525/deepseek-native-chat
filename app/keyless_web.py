@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from .text_tokens import count_tokens, truncate_tokens, upstream_char_ceiling
+from .page_focus import focus_page
+from .text_tokens import truncate_tokens, upstream_char_ceiling
 
 import json
 import re
@@ -185,7 +186,7 @@ class KeylessWebProvider:
             raise KeylessWebError(f"{self.label} 搜索未返回可用结果")
         return results
 
-    async def fetch(self, url: str, objective: str = "") -> str:
+    async def fetch(self, url: str, objective: str = "", queries: list[str] | tuple[str, ...] = ()) -> str:
         objective = truncate_tokens(" ".join(str(objective or "").split()), 200)
         if self.provider == "you":
             raise KeylessWebError("You.com Free 不提供网页抓取，应复用 Jina Reader")
@@ -207,15 +208,20 @@ class KeylessWebProvider:
                 "onlyMainContent": True,
                 "removeBase64Images": True,
             }
-        structured, text = await self._call_tool(str(self.config["fetch_tool"]), arguments)
+        try:
+            structured, text = await self._call_tool(str(self.config["fetch_tool"]), arguments)
+        except KeylessWebError:
+            if self.provider != "keenable":
+                raise
+            # A live crawl is refused by sites that block crawlers (fandom,
+            # for example) although Keenable's index already holds the page.
+            structured, text = await self._call_tool(str(self.config["fetch_tool"]), {**arguments, "live": False})
         payload = _payload(structured, text)
         _raise_service_error(self.label, payload)
         content = _page_content(self.provider, payload, text).strip()
         if not content:
             raise KeylessWebError(f"{self.label} 未返回可用网页正文")
-        if count_tokens(content) > MAX_PAGE_TOKENS:
-            content = truncate_tokens(content, MAX_PAGE_TOKENS).rstrip() + "\n\n[网页内容已截断，仅保留前面部分]"
-        return content
+        return focus_page(content, MAX_PAGE_TOKENS, objective, queries)
 
     async def _initialize(self) -> None:
         if self._initialized:

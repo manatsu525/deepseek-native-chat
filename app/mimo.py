@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from .text_tokens import count_tokens, truncate_tokens, upstream_char_ceiling
+from .page_focus import focus_page
+from .text_tokens import truncate_tokens, upstream_char_ceiling
 
 import asyncio
 import re
@@ -487,7 +488,9 @@ def _response_bytes(response: Any):
     return iterator() if iterator else response.aiter_bytes()
 
 
-async def _read_with_jina(client: Any, url: str, stopped: Callable[[], bool]) -> str:
+async def _read_with_jina(
+    client: Any, url: str, stopped: Callable[[], bool], objective: str = "", queries: list[str] | tuple[str, ...] = (),
+) -> str:
     await _acquire_jina_slot(stopped)
     reader_url = JINA_READER_PREFIX + url
     try:
@@ -540,9 +543,9 @@ async def _read_with_jina(client: Any, url: str, stopped: Callable[[], bool]) ->
     header, separator, markdown_body = content.partition("Markdown Content:")
     if separator and not markdown_body.strip() and ("warning:" in header.casefold() or "error" in header.casefold()):
         raise RuntimeError("Jina Reader 未返回可用网页正文")
-    if count_tokens(content) > JINA_MAX_TOKENS:
-        content = truncate_tokens(content, JINA_MAX_TOKENS).rstrip() + "\n\n[网页内容已截断，仅保留前面部分]"
-    return content
+    # Jina serves its cache by default (no X-No-Cache), so there is no
+    # cached-copy retry here; long pages are fitted around the objective.
+    return focus_page(content, JINA_MAX_TOKENS, objective, queries)
 
 
 def _page_title(content: str, url: str) -> str:
@@ -637,6 +640,7 @@ FETCH_WEBPAGE_TOOL = {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "要读取的公开 http/https URL"},
+                "objective": {"type": "string", "description": "希望从该网页中找到的具体信息。长网页超过读取上限时，按它保留最相关的片段"},
             },
             "required": ["url"],
             "additionalProperties": False,
@@ -675,12 +679,12 @@ PARALLEL_FETCH_WEBPAGE_TOOL = {
     "type": "function",
     "function": {
         "name": "fetch_webpage",
-        "description": "通过 Parallel Search MCP 读取一个真实内容页并返回与目标相关的精简摘录。仅当搜索摘录不足、需要原文细节或用户指定了 URL 时使用；不要默认读取每条搜索结果。URL 必须来自用户或本地 web_search。",
+        "description": "通过 Parallel Search MCP 读取一个真实内容页的正文；长网页超过读取上限时按 objective 保留最相关的片段。仅当搜索摘录不足、需要原文细节或用户指定了 URL 时使用；不要默认读取每条搜索结果。URL 必须来自用户或本地 web_search。",
         "parameters": {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "要读取的公开 http/https 内容页 URL"},
-                "objective": {"type": "string", "description": "希望从该网页中找到的信息，最多 200 token"},
+                "objective": {"type": "string", "description": "希望从该网页中找到的具体信息，最多 200 token。长网页按它保留最相关的片段"},
             },
             "required": ["url"],
             "additionalProperties": False,

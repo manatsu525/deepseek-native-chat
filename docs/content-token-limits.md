@@ -37,6 +37,14 @@ ceiling, then the application applies its 8,000-token allowance. Keenable
 search requests the provider's maximum supported 10,000-character snippet,
 then applies 500 tokens locally. Providers can still impose their own limits.
 
+A fetched page longer than its 8,000-token allowance is no longer cut to its
+first 8,000 tokens. Parallel (full content), Keenable and Jina (You) pages keep
+their beginning plus the passages matching the fetch `objective` and the last
+search queries, in document order with explicit gaps (`app/page_focus.py`).
+When Keenable's live crawl is refused it retries from Keenable's cache
+(`live: false`); Parallel retries with `allow_live_fetch: false`. Jina already
+serves its cache by default.
+
 Already-truncated uploaded files and cached records are preserved, not silently
 deleted or regenerated. Re-upload/re-fetch when the missing original content
 is needed. This change does not alter live-fetch policy, objective forwarding,

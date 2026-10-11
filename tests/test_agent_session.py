@@ -111,7 +111,7 @@ class AgentSessionLoopTests(unittest.IsolatedAsyncioTestCase):
             async def search(self, query, num_results=10):
                 self.searches += 1
                 return [{"url": f"https://example.test/page{self.searches - 1}", "title": "source", "snippet": "fixture evidence"}]
-            async def fetch(self, url, objective=""): return "fixture rule text"
+            async def fetch(self, url, objective="", queries=()): return "fixture rule text"
         forbidden = ("联网查询已暂停", "现在就写文件", "没有修改任何文件", "先根据已有资料动手", "只读操作已暂停")
         for protocol in ("chat_completions", "responses", "messages"):
             for mode in (False, True):
