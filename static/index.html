@@ -208,7 +208,7 @@
       <label class="wide">搜索/抓取工具方案<select id="customWebToolBackend"><option value="parallel">Parallel（默认）</option><option value="keenable">Keenable</option><option value="tavily">Tavily</option><option value="firecrawl">Firecrawl</option><option value="you">You.com</option><option value="legacy">DDG + Jina</option></select></label>
       <p id="customSamplingNote" class="wide muted">默认不发送 temperature/top_p；勾选对应开关后才会加入真实上游 JSON。</p>
       <p id="customToolNote" class="wide muted custom-cost-note">默认通过免费的 Parallel Search MCP 搜索并提取相关网页内容，不需要 Parallel API Key。</p>
-      <p class="wide muted custom-cost-note">所有方案均由本机后端调用并强制限制：每个回答最多搜索 3 次、读取 3 个网页、执行 6 个工具轮次；资料足够时可以提前停止。每次搜索最多向模型返回 10 条结果。</p>
+      <p class="wide muted custom-cost-note">所有方案均由本机后端调用并强制限制：每个回答最多搜索 8 次、读取 8 个网页、执行 40 个工具轮次；资料足够时可以提前停止。每次搜索最多向模型返回 10 条结果。</p>
       <label class="check wide"><input id="customAdvancedEnabled" type="checkbox"> 启用高级 JSON 配置</label>
       <label class="wide">上游配置参数（当前模型）<textarea id="customRequestOverrides" rows="14" spellcheck="false" autocapitalize="off" readonly aria-describedby="customAdvancedNote"></textarea></label>
       <p id="customAdvancedNote" class="wide muted custom-cost-note"></p>
