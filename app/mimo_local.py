@@ -165,6 +165,33 @@ def _join_round_text(answer: str, text: str) -> str:
     return answer + text
 
 
+_PREVIEW_PATH_RE = re.compile(r'"(?:path|file_path|filename)"\s*:\s*"((?:[^"\\]|\\.){1,300})"')
+
+
+def _tool_call_preview(found: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Describe tool calls whose arguments are still streaming, for display.
+
+    A large write_file can take minutes to arrive; without this the page shows
+    no change at all until the call completes.
+    """
+    preview: list[dict[str, Any]] = []
+    for index, raw in sorted(found.items()):
+        function = raw.get("function") or {}
+        name = str(function.get("name") or "")
+        if not name:
+            continue
+        arguments = str(function.get("arguments") or "")
+        match = _PREVIEW_PATH_RE.search(arguments)
+        path = ""
+        if match:
+            try:
+                path = json.loads(f'"{match.group(1)}"')
+            except ValueError:
+                path = match.group(1)
+        preview.append({"index": index, "id": str(raw.get("id") or ""), "tool": name, "path": path, "chars": len(arguments)})
+    return preview
+
+
 def _retry_status_codes(config: dict[str, Any]) -> set[int]:
     """Return the configured HTTP statuses eligible for automatic retry."""
     raw = config.get("retry_status_codes", [503])
@@ -1603,6 +1630,7 @@ async def stream_response(
                             "searches": steps,
                             "usage": preview_usage,
                             "sources": list(sources.values()),
+                            "tool_preview": _tool_call_preview(round_tools_by_index),
                         }
                     )
 

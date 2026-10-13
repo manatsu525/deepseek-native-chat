@@ -56,6 +56,9 @@ from .workspace import AgentSharedWorkspace, ConversationWorkspace, WorkspaceErr
 db = Database(settings.db_path)
 secret = b""
 tasks: dict[str, asyncio.Task[Any]] = {}
+# Tool calls the model is still streaming, per running job. Display only:
+# kept in memory so a stop or failure never persists half-generated calls.
+live_tool_previews: dict[str, list[dict[str, Any]]] = {}
 MAX_CONCURRENT_JOBS = 2
 WEB_EVIDENCE_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 WEB_EVIDENCE_CONTEXT_MAX_TOKENS = 16_000
@@ -798,6 +801,7 @@ async def _execute_job(job_id: str) -> None:
         for key in ("tool_trace", "round_stats", "loaded_tool_groups"):
             if key in state:
                 live_diagnostics[key] = list(state[key])
+        live_tool_previews[job_id] = list(state.get("tool_preview") or [])
         retry_state = state.get("retry_status")
         if retry_state is not None:
             live_diagnostics["retry_status"] = dict(retry_state)
@@ -1026,6 +1030,7 @@ async def _execute_job(job_id: str) -> None:
                 (error, failed_at, job_id),
             )
     finally:
+        live_tool_previews.pop(job_id, None)
         if attachment_lock_acquired:
             attachment_job_lock.release()
         if journal:
@@ -1946,7 +1951,10 @@ def get_job(job_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[s
     job = db.one("SELECT * FROM jobs WHERE id=? AND user_id=?", (job_id, user["id"]))
     if not job:
         raise HTTPException(404, "任务不存在")
-    return public_job(job)
+    result = public_job(job)
+    if result.get("status") == "running":
+        result["tool_preview"] = live_tool_previews.get(job_id, [])
+    return result
 
 
 @app.get("/api/jobs/{job_id}/execution")
