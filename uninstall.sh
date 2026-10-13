@@ -11,7 +11,8 @@ if [[ ${1:-} != "--yes" ]]; then
 fi
 
 systemctl disable --now deepseek-native-chat.service 2>/dev/null || true
-rm -f /etc/systemd/system/deepseek-native-chat.service
+systemctl disable --now deepseek-native-chat-tls.timer 2>/dev/null || true
+rm -f /etc/systemd/system/deepseek-native-chat.service /etc/systemd/system/deepseek-native-chat-tls.service /etc/systemd/system/deepseek-native-chat-tls.timer
 systemctl daemon-reload
 rm -rf -- /opt/deepseek-native-chat
 echo "Custom Native Chat 已完全卸载，数据不可恢复。"

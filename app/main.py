@@ -1097,6 +1097,15 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/ca.crt")
+def local_ca_certificate() -> FileResponse:
+    # 只公开本地 CA 的公钥证书，方便手机和电脑安装信任；私钥 ca.key 不会被提供。
+    ca_cert = settings.data_dir / "tls" / "ca.crt"
+    if not ca_cert.is_file():
+        raise HTTPException(status_code=404, detail="未使用本地 CA 证书")
+    return FileResponse(ca_cert, media_type="application/x-x509-ca-cert", filename="custom-native-chat-ca.crt")
+
+
 @app.post("/api/login")
 def login(body: LoginBody, response: Response) -> dict[str, Any]:
     user = db.one("SELECT * FROM users WHERE username=? COLLATE NOCASE", (body.username.strip(),))

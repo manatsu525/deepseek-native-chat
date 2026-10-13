@@ -19,7 +19,7 @@
 - 前端测试 API、读取 `/models` 全部模型并勾选、手动填写模型名、重新编辑已保存 API 的模型列表、删除 API
 - Custom 参数：每个模型均可独立设置 `thinking`、`reasoning_effort`（Low/Medium/High/Extra High/Max 五档）及开关，并可手动勾选 OpenRouter/Vercel 的最低价路由方式，另有普通采样参数、默认 65,536 的生成上限和联网方案切换
 - Custom 匿名联网方案：Parallel Search + Fetch、Keenable Search + Live Fetch、Tavily Keyless Search + Extract、Firecrawl Keyless Search + Scrape、You Search + Jina Fetch、DDG Search + Jina Fetch
-- SQLite 单文件数据库、自签 HTTPS、systemd 守护
+- SQLite 单文件数据库、本地 CA 签发的 HTTPS（自动续期，也可换成 Let's Encrypt 等正规证书）、systemd 守护
 - 手机和桌面端响应式界面
 - 浏览器自动上报 IANA 时区；Custom/MiMo 每次回答都会获得对应的当前本地日期，并要求按绝对日期核对“今天/最新”等时效性问题
 - 每个账号可以一键清空自己的全部聊天记录；级联删除消息、思考、搜索记录和任务后会截断 WAL 并压缩 SQLite，实际释放 VPS 磁盘空间
@@ -54,7 +54,35 @@ sudo ./install.sh
 重复运行安装脚本会更新程序、重启服务，并保留已有数据库、证书和原管理员登录凭据。
 如果 `/opt/deepseek-native-chat` 本身是 Git 工作区，也可以直接在该目录更新 `main` 后运行 `sudo ./install.sh`；脚本不会删除当前工作区的 `.git`。
 
-默认访问地址为 `https://服务器IP:8000`。证书为自签证书，首次访问需要在浏览器中确认继续。
+默认访问地址为 `https://服务器IP:8000`。
+
+### HTTPS 证书
+
+安装脚本会在 `data/tls/` 生成一个本地 CA（`ca.crt`，有效期 10 年，重装不会重建），再用它签发服务器证书（有效期 397 天）。服务每次启动和每天定时检查一次，到期前 30 天、服务器 IP 或域名变化时自动重签；CA 不变，所以设备上的信任一直有效。
+
+每台手机或电脑信任一次 CA，之后就不会再提示“不安全”：
+
+1. 打开 `https://服务器IP:8000/ca.crt` 下载证书（这一次仍需在浏览器中点“继续访问”），或从服务器复制 `/opt/deepseek-native-chat/data/tls/ca.crt`。
+2. 安装为受信任的根证书：
+   - Windows：双击 → 安装证书 → 本地计算机 → “受信任的根证书颁发机构”，然后重启浏览器。
+   - macOS：双击导入“钥匙串访问”的“系统”钥匙串 → 双击该证书 → 信任 → “始终信任”。
+   - iPhone/iPad：用 Safari 打开下载链接 → 设置 → 已下载描述文件 → 安装；再到 设置 → 通用 → 关于本机 → 证书信任设置，打开该证书的完全信任。
+   - Android：设置 → 安全 → 加密与凭据 → 安装证书 → CA 证书。Android 版 Chrome 会使用系统 CA。
+   - Firefox（桌面）：设置 → 隐私与安全 → 证书 → 查看证书 → 证书颁发机构 → 导入。
+
+服务器公网 IP 不是 `hostname -I` 的第一个地址时（例如 NAT 型 VPS），请指定后重装：`sudo PUBLIC_IP=公网IP ./install.sh`。有域名时可加上 `TLS_DOMAIN=chat.example.com`。这些设置会写入 `.env`，以后重装会沿用。
+
+有域名时也可以直接使用 Let's Encrypt 等正规证书，设备上无需安装任何东西：
+
+```bash
+sudo certbot certonly --standalone -d chat.example.com
+sudo TLS_DOMAIN=chat.example.com \
+  TLS_CERT_FILE=/etc/letsencrypt/live/chat.example.com/fullchain.pem \
+  TLS_KEY_FILE=/etc/letsencrypt/live/chat.example.com/privkey.pem \
+  ./install.sh
+```
+
+使用外部证书时脚本不会再生成或替换证书，重装也会保留这两个路径。certbot 续期后需重启服务才会加载新证书，可在 `/etc/letsencrypt/renewal-hooks/deploy/` 放一个执行 `systemctl restart deepseek-native-chat` 的脚本。
 
 进入页面后，在右上角打开“API”，接口类型分为三种：Custom Chat Completions、Custom Responses 和 Custom Messages（Anthropic）。填写 API 地址和 API Key 后，点击“测试并读取模型”；`/models` 返回的模型会以复选框显示，也可以手动填写不在列表中的模型名并测试。Chat/Responses 默认使用 `https://api.openai.com/v1`，Messages 默认使用 `https://api.anthropic.com/v1`，均可改成兼容平台地址。协议是每条 API 配置的一部分，不会根据模型名自动猜测；同一平台需要多种协议时请分别添加配置。
 
@@ -74,7 +102,7 @@ sudo ./uninstall.sh
 sudo ./uninstall.sh --yes
 ```
 
-卸载会删除 `/opt/deepseek-native-chat`，包括账号、API Key、聊天记录和自签证书。
+卸载会删除 `/opt/deepseek-native-chat`，包括账号、API Key、聊天记录和本地 CA 证书（重新安装后各设备需重新信任新的 CA）。
 
 ## 设计说明
 
@@ -111,4 +139,4 @@ Custom Responses 默认发送 `store:true`，成功响应的 ID 随助手消息�
 - API Key：保存在仅 root 可读的本地 SQLite 数据库中，前端只返回掩码
 - 会话 Cookie：HttpOnly、Secure、SameSite=Lax
 - 每账号超过 100 个普通对话时自动删除最旧的普通对话及关联任务；置顶对话不会被自动删除
-- 生产环境如有域名，建议把自签证书换成受信任证书
+- 生产环境如有域名，建议改用 Let's Encrypt 等受信任证书（见“HTTPS 证书”）
